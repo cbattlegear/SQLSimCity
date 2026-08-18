@@ -251,7 +251,7 @@
         "dependencies": {
           "Microsoft.Data.SqlClient": "[7.0.2, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.11, )",
-          "Microsoft.SqlServer.TransactSql.ScriptDom": "[170.191.0, )",
+          "Microsoft.SqlServer.TransactSql.ScriptDom": "[180.78.1, )",
           "SqlSimCity.Contracts": "[1.0.0, )",
           "SqlSimCity.Domain": "[1.0.0, )",
           "SqlSimCity.SqlServer": "[1.0.0, )",
@@ -400,9 +400,9 @@
       },
       "Microsoft.SqlServer.TransactSql.ScriptDom": {
         "type": "CentralTransitive",
-        "requested": "[170.191.0, )",
-        "resolved": "170.191.0",
-        "contentHash": "Rd0xOrMhZV3bE7LwkiOv9zJsZ/OUNUS7xvEPvbSVK04vDotPk1lxRTPXxul/E6TSfdmT8E+RoeVDgtIaFMUshQ=="
+        "requested": "[180.78.1, )",
+        "resolved": "180.78.1",
+        "contentHash": "hEQI2FUBvIvEn99PSvrmEL4WkD4QeaES6ffT2SDPlb/fKeVGAfJKOEUyeSYFvUIAFp5ebEPRUFeLAFh5T/lWRA=="
       }
     }
   }
