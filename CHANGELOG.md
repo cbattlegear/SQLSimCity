@@ -88,6 +88,16 @@ First MVP release candidate. There is no tagged release yet.
 
 ### Changed
 
+- NuGet dependencies updated, including three major bumps:
+  `Microsoft.SqlServer.TransactSql.ScriptDom` 170.191.0 → 180.78.1,
+  `xunit.runner.visualstudio` 3.1.5 → 4.0.0, and `coverlet.collector` 6.0.4 → 10.0.1, alongside
+  `Microsoft.AspNetCore.Mvc.Testing` and `Microsoft.AspNetCore.SignalR.Client` 10.0.4 → 10.0.11 and
+  `Microsoft.NET.Test.Sdk` 18.3.0 → 18.9.0. The ScriptDom bump moves the T-SQL parser from the
+  SQL Server 2022 grammar to 2025; all 280 `SqlSimCity.SqlServer.Tests` parser assertions still hold.
+  Because the repository pins transitive versions with `RestorePackagesWithLockFile`, all 13 affected
+  `packages.lock.json` files were regenerated with `dotnet restore --force-evaluate`; without that
+  step CI's `dotnet restore --locked-mode` fails with `NU1004`, which is why the equivalent
+  automated dependency pull requests could not build.
 - Frontend build is code-split: the three.js atlas/city viewports and the Query
   Store, Live, and Findings tabs load as lazy chunks, and three.js is isolated
   into its own vendor chunk. The initial-path bundle drops from ~848 KiB to
