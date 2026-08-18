@@ -17,6 +17,14 @@ import {
 import { layoutFacilities, type Facility, type FacilityKind, type FacilitySite } from './cityInfrastructure'
 import type { FacilityLane } from './cityFacilityTraffic'
 import { facilityShell, facilitySlots } from './cityFacilityShells'
+import {
+  buildingLabelText,
+  createCityLabels,
+  elideMiddle,
+  labelAnchor,
+  LABEL_MAX_CHARS,
+  LABEL_WORLD_HEIGHT,
+} from './cityLabels'
 import type { CityRoute } from './cityRoute'
 
 export type CityLayerToggles = {
@@ -24,7 +32,10 @@ export type CityLayerToggles = {
   waitLanes: boolean
   infrastructure: boolean
   route: boolean
+  /** Schema neighborhood tints. Off by default: the tint crowds the map and names nothing on its own. */
   districts: boolean
+  /** Ground labels naming each building and facility. */
+  labels: boolean
 }
 
 export type CameraNudge =
@@ -168,6 +179,13 @@ export function createDatabaseCityScene(
   const infrastructureGroup = new THREE.Group()
   const routeGroup = new THREE.Group()
   const selectionGroup = new THREE.Group()
+  // Labels are their own layer, but facility labels nest so they disappear with the facilities they
+  // name rather than hovering over an empty civic district.
+  const labelGroup = new THREE.Group()
+  const buildingLabelGroup = new THREE.Group()
+  const facilityLabelGroup = new THREE.Group()
+  labelGroup.add(buildingLabelGroup, facilityLabelGroup)
+  const labelFactory = createCityLabels()
   scene.add(
     groundGroup,
     districtGroup,
@@ -178,6 +196,7 @@ export function createDatabaseCityScene(
     infrastructureGroup,
     routeGroup,
     selectionGroup,
+    labelGroup,
   )
 
   const pickable: THREE.Object3D[] = []
@@ -205,7 +224,8 @@ export function createDatabaseCityScene(
     waitLanes: true,
     infrastructure: true,
     route: true,
-    districts: true,
+    districts: false,
+    labels: true,
   }
 
   const track = <T extends THREE.BufferGeometry>(geometry: T): T => {
@@ -224,6 +244,22 @@ export function createDatabaseCityScene(
       })
     }
   }
+
+  /**
+   * Applies the layer toggles to group visibility. Facility labels nest inside the label group, so
+   * they need both their own layer and the infrastructure layer to be on.
+   */
+  const applyLayers = () => {
+    roadGroup.visible = layers.traffic
+    laneGroup.visible = layers.waitLanes
+    roadHighlightGroup.visible = layers.traffic
+    infrastructureGroup.visible = layers.infrastructure
+    routeGroup.visible = layers.route
+    districtGroup.visible = layers.districts
+    labelGroup.visible = layers.labels
+    facilityLabelGroup.visible = layers.infrastructure
+  }
+  applyLayers()
 
   const draw = () => {
     const width = Math.max(canvas.clientWidth, 1)
@@ -316,9 +352,14 @@ export function createDatabaseCityScene(
     group.add(mesh)
   }
 
+  /**
+   * Draws one tint per schema neighborhood. The civic district is deliberately not drawn here: this
+   * layer is named for schema neighborhoods, and the infrastructure district is drawn with the
+   * facilities it holds so the toggle stays literally true.
+   */
   function buildDistricts(cityPlan: CityPlan) {
     clearGroup(districtGroup)
-    for (const district of [...cityPlan.districts, cityPlan.civic]) {
+    for (const district of cityPlan.districts) {
       addQuad(
         districtGroup,
         district.maxX - district.minX,
@@ -331,12 +372,23 @@ export function createDatabaseCityScene(
     }
   }
 
+  /** Places a label on the pavement in front of a building, in world space so it never rotates with the lot. */
+  function addBuildingLabel(object: DatabaseCityObject, lot: CityLot) {
+    const sprite = labelFactory.make(buildingLabelText(object.schemaName, object.name))
+    if (!sprite) return
+    const anchor = labelAnchor(lot.x, lot.z, lot.accessX, lot.accessZ, (lot.footprint ?? 11) / 2 + 3)
+    sprite.position.set(anchor.x, LABEL_WORLD_HEIGHT / 2 + 0.7, anchor.z)
+    buildingLabelGroup.add(sprite)
+  }
+
   function buildBuildings(objects: readonly DatabaseCityObject[], cityPlan: CityPlan) {
     clearGroup(buildingGroup)
+    clearGroup(buildingLabelGroup)
     pickable.length = 0
     for (const object of objects) {
       const lot = cityPlan.lots.get(object.objectId)
       if (!lot) continue
+      addBuildingLabel(object, lot)
       const known = lot.footprint !== null && lot.height !== null
       const group = new THREE.Group()
       group.position.set(lot.x, 0, lot.z)
@@ -503,10 +555,26 @@ export function createDatabaseCityScene(
 
   function buildInfrastructure(facilities: readonly Facility[]) {
     clearGroup(infrastructureGroup)
+    clearGroup(facilityLabelGroup)
     if (!plan) return
+
+    // The civic district's tint travels with its facilities rather than with the schema
+    // neighborhoods, so switching schema neighborhoods off still leaves the infrastructure
+    // district legible as a place.
+    addQuad(
+      infrastructureGroup,
+      plan.civic.maxX - plan.civic.minX,
+      plan.civic.maxZ - plan.civic.minZ,
+      plan.civic.centerX,
+      plan.civic.centerZ,
+      -0.5,
+      materials.district,
+    )
+
     for (const facility of facilities) {
       const site = facilitySites.get(facility.kind)
       if (!site) continue
+      addFacilityLabel(facility, site)
       const group = new THREE.Group()
       group.position.set(site.x, 0, site.z)
 
@@ -556,6 +624,14 @@ export function createDatabaseCityScene(
       })
       infrastructureGroup.add(group)
     }
+  }
+
+  /** Names a facility on the pavement at the front of its plot, matching how buildings are labelled. */
+  function addFacilityLabel(facility: Facility, site: FacilitySite) {
+    const sprite = labelFactory.make(elideMiddle(facility.label, LABEL_MAX_CHARS))
+    if (!sprite) return
+    sprite.position.set(site.x, LABEL_WORLD_HEIGHT / 2 + 0.7, site.z + site.radius + 3)
+    facilityLabelGroup.add(sprite)
   }
 
   function buildRoute(route: CityRoute | null) {
@@ -768,12 +844,7 @@ export function createDatabaseCityScene(
     },
     setLayers(next) {
       Object.assign(layers, next)
-      roadGroup.visible = layers.traffic
-      laneGroup.visible = layers.waitLanes
-      roadHighlightGroup.visible = layers.traffic
-      infrastructureGroup.visible = layers.infrastructure
-      routeGroup.visible = layers.route
-      districtGroup.visible = layers.districts
+      applyLayers()
       if (!layers.traffic) clearHover()
       requestRender()
     },
@@ -879,6 +950,7 @@ export function createDatabaseCityScene(
       for (const material of Object.values(materials)) material.dispose()
       for (const material of archetypeMaterials.values()) material.dispose()
       for (const material of roadMaterials.values()) material.dispose()
+      labelFactory.dispose()
       renderer.dispose()
     },
   }

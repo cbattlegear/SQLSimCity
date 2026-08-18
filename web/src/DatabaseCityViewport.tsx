@@ -49,7 +49,8 @@ const LAYER_LABELS: ReadonlyArray<readonly [keyof CityLayerToggles, string]> = [
   ['waitLanes', 'Wait lanes'],
   ['infrastructure', 'Infrastructure'],
   ['route', 'Query route'],
-  ['districts', 'Districts'],
+  ['labels', 'Labels'],
+  ['districts', 'Schema neighborhoods'],
 ]
 
 function swatch(color: number): string {
@@ -81,7 +82,10 @@ export function DatabaseCityViewport({
     waitLanes: true,
     infrastructure: true,
     route: true,
-    districts: true,
+    // Schema neighborhood tints are off until asked for: the building labels now carry the schema
+    // name, so the tint adds colour without adding a fact.
+    districts: false,
+    labels: true,
   })
 
   useEffect(() => {
