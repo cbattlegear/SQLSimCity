@@ -500,8 +500,12 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, onOpenQuery
           category with no facility here is listed, never folded into one, and a family naming more
           than one object is reported whole rather than divided.
           Unknown size or unavailable activity uses fixed wireframe geometry and makes no quantity
-          claim. Everything else — roof shapes, windows, doors, setbacks, crowns, sidewalks, district
-          tints — is decoration seeded from each object&apos;s stable id and encodes nothing.
+          claim. Ground labels name each building and facility and carry identity only — a label
+          never restates or qualifies a measurement. Everything else — roof shapes, windows, doors,
+          setbacks, crowns, sidewalks, schema neighborhood tints — is decoration seeded from each
+          object&apos;s stable id and encodes nothing. Schema neighborhood tints are off by default,
+          because the schema name a tint grouped by is now written on every building label; turn
+          them back on from the Layers control.
         </p>
 
         <details className="evidence-tables" open>

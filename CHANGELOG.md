@@ -51,6 +51,15 @@ First MVP release candidate. There is no tagged release yet.
     legend, compass and camera controls, live-feed pill, and a slide-over for the selected building or
     route. The existing evidence tables are preserved verbatim in a collapsible section below the map as
     the text-first, non-WebGL equivalent.
+  - **Every building and facility is named on the map.** A ground label sits on the pavement at the
+    frontage each building is entered from — the same kerb point the GPS route stops at, so the label
+    and the route agree about where a building's front is (`web/src/cityLabels.ts`). Building labels
+    are schema-qualified, which is what a neighborhood tint used to convey. A label carries identity
+    and nothing else: it never restates or qualifies a measurement, so footprint, height, roof cap,
+    road, and lane keep their documented meanings unchanged. Long names elide from the middle rather
+    than the end, because a name's tail is often the only thing separating `orders_2024_q3_archive`
+    from `orders_2024_q3_current`. One texture is rasterized per distinct string and reused, so a
+    live tick or an appended page redraws labels without churning GPU memory.
 - **Waits as traffic to infrastructure.** Query Store wait categories, which were already collected
   but discarded before reaching the city, now flow through `DatabaseCityQueryFamilyV1.WaitMillisecondsByCategory`
   and render as **wait lanes** from a building to the facility whose resource its workload queued for
@@ -153,6 +162,16 @@ First MVP release candidate. There is no tagged release yet.
   backup/restore tooling with operations documentation.
 
 ### Changed
+
+- **Schema neighborhoods are off by default and the layer that draws them is now named for what it
+  draws.** The toggle was called "Districts" and started switched on, tinting a translucent plate
+  under every schema so the map met you pre-coloured by a grouping that encodes nothing measured.
+  Now that each building label carries its schema name, the tint is redundant as well as busy, so it
+  starts off and is labelled **Schema neighborhoods**. Nothing about layout changed: buildings sit on
+  the same lots, in the same neighborhoods, in the same order. The civic district's own tint moved to
+  the infrastructure layer, so it is drawn with the facilities it holds — which both keeps the
+  infrastructure district legible when schema neighborhoods are off, and keeps the toggle's name
+  literally true rather than quietly also hiding a district that is not a schema.
 
 - **Query Store is now wired into the connected map.** `ConnectedDatabaseCitySource` used to emit
   `topQueryFamilies: []` and `routes: []` against a live server, so on a real connection the city had
