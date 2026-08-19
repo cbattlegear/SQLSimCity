@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildingLabelText,
+  createCityLabels,
   elideMiddle,
   labelAnchor,
   labelWorldWidth,
@@ -70,6 +71,93 @@ describe('labelWorldWidth', () => {
     expect(labelWorldWidth(0, 80)).toBe(0)
     expect(labelWorldWidth(400, 0)).toBe(0)
     expect(labelWorldWidth(Number.NaN, 80)).toBe(0)
+  })
+})
+
+describe('createCityLabels', () => {
+  /**
+   * Minimal 2D canvas stub. Vitest runs in a node environment with no DOM, but the sprite decisions
+   * worth locking down — depth behaviour, render order, world size — are settled at sprite creation
+   * and need no GPU to observe.
+   */
+  function stubCanvas() {
+    const context = {
+      font: '',
+      textAlign: '',
+      textBaseline: '',
+      fillStyle: '',
+      strokeStyle: '',
+      lineWidth: 0,
+      measureText: (text: string) => ({ width: text.length * 30 }),
+      beginPath: () => {},
+      moveTo: () => {},
+      arcTo: () => {},
+      closePath: () => {},
+      fill: () => {},
+      stroke: () => {},
+      fillText: () => {},
+    }
+    const previous = globalThis.document
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: {
+        createElement: () => ({
+          width: 0,
+          height: 0,
+          getContext: (kind: string) => (kind === '2d' ? context : null),
+        }),
+      },
+    })
+    return () => {
+      if (previous === undefined) delete (globalThis as { document?: unknown }).document
+      else Object.defineProperty(globalThis, 'document', { configurable: true, value: previous })
+    }
+  }
+
+  it('draws labels without depth testing, so a building never hides another building\'s name', () => {
+    const restore = stubCanvas()
+    try {
+      const labels = createCityLabels()
+      const sprite = labels.make('dbo.Customer')
+      expect(sprite).not.toBeNull()
+      // The whole point: identity survives every camera angle.
+      expect(sprite!.material.depthTest).toBe(false)
+      // Still never writes depth, so a label cannot occlude the geometry it floats over.
+      expect(sprite!.material.depthWrite).toBe(false)
+      // Above the road (1) and halo (2) render orders used by the scene.
+      expect(sprite!.renderOrder).toBeGreaterThan(2)
+      labels.dispose()
+    } finally {
+      restore()
+    }
+  })
+
+  it('sizes a sprite to the shared world height, preserving its rasterized aspect', () => {
+    const restore = stubCanvas()
+    try {
+      const labels = createCityLabels()
+      const sprite = labels.make('dbo.Customer')!
+      expect(sprite.scale.y).toBeCloseTo(LABEL_WORLD_HEIGHT)
+      expect(sprite.scale.x).toBeGreaterThan(0)
+      labels.dispose()
+    } finally {
+      restore()
+    }
+  })
+
+  it('reuses one material per distinct string, so a rebuild does not churn textures', () => {
+    const restore = stubCanvas()
+    try {
+      const labels = createCityLabels()
+      const first = labels.make('dbo.Customer')!
+      const second = labels.make('dbo.Customer')!
+      const other = labels.make('dbo.OrderHeader')!
+      expect(second.material).toBe(first.material)
+      expect(other.material).not.toBe(first.material)
+      labels.dispose()
+    } finally {
+      restore()
+    }
   })
 })
 

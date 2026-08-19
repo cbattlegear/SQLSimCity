@@ -515,8 +515,9 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, onOpenQuery
           neither divided between those buildings nor counted inside any of their own totals.
           Unknown size or unavailable activity uses fixed wireframe geometry and makes no quantity
           claim. Ground labels name each building and facility and carry identity only — a label
-          never restates or qualifies a measurement. Every building stands alone on its own block,
-          which separates one table from the next without depending on a layer being switched on;
+          never restates or qualifies a measurement. Labels draw in front of all geometry so a name
+          is never hidden by the city it describes; a label names only the building at its own
+          anchor, so one that happens to overlap other geometry is not naming that geometry. Every building stands alone on its own block,          which separates one table from the next without depending on a layer being switched on;
           a building&apos;s block position comes from its stable layout ordinals and encodes nothing,
           so neighbouring buildings are not related by being neighbours. Everything else — roof
           shapes, windows, doors, setbacks, crowns, sidewalks, schema neighborhood tints — is

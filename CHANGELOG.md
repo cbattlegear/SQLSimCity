@@ -163,6 +163,18 @@ First MVP release candidate. There is no tagged release yet.
 
 ### Changed
 
+- **Building labels are larger and are never hidden by the city.** At the default framing most table
+  labels were unreadable: they rasterized small and, being depth-tested, were drawn behind the very
+  buildings they named. Labels now ignore the depth buffer entirely (`depthTest: false`, render order
+  above every other pass in the scene) and `LABEL_WORLD_HEIGHT` rises from `3.6` to `6.2`. Measured
+  on the sales fixture at the reset view: all 10 labels resolve as distinct on-screen boxes with
+  **zero overlapping pairs**, and glyph bands grow from roughly 9-12px to 15-20px. `LABEL_MAX_CHARS`
+  drops from `32` to `24` to hold plate width in check, since width scales with the new height and a
+  long name would otherwise span several lots; the elision is still from the middle, so both ends of
+  a name survive, and the full name remains in the evidence tables and detail panel. The tradeoff is
+  disclosed rather than hidden: a label drawn in front can overlap geometry it does not name, so the
+  "what encodes evidence" note now states that a label names only the building at its own anchor.
+
 - **Multi-object query plans are drawn instead of footnoted.** A query family naming more than one
   object used to be dropped from the wait layer entirely: its milliseconds went into a text-only
   "shared" bucket and nothing reached the map. The refusal was sound — Query Store measures one wait

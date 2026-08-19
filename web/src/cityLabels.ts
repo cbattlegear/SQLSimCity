@@ -9,6 +9,11 @@ import * as THREE from 'three'
  * when schema neighborhoods are switched off, because the district tint is then no longer there to
  * say which schema a building belongs to -- so a building label is schema-qualified.
  *
+ * Labels are drawn in front of every other object rather than depth-tested against the city. A name
+ * hidden behind the building it names is worth nothing, and at the default framing most of them were
+ * hidden. The cost is that a label can overlap geometry it does not name, so a label is always
+ * anchored at its own building's kerb and the evidence tables below the map remain authoritative.
+ *
  * Rasterization lives behind {@link createCityLabels}. The text and geometry decisions above it are
  * pure functions so they can be tested without a DOM or a GPU.
  */
@@ -17,13 +22,21 @@ import * as THREE from 'three'
 const FONT_PX = 56
 const PAD_X = 20
 const PAD_Y = 12
-/** Height of a label in world units. Labels are size-attenuated, so they shrink with distance. */
-export const LABEL_WORLD_HEIGHT = 3.6
+/**
+ * Height of a label in world units. Labels are size-attenuated, so they still shrink with distance;
+ * this sets how large they are at a given range. Sized so a name stays readable from the default
+ * framing, where a label competes with towers several times its height for attention.
+ */
+export const LABEL_WORLD_HEIGHT = 6.2
 /**
  * Longest label drawn before the middle is elided. A wide texture costs both memory and legibility,
  * and the full name is always available in the evidence tables and the detail panel.
+ *
+ * Width scales with {@link LABEL_WORLD_HEIGHT}, so a long name at the current height spans several
+ * lots. This limit is what keeps that in hand; the elision is from the middle, so both ends of a
+ * name survive.
  */
-export const LABEL_MAX_CHARS = 32
+export const LABEL_MAX_CHARS = 24
 
 const ELLIPSIS = '…'
 
@@ -146,7 +159,15 @@ export function createCityLabels(): CityLabels {
     texture.anisotropy = 4
 
     const entry: RasterizedLabel = {
-      material: new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false }),
+      material: new THREE.SpriteMaterial({
+        map: texture,
+        transparent: true,
+        depthWrite: false,
+        // Labels ignore the depth buffer so a building can never hide the name of the building
+        // behind it. Identity is the one thing that must survive any camera angle: a name you
+        // cannot read is no more useful than no name at all.
+        depthTest: false,
+      }),
       pixelWidth: canvas.width,
       pixelHeight: canvas.height,
     }
@@ -160,9 +181,9 @@ export function createCityLabels(): CityLabels {
       if (!entry) return null
       const sprite = new THREE.Sprite(entry.material)
       sprite.scale.set(labelWorldWidth(entry.pixelWidth, entry.pixelHeight), LABEL_WORLD_HEIGHT, 1)
-      // Drawn after the city so a label is never half-hidden by the pavement it rests on, while
-      // depth testing still lets a building in front of it do the hiding.
-      sprite.renderOrder = 3
+      // Above every other render order in the scene, so labels resolve last and against each other
+      // by camera distance rather than by the order buildings happened to be added.
+      sprite.renderOrder = 10
       return sprite
     },
     dispose() {
