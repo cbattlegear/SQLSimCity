@@ -75,8 +75,21 @@ No `flex` arrangement on `.map-sidebar`'s children can shrink it. Do not add `mi
 `.sidebar-drawer` to try: that is the 10px-drawer defect above, and it is pinned by
 `never shrinks the legend drawer past its own summary`.
 
+Cap the box itself instead. `.sidebar-drawer::details-content` is given `min-height: 0` so it can
+give way, plus `display: flex; flex-direction: column` so the shrink reaches `.sidebar-drawer-body`,
+which is already a `min-height: 0; overflow: auto` scroller. The legend then scrolls inside the
+drawer rather than spilling out of the rail. An engine without `::details-content` skips the rule
+and does not need it: without that box the summary and the body are the flex items directly, and the
+body already scrolls. The defect exists only where the box does.
+
+`.sidebar-drawer` keeps `min-height: auto`, and a flex item's automatic minimum is its content size
+clamped by its own definite `max-height`. So each drawer still floors at `min(content, 46vh)` —
+368px in an 800px viewport, summary always inside that. Two open drawers therefore cannot both
+shrink out of the way, which is a separate defect from this one.
+
 There are three `.sidebar-drawer` instances — one in `App.tsx` and two in `DatabaseCityView.tsx`.
-Check the change against more than one.
+Check the change against more than one. The two in `DatabaseCityView.tsx` are siblings in the same
+column, so they are the case where the caps compete.
 
 ## NuGet lock files move together
 
@@ -101,7 +114,7 @@ Do not weaken `--locked-mode` in CI to get around this. It is a supply-chain con
 ```powershell
 dotnet build SqlSimCity.slnx -c Release        # 0 warnings expected
 dotnet test SqlSimCity.slnx -c Release         # 1,139 tests
-cd web; npm ci; npm run build; npm test -- --run   # 679 tests / 39 files
+cd web; npm ci; npm run build; npm test -- --run   # 681 tests / 39 files
 npm run typecheck
 ```
 
