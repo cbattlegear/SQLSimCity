@@ -365,16 +365,50 @@ describe('the sidebar column scrolls its own overflow', () => {
    * `min-height: 0` here is the difference between "the legend collapses to its summary" and "the
    * legend collapses to ten pixels and you can no longer click it", which is what a full column
    * actually did when this was first written. Leaving the drawer's minimum at `auto` floors it on its
-   * own summary. The ban is checked at every width, not just on the desktop rule, because a narrow
-   * override would apply to the same element.
+   * content clamped by its own `max-height` -- measured at 368px in an 800px viewport, with the
+   * summary always inside that -- so the control stays clickable however hard the column pushes.
+   *
+   * The ban is checked at every width, not just on the desktop rule, because a narrow override would
+   * apply to the same element. Note the filter is an exact string match: it is deliberately blind to
+   * `.sidebar-drawer::details-content`, which is a different box and *is* meant to shrink, but it is
+   * equally blind to any future rule that reaches this element by some other selector.
    */
   it('never shrinks the legend drawer past its own summary', () => {
-    for (const rule of rules().filter((one) => one.selector.split(',')
-      .some((part) => part.trim() === '.sidebar-drawer'))) {
+    const drawerRules = rules().filter((one) => one.selector.split(',')
+      .some((part) => part.trim() === '.sidebar-drawer'))
+    // Or the loop below would pass by matching nothing at all.
+    expect(drawerRules.length, 'no .sidebar-drawer rule to check').toBeGreaterThan(1)
+    for (const rule of drawerRules) {
       expect(rule.body, 'a .sidebar-drawer rule sets min-height: 0').not.toMatch(/min-height:\s*0/)
     }
     expect(desktopRule('.sidebar-drawer-body')).toMatch(/min-height:\s*0/)
     expect(css).toMatch(/\.sidebar-drawer > summary \{[^}]*flex:\s*none/)
+  })
+
+  /**
+   * The box the drawer actually shrinks (#63).
+   *
+   * `details` wraps everything after its summary in a `::details-content` box, and *that* box is the
+   * second flex item of `.sidebar-drawer` -- not the summary, and not `.sidebar-drawer-body`. It is
+   * `display: block; min-height: auto`, so it floored on its own content (479.688px measured) while
+   * the drawer's `max-height: 46vh` held the drawer at 368px, and the 147px difference spilled out of
+   * a `.map-sidebar` that is `overflow: hidden`, unreachable.
+   *
+   * `.sidebar-drawer-body` was already a `min-height: 0` scroller, but a block box in front of it
+   * absorbed no shrink and forwarded none, so it never had a height to scroll inside of. Making the
+   * content box shrinkable *and* a flex column is what connects the two.
+   */
+  it('lets the drawer shrink the box that actually holds its content', () => {
+    const content = desktopRule('.sidebar-drawer::details-content')
+    expect(content, '.sidebar-drawer::details-content has no rule at all').not.toBeNull()
+    // Without this the box floors on its content and no flex arrangement above it can win.
+    expect(content, 'the drawer content box still refuses to shrink').toMatch(/min-height:\s*0/)
+    // And the pressure has to reach the scroller inside, or the box just clips instead.
+    expect(content, 'the drawer content box does not forward its shrink').toMatch(/display:\s*flex/)
+    expect(content).toMatch(/flex-direction:\s*column/)
+    expect(desktopRule('.sidebar-drawer-body'), 'nothing to receive the shrink').toMatch(/overflow:\s*auto/)
+    // The drawer element itself is untouched: it still caps, and it still floors on its content.
+    expect(desktopRule('.sidebar-drawer')).toMatch(/max-height:\s*46vh/)
   })
 })
 
@@ -419,12 +453,32 @@ describe('the narrow bottom sheet scrolls as one region', () => {
    * A nested scroller inside a scrolling sheet is a gesture trap: you drag over the address list
    * expecting the sheet to move and the list swallows it. Every scroller the desktop rail defines
    * inside the sidebar has to be switched off here.
+   *
+   * This is also what keeps the desktop `::details-content` fix (#63) out of the sheet. That rule is
+   * not media-scoped -- it forwards shrink to `.sidebar-drawer-body` at every width -- but a forwarded
+   * shrink only becomes a scroller if the body scrolls, and here it does not. Measured at 800x700
+   * with the drawer open, the sheet has zero nested scrollers before and after that change.
    */
   it('leaves no scroller nested inside the scrolling sheet', () => {
     for (const selector of ['.sidebar-scroll', '.sidebar-drawer-body', '.sidebar-place-card .place-card']) {
       expect(desktopRule(selector), `${selector} is not a desktop scroller`).toMatch(/overflow:\s*auto/)
       expect(narrowRule(selector), `${selector} still scrolls inside the sheet`).toMatch(/overflow:\s*visible/)
     }
+  })
+
+  /**
+   * And nothing shrinks the drawer here either, so the content box has nothing to forward.
+   *
+   * `.map-sidebar > *` is `flex: none` and the drawer's cap is dropped, so the drawer sizes to its
+   * content and the `::details-content` box is never compressed. If a future change gives the drawer
+   * a height in the sheet, this is the assertion that should start failing.
+   */
+  it('never compresses the drawer content box inside the sheet', () => {
+    expect(narrowRule('.sidebar-drawer'), '.sidebar-drawer keeps a cap in the sheet').toMatch(/max-height:\s*none/)
+    expect(narrowCss).toMatch(/\.map-sidebar > \*\s*\{[^}]*flex:\s*none/)
+    // The desktop fix is defined once, outside any media query, and is inert here rather than undone.
+    expect(desktopRule('.sidebar-drawer::details-content')).not.toBeNull()
+    expect(narrowRule('.sidebar-drawer::details-content')).toBeNull()
   })
 
   /**

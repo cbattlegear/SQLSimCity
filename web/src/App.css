@@ -1144,10 +1144,10 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
 /*
  * Same shape as the place card: the cap sits on the drawer so the drawer can shrink below it too.
  *
- * Deliberately no `min-height: 0` here. The drawer's content-based minimum is its own summary -- the
- * body inside it is already a `min-height: 0` scroller and so contributes nothing -- which is exactly
- * the floor this needs. Adding `min-height: 0` let a full column squeeze the drawer to ten pixels and
- * clip the control you open it with.
+ * Deliberately no `min-height: 0` on `.sidebar-drawer` itself. Its automatic minimum is its content
+ * height clamped by this `max-height` -- 368px in an 800px viewport, with the summary always inside
+ * that -- and removing that floor let a full column squeeze the drawer to ten pixels and clip the
+ * control you open it with. The shrinking happens one level in instead: see `::details-content`.
  */
 .sidebar-drawer {
   flex: 0 1 auto;
@@ -1169,6 +1169,32 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
 .sidebar-drawer[open] > summary { border-bottom: 1px solid #1c2733; }
 .sidebar-drawer-body { min-height: 0; overflow: auto; }
 .sidebar-drawer-body > * { margin-block: 0; }
+
+/*
+ * The box the drawer actually shrinks.
+ *
+ * `details` wraps everything after its summary in a `::details-content` box, and *that* box -- not
+ * the summary, and not `.sidebar-drawer-body` -- is the second flex item of `.sidebar-drawer`. It is
+ * `display: block` with `min-height: auto`, so it floors on its own content: measured at 479.688px
+ * on the atlas legend. The drawer's own `max-height: 46vh` clamps the drawer to 368px at an 800px
+ * viewport, the content box keeps its 479px regardless, and the difference spilled out of a
+ * `.map-sidebar` that is `overflow: hidden` -- 147px of legend that nothing could scroll to (#63).
+ *
+ * `.sidebar-drawer-body` was already a `min-height: 0` scroller, but the block box in front of it
+ * absorbed no pressure and passed none on, so it never had a height to scroll inside of. So the
+ * content box is made shrinkable and turned into a flex column, which forwards the shrink to the
+ * body, which then scrolls the legend internally. The drawer keeps its cap, the rail keeps its
+ * pinned header and search field, and nothing else in the column moves.
+ *
+ * An engine without `::details-content` skips this rule -- and does not need it. Without that box the
+ * summary and `.sidebar-drawer-body` are the flex items directly, and the body's own `min-height: 0;
+ * overflow: auto` already scrolls. The defect exists only where the box does.
+ */
+.sidebar-drawer::details-content {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 
 
 /* --- Incident pins ------------------------------------------------------------------------- */
