@@ -21,6 +21,13 @@ import { createCityLabels, databaseLabelText, labelAnchor, type CityLabels } fro
 import type { AtlasSnapshot, DatabaseAtlasItem, EdgeConfidence } from './contracts'
 import { polygonPositions, ribbonPositions } from './mapRibbon'
 import { LANDUSE_CITY_COLORS, LANDUSE_MAP_COLORS, MAP_PALETTE, type MapViewMode } from './mapStyle'
+import {
+  ATLAS_ATMOSPHERE,
+  resolveTimeOfDay,
+  watchTimeOfDay,
+  type AtlasAtmosphere,
+  type TimeOfDay,
+} from './timeOfDay'
 
 /**
  * The server atlas: one small city per database on a shared grid.
@@ -51,14 +58,14 @@ const HIGHWAY_FILL_WIDTH = 3.4
 const HIGHWAY_CASING_WIDTH = 5.4
 
 /**
- * The dusk beyond the last town.
+ * The sky beyond the last town.
  *
  * Both the clear colour and the fog colour in 3D, which is the whole trick: with the two matched, the
  * landscape fades into the sky at the horizon instead of ending at a hard edge with a void behind it.
- * The database city one level down already sits under a dusk sky, and an atlas lit differently from
- * the city it zooms into is two drawings rather than two altitudes over one place.
+ * The database city one level down stands under the same hour, and an atlas lit differently from
+ * the city it zooms into is two drawings rather than two altitudes over one place. That is why both
+ * read their light out of the same `timeOfDay` module.
  */
-const ATLAS_SKY = 0x2b3a45
 
 type AtlasSceneCallbacks = {
   onHover: (databaseId: string | null) => void
@@ -104,6 +111,11 @@ export class AtlasScene {
   private readonly frameCenter = new THREE.Vector3()
   private readonly frameExtents = new THREE.Vector3(MIN_FRAME_EXTENT, MIN_FRAME_EXTENT, MIN_FRAME_EXTENT)
   private readonly nightLights: THREE.Object3D[]
+  private readonly hemiLight: THREE.HemisphereLight
+  private readonly keyLight: THREE.DirectionalLight
+  /** The hour the region is drawn in. Read from the viewer's clock; encodes nothing measured. */
+  private timeOfDay: TimeOfDay = resolveTimeOfDay(new Date())
+  private readonly stopWatchingClock: () => void
   private readonly ambientLight: THREE.AmbientLight
   /** The fixed regional landscape. Seeded once, never refitted, and never derived from a measurement. */
   private readonly terrainPlan: AtlasTerrain = planAtlasTerrain()
@@ -116,20 +128,26 @@ export class AtlasScene {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false })
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
-    this.renderer.setClearColor(ATLAS_SKY, 1)
+    this.renderer.setClearColor(this.atmosphere.sky, 1)
     this.frameCenter.set(0, 0, 0)
 
     /*
-     * Golden hour, the same hour the database city stands in. A warm low key light against a cool sky
-     * fill is what gives a skyline a lit face and a shaded one; lit flat, a town is a grey mass and
-     * the whole point of the 3D view -- that you can see the shape of a place -- is lost.
+     * A warm low key light against a cool sky fill is what gives a skyline a lit face and a shaded
+     * one; lit flat, a town is a grey mass and the whole point of the 3D view — that you can see the
+     * shape of a place — is lost. Which warm and which cool comes from the hour the viewer is in,
+     * the same hour the database city one level down is drawn under.
      */
-    this.scene.fog = new THREE.Fog(ATLAS_SKY, 520, 1150)
-    this.scene.add(new THREE.HemisphereLight(0xa8cbe4, 0x35392a, 1.05))
-    const key = new THREE.DirectionalLight(0xffd39a, 3.1)
-    key.position.set(-160, 130, 120)
-    this.scene.add(key)
-    this.nightLights = [this.scene.children[0], key]
+    this.scene.fog = new THREE.Fog(this.atmosphere.sky, 520, 1150)
+    this.hemiLight = new THREE.HemisphereLight(
+      this.atmosphere.hemiSky,
+      this.atmosphere.hemiGround,
+      this.atmosphere.hemiIntensity,
+    )
+    this.scene.add(this.hemiLight)
+    this.keyLight = new THREE.DirectionalLight(this.atmosphere.keyColor, this.atmosphere.keyIntensity)
+    this.keyLight.position.set(-160, 130, 120)
+    this.scene.add(this.keyLight)
+    this.nightLights = [this.hemiLight, this.keyLight]
     // Intensity π, not 1: three.js resolves ambient light through the Lambert BRDF, which divides by
     // π, so an intensity of 1 would draw every surface at about a third of its own colour. Cancelling
     // that divide is what makes a lit material render as exactly its base colour in map mode.
@@ -146,7 +164,40 @@ export class AtlasScene {
     canvas.addEventListener('click', this.handleClick)
     canvas.addEventListener('dblclick', this.handleDoubleClick)
     this.reducedMotion.addEventListener('change', this.handleMotionPreference)
+    this.stopWatchingClock = watchTimeOfDay(phase => {
+      if (phase === this.timeOfDay) return
+      this.timeOfDay = phase
+      this.applyAtmosphere()
+    })
     this.resize()
+  }
+
+  /** The atlas rig for the hour the viewer is in. */
+  private get atmosphere(): AtlasAtmosphere {
+    return ATLAS_ATMOSPHERE[this.timeOfDay]
+  }
+
+  /**
+   * Moves the region to a new hour.
+   *
+   * Lights and fog only. A snapshot rebuild is what a *view mode* switch costs, because the two
+   * modes draw different geometry; two hours draw the same geometry under different light, so
+   * rebuilding here would be pure churn on a thirty-second refresh timer.
+   *
+   * Map mode is skipped outright: a printed sheet has no sky, and `setViewMode` reads the current
+   * atmosphere back when the 3D view returns.
+   */
+  private applyAtmosphere(): void {
+    const atmosphere = this.atmosphere
+    this.hemiLight.color.setHex(atmosphere.hemiSky)
+    this.hemiLight.groundColor.setHex(atmosphere.hemiGround)
+    this.hemiLight.intensity = atmosphere.hemiIntensity
+    this.keyLight.color.setHex(atmosphere.keyColor)
+    this.keyLight.intensity = atmosphere.keyIntensity
+    if (this.viewMode === 'map') return
+    this.renderer.setClearColor(atmosphere.sky, 1)
+    if (this.scene.fog instanceof THREE.Fog) this.scene.fog.color.setHex(atmosphere.sky)
+    this.render()
   }
 
   setSnapshot(snapshot: AtlasSnapshot): void {
@@ -214,12 +265,12 @@ export class AtlasScene {
     if (mode === this.viewMode) return
     this.viewMode = mode
     const flat = mode === 'map'
-    this.renderer.setClearColor(flat ? MAP_PALETTE.ground : ATLAS_SKY, 1)
+    this.renderer.setClearColor(flat ? MAP_PALETTE.ground : this.atmosphere.sky, 1)
     for (const light of this.nightLights) light.visible = !flat
     this.ambientLight.visible = flat
     // Fog is what stops the far edge of the landscape reading as a cliff into empty space. The flat
     // drawing is a printed sheet seen straight down, and a printed sheet has no haze.
-    this.scene.fog = flat ? null : new THREE.Fog(ATLAS_SKY, 520, 1150)
+    this.scene.fog = flat ? null : new THREE.Fog(this.atmosphere.sky, 520, 1150)
     this.buildTerrain()
     if (this.lastSnapshot) this.setSnapshot(this.lastSnapshot)
     else this.placeCamera()
@@ -312,6 +363,7 @@ export class AtlasScene {
     this.canvas.removeEventListener('click', this.handleClick)
     this.canvas.removeEventListener('dblclick', this.handleDoubleClick)
     this.reducedMotion.removeEventListener('change', this.handleMotionPreference)
+    this.stopWatchingClock()
     this.clearAtlasObjects()
     for (const geometry of this.geometryCache.values()) disposeCityGeometry(geometry)
     this.geometryCache.clear()

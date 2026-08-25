@@ -866,10 +866,13 @@ function LegendDrawer({
           measured. The river and its banks, the ground relief, every land-use area — parks,
           woodland, orchards, plazas, parking, yards and open water — the trees, hedges, streetlights,
           benches, parked cars and other street furniture, the architecture of the six infrastructure
-          facilities, and the whole golden-hour palette, sky and shadows are all generated from the
-          same database-id seed as the block layout. None of them is derived from any measurement, so
-          none of them can be read as one: a park is not idle space, a wooded edge is not a cold
-          table, and a district with few streets is not a sparse schema.
+          facilities, and the whole palette are all generated from the same database-id seed as the
+          block layout. The sky, the sun and the shadows are not even seeded: they follow the clock
+          on the machine you are reading this on, so the city is lit as morning, day, evening or
+          night to match your own hour, and lit identically for a healthy instance and a failing one.
+          None of it is derived from any measurement, so none of it can be read as one: a park is not
+          idle space, a wooded edge is not a cold table, a district with few streets is not a sparse
+          schema, and a dark city is not an idle one.
         </p>
 
         <p className="mapping-note">

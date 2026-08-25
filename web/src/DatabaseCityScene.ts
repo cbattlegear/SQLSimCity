@@ -45,6 +45,13 @@ import {
   MAP_STREET,
   type MapViewMode,
 } from './mapStyle'
+import {
+  CITY_ATMOSPHERE,
+  resolveTimeOfDay,
+  watchTimeOfDay,
+  type CityAtmosphere,
+  type TimeOfDay,
+} from './timeOfDay'
 import type { LandUse, TerrainBlock } from './cityTerrain'
 import type { IncidentMarker } from './cityIncidents'
 
@@ -236,6 +243,16 @@ export function createDatabaseCityScene(
     typeof window.matchMedia === 'function' &&
     window.matchMedia('(prefers-reduced-motion: reduce)').matches
 
+  /*
+   * The hour the city is standing in.
+   *
+   * Read from the clock on the machine looking at it, and re-read on a timer further down so a tab
+   * left open crosses into the next phase on its own. The light is decoration and encodes nothing —
+   * the sun sits in the same place for a healthy instance and a failing one at the same hour. See
+   * `timeOfDay.ts` for why the four looks are four *rigs* rather than four palettes.
+   */
+  let timeOfDay: TimeOfDay = resolveTimeOfDay(new Date())
+
   const scene = new THREE.Scene()
   scene.background = new THREE.Color(0x070b11)
   const camera = new THREE.PerspectiveCamera(46, 1, 1, 8000)
@@ -274,21 +291,25 @@ export function createDatabaseCityScene(
   controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN }
 
   /*
-   * Golden hour.
+   * The lighting rig.
    *
-   * The 3D city is lit as late afternoon rather than as a neutral studio, because a low sun is the
-   * cheapest and most honest depth cue available: every building's own shadow states its height a
-   * second time, and the ~47% of ground that carries no building finally has something on it. The
+   * The 3D city is lit as a real hour rather than as a neutral studio, because a directional sun is
+   * the cheapest and most honest depth cue available: every building's own shadow states its height
+   * a second time, and the ~47% of ground that carries no building finally has something on it. The
    * light is decoration and encodes nothing — the sun sits in the same place for a healthy instance
-   * and a failing one.
-   */
-  /*
-   * Shadow fill is as deliberate as the key.
+   * and a failing one at the same hour.
    *
-   * A low sun paired with a weak sky turns every shadow into a navy void, and since roughly half the
-   * ground is in shadow at this hour that erases half the map. The hemisphere is pitched bright and
-   * only lightly cool, with a warm bounce underneath, so shaded parkland still reads as parkland.
+   * Which hour is `timeOfDay`, and every colour and intensity below is overwritten by
+   * `applyAtmosphere()` before the first frame. They are constructed at the evening values, which is
+   * the golden hour the city has always been drawn in, so that a scene which somehow never reaches
+   * that call still renders the historical look rather than black.
+   *
+   * Shadow fill is as deliberate as the key. A low sun paired with a weak sky turns every shadow
+   * into a navy void, and since roughly half the ground is in shadow at that hour it erases half the
+   * map. So the hemisphere is pitched bright with a warm bounce underneath at every phase, and at
+   * night it is the *only* thing keeping the ground readable — see `timeOfDay.ts`.
    */
+  const cityAtmosphere = () => CITY_ATMOSPHERE[timeOfDay]
   const hemiLight = new THREE.HemisphereLight(0xa8b6c9, 0x6a5a45, 1.75)
   scene.add(hemiLight)
   const keyLight = new THREE.DirectionalLight(0xffc286, 2.2)
@@ -312,24 +333,28 @@ export function createDatabaseCityScene(
    *
    * The warm band is deliberately narrow. A golden hour is warm *at the horizon* and deep blue
    * overhead — spread the orange across the whole dome and it stops reading as a sunset and starts
-   * reading as a wall.
-   */
-  const SKY_ZENITH = new THREE.Color(0x14203c)
-  const SKY_UPPER = new THREE.Color(0x3c4a72)
-  const SKY_HORIZON = new THREE.Color(0xf0b072)
-  /*
+   * reading as a wall. The same holds for the other three hours: the phase changes what the band is
+   * *made of*, never how wide it is.
+   *
    * Below the horizon the dome is not sky at all — it is the haze that distant ground dissolves
    * into, and at this camera angle it is most of what you see. It has to obey aerial perspective,
    * which means distance makes ground *lighter and warmer*, not darker: the band is brightest right
    * at the horizon and settles toward the colour of the land as it comes back down towards the
    * viewer. Painting it dark turned the whole background into a muddy wall.
+   *
+   * Baked rather than shaded, so a phase change has to re-bake. It is 24×20 vertices and happens at
+   * most four times a day.
    */
-  const HAZE_NEAR = new THREE.Color(0xc6a184)
-  const HAZE_FAR = new THREE.Color(0x6d6b52)
   const skyGeometry = new THREE.SphereGeometry(1, 24, 20)
-  {
+  function paintSkyDome(atmosphere: CityAtmosphere) {
+    const zenith = new THREE.Color(atmosphere.skyZenith)
+    const upper = new THREE.Color(atmosphere.skyUpper)
+    const horizon = new THREE.Color(atmosphere.skyHorizon)
+    const hazeNear = new THREE.Color(atmosphere.hazeNear)
+    const hazeFar = new THREE.Color(atmosphere.hazeFar)
     const position = skyGeometry.getAttribute('position')
-    const colors = new Float32Array(position.count * 3)
+    const existing = skyGeometry.getAttribute('color') as THREE.BufferAttribute | undefined
+    const colors = existing ? (existing.array as Float32Array) : new Float32Array(position.count * 3)
     const color = new THREE.Color()
     for (let index = 0; index < position.count; index += 1) {
       const y = position.getY(index)
@@ -337,16 +362,18 @@ export function createDatabaseCityScene(
         // Two stops rather than one: warm to dusk-blue in the first few degrees, dusk-blue to
         // near-black over the rest of the dome.
         const low = Math.min(1, Math.pow(y, 0.28))
-        color.copy(SKY_HORIZON).lerp(SKY_UPPER, low).lerp(SKY_ZENITH, Math.pow(y, 1.4))
+        color.copy(horizon).lerp(upper, low).lerp(zenith, Math.pow(y, 1.4))
       } else {
-        color.copy(HAZE_NEAR).lerp(HAZE_FAR, Math.min(1, Math.pow(-y, 0.5)))
+        color.copy(hazeNear).lerp(hazeFar, Math.min(1, Math.pow(-y, 0.5)))
       }
       colors[index * 3] = color.r
       colors[index * 3 + 1] = color.g
       colors[index * 3 + 2] = color.b
     }
-    skyGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    if (existing) existing.needsUpdate = true
+    else skyGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
   }
+  paintSkyDome(cityAtmosphere())
   const skyDome = new THREE.Mesh(
     skyGeometry,
     new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, depthWrite: false, fog: false }),
@@ -356,16 +383,17 @@ export function createDatabaseCityScene(
 
   /**
    * Haze at the edge of the city, so the ground fades into the horizon rather than ending at a hard
-   * edge. Tinted to the warm band it is dissolving into.
+   * edge. Tinted to the band it is dissolving into, which is why it is a phase value and not a
+   * constant: a warm fog under a night sky reads as a city on fire.
    */
-  const cityFog = new THREE.Fog(0xc6a184, 900, 3200)
+  const cityFog = new THREE.Fog(cityAtmosphere().fogColor, 900, 3200)
   /*
    * City mode is the mode the scene opens in, and `applyViewMode` only runs on a *change* — so the
    * atmosphere has to be armed here or the first view of every city renders with no fog, which is
    * what left the ground plane sitting in the sky as a hard-edged slab.
    */
   scene.fog = cityFog
-  scene.background = new THREE.Color(0x131f36)
+  scene.background = new THREE.Color(cityAtmosphere().background)
   /**
    * Map mode's only light.
    *
@@ -746,11 +774,53 @@ export function createDatabaseCityScene(
     return material
   }
 
+  /**
+   * Which materials are lit from the *inside* rather than by the sun.
+   *
+   * These are the only colours the hour is allowed to move, and they move opposite to the sky: a
+   * window is brightest against a dark one. Everything else in the drawing keeps a single albedo
+   * across all four phases and is re-graded by the lighting rig, which is what keeps one palette in
+   * one place instead of four that drift apart.
+   */
+  const LIT_FROM_WITHIN = ['window', 'kitGlass'] as const
+
+  /**
+   * Pushes the current hour into the lights, the sky, the haze, and the lit windows.
+   *
+   * Deliberately does *not* touch geometry, framing, or any measured colour, so a phase change is a
+   * handful of `setHex` calls and a re-bake of a 24×20 dome — never a rebuild.
+   */
+  function applyAtmosphere() {
+    const atmosphere = cityAtmosphere()
+    paintSkyDome(atmosphere)
+    hemiLight.color.setHex(atmosphere.hemiSky)
+    hemiLight.groundColor.setHex(atmosphere.hemiGround)
+    hemiLight.intensity = atmosphere.hemiIntensity
+    keyLight.color.setHex(atmosphere.keyColor)
+    keyLight.intensity = atmosphere.keyIntensity
+    fillLight.color.setHex(atmosphere.fillColor)
+    fillLight.intensity = atmosphere.fillIntensity
+    cityFog.color.setHex(atmosphere.fogColor)
+    // The sun moves with the hour, so the shadow frustum has to be re-aimed at the plan it was
+    // fitted to. Skipped before the first plan arrives; `setPlan` aims it then.
+    if (plan) aimSunAt(plan)
+    // Map mode owns the background and the emissives while it is on screen — a printed basemap has
+    // no sky and no lit windows. `applyViewMode` reads the atmosphere back when the city returns.
+    if (flatMode) return
+    scene.background = new THREE.Color(atmosphere.background)
+    for (const name of LIT_FROM_WITHIN) {
+      const material = materials[name]
+      material.emissive.setHex(atmosphere.windowEmissive)
+      material.emissiveIntensity = atmosphere.windowEmissiveIntensity
+    }
+  }
+
   function applyViewMode() {
     const flat = viewMode === 'map'
     const table = flat ? MAP_COLORS : CITY_COLORS
+    const atmosphere = cityAtmosphere()
 
-    scene.background = new THREE.Color(flat ? MAP_PALETTE.ground : 0x131f36)
+    scene.background = new THREE.Color(flat ? MAP_PALETTE.ground : atmosphere.background)
     // A printed basemap has no atmosphere and no sun. Both are switched off wholesale rather than
     // tuned, so map mode stays a flat drawing of the same plan.
     scene.fog = flat ? null : cityFog
@@ -760,8 +830,14 @@ export function createDatabaseCityScene(
     for (const [name, material] of Object.entries(materials)) {
       const hex = table[name]
       if (hex !== undefined) (material as THREE.Material & { color: THREE.Color }).color.setHex(hex)
-      const emissive = (material as THREE.Material & { emissive?: THREE.Color }).emissive
-      if (emissive) emissive.setHex(flat ? 0x000000 : CITY_EMISSIVE[name] ?? 0x000000)
+      const lit = material as THREE.Material & { emissive?: THREE.Color; emissiveIntensity?: number }
+      if (!lit.emissive) continue
+      // Windows follow the hour; everything else that glows carries a fixed city value.
+      const litFromWithin = (LIT_FROM_WITHIN as readonly string[]).includes(name)
+      lit.emissive.setHex(
+        flat ? 0x000000 : litFromWithin ? atmosphere.windowEmissive : CITY_EMISSIVE[name] ?? 0x000000,
+      )
+      if (litFromWithin) lit.emissiveIntensity = flat ? 1 : atmosphere.windowEmissiveIntensity
     }
     for (const use of LAND_USES) {
       landMaterials[use].color.setHex((flat ? LANDUSE_MAP_COLORS : LANDUSE_CITY_COLORS)[use])
@@ -1449,16 +1525,30 @@ export function createDatabaseCityScene(
   function aimSunAt(cityPlan: CityPlan) {
     const { centerX, centerZ, width, depth } = cityPlan.bounds
     const reach = Math.max(width, depth) * 0.62 + ARTERIAL_WIDTH * 6
+    const atmosphere = cityAtmosphere()
     keyLight.target.position.set(centerX, 0, centerZ)
     keyLight.target.updateMatrixWorld()
-    keyLight.position.set(centerX + reach * 1.35, reach * 1.15, centerZ + reach * 0.6)
+    /*
+     * Elevation and heading both come from the hour. A low sun is the whole of a golden hour and a
+     * high one is the whole of midday, so leaving the sun where evening put it and only recolouring
+     * it renders morning as evening in different paint — the shadows are the tell, and they are the
+     * drawing's cheapest depth cue.
+     */
+    keyLight.position.set(
+      centerX + reach * atmosphere.sunEast,
+      reach * atmosphere.sunHeight,
+      centerZ + reach * atmosphere.sunSouth,
+    )
     const shadow = keyLight.shadow.camera
     shadow.left = -reach
     shadow.right = reach
     shadow.top = reach
     shadow.bottom = -reach
     shadow.near = 1
-    shadow.far = reach * 5
+    // A high sun stands further from the city than a low one, so the far plane has to clear wherever
+    // this hour actually put it, or midday clips its own shadow frustum and loses every shadow at
+    // once. The `reach * 5` floor is the historical value and still wins at every low sun.
+    shadow.far = Math.max(reach * 5, keyLight.position.distanceTo(keyLight.target.position) * 2)
     shadow.updateProjectionMatrix()
     fillLight.position.set(centerX - reach, reach * 1.1, centerZ - reach)
   }
@@ -2276,7 +2366,29 @@ export function createDatabaseCityScene(
     requestRender()
   })
   resize.observe(canvas)
+  /*
+   * Arm the current hour before the first frame.
+   *
+   * The lights, the fog and the window emissives are all constructed at evening values, because
+   * evening is what the constants above have always said. This is the call that moves them to
+   * whatever hour the viewer is actually in — without it the city renders one frame of dusk at
+   * nine in the morning.
+   */
+  applyAtmosphere()
   draw()
+
+  /*
+   * Follow the clock while the tab stays open.
+   *
+   * A phase change is lights, fog and a dome re-bake — never a rebuild — so it is safe to do
+   * underneath a city that is already on screen.
+   */
+  const stopWatchingClock = watchTimeOfDay(phase => {
+    if (disposed || phase === timeOfDay) return
+    timeOfDay = phase
+    applyAtmosphere()
+    requestRender()
+  })
 
   /*
    * Fetch the authored kits in the background.
@@ -2477,6 +2589,7 @@ export function createDatabaseCityScene(
       if (animationHandle !== 0) cancelAnimationFrame(animationHandle)
       if (hoverHandle !== 0) cancelAnimationFrame(hoverHandle)
       resize.disconnect()
+      stopWatchingClock()
       canvas.removeEventListener('pointerdown', rememberPointer)
       canvas.removeEventListener('pointerup', maybeSelect)
       canvas.removeEventListener('pointercancel', cancelPointer)
