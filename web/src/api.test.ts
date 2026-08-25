@@ -41,7 +41,7 @@ vi.mock('@microsoft/signalr', () => ({
   },
 }))
 
-const { LIVE_FALLBACK_POLL_INTERVAL_MS, subscribeToLiveIncidents } = await import('./api')
+const { LIVE_FALLBACK_POLL_INTERVAL_MS, subscribeToLiveIncidents } = await import('./liveFeed')
 
 function validResponse(sequence: number): LiveIncidentResponse {
   return {

@@ -4,8 +4,8 @@ import {
   fetchPlan,
   fetchQueryFamilies,
   fetchQueryFamily,
-  subscribeToLiveIncidents,
 } from './api'
+import { subscribeToLiveIncidents } from './liveFeed'
 import { accessibleObjectLabel, attributedAbsenceLabel, databaseCityMetricValue, databaseCitySharedMetricValue, formatKiB, shouldRenderRoute } from './databaseCity'
 import type { DatabaseCityObject, DatabaseCityPage, DatabaseCityQueryFamily } from './databaseCityContracts'
 import type { LiveIncidentResponse } from './liveContracts'
