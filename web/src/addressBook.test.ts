@@ -177,16 +177,39 @@ describe('buildAddressBook', () => {
     expect(unknown.meta).not.toContain('0 reserved')
   })
 
-  it('names the objects a query visits, and says so when it names none that loaded', () => {
-    const entries = buildAddressBook(objects, [
+  it('names the objects a query visits, and distinguishes the two kinds of silence', () => {
+    // One id that resolves to nothing is a reference into another database, not an absence of one.
+    const otherDatabase = buildAddressBook(objects, [
       family('family:3', '0x112233', ['object:elsewhere:1']),
     ], facilities, samplePlan())
-    expect(entries[0].address).toBe('Visits no loaded object named')
+    expect(otherDatabase[0].address).toBe('Names one object in another database')
+
+    const otherDatabaseMany = buildAddressBook(objects, [
+      family('family:4', '0x445566', ['object:elsewhere:1', 'object:elsewhere:2']),
+    ], facilities, samplePlan())
+    expect(otherDatabaseMany[0].address).toBe('Names 2 objects in another database')
+
+    // A family whose plans named no object at all says exactly that, not that one is elsewhere.
+    const nowhere = buildAddressBook(objects, [
+      family('family:5', '0x778899', []),
+    ], facilities, samplePlan())
+    expect(nowhere[0].address).toBe('Plans named no object in this database')
 
     const visiting = buildAddressBook(objects, families, facilities, samplePlan())
       .find(entry => entry.targetId === 'family:1')!
     expect(visiting.address).toContain('dbo.Customer')
     expect(visiting.address).toContain('dbo.Orders')
+  })
+
+  it('counts the cross-database references alongside the tables a query does visit', () => {
+    // A plan that touches a local table and one in another database gets both truths: the local
+    // stop by name, and a count of what it reached across the boundary the map cannot draw.
+    const mixed = buildAddressBook(objects, [
+      family('family:6', '0xAA00BB', ['object:dbo:100', 'object:elsewhere:9']),
+    ], facilities, samplePlan())
+    expect(mixed[0].address).toBe('Visits dbo.Customer (+1 in another database)')
+    // The cross-database id stays in the haystack so the query is still findable by it.
+    expect(mixed[0].searchText).toContain('object:elsewhere:9')
   })
 
   it('reports an unsampled facility with its status rather than hiding it', () => {

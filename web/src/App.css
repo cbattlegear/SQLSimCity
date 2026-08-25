@@ -352,6 +352,20 @@
   overflow: auto;
 }
 
+/*
+ * A query route takes the whole rail over.
+ *
+ * When a route is open the address book — search, list, metric footer, both drawers — is not
+ * rendered, so the card is the only thing under the header. The shared-with-a-list `46vh` cap would
+ * strand the rest of the rail empty, so a full-takeover card grows to fill the column instead and
+ * scrolls its own content (`.hud-slideover` inside is already a `min-height: 0` `overflow: auto`
+ * flex item). Measured before/after at 1115x800 and in the bottom sheet; see the pull request body.
+ */
+.sidebar-place-card.is-full {
+  flex: 1 1 auto;
+  max-height: none;
+}
+
 .sidebar-metric {
   display: grid;
   gap: 8px;
@@ -1415,6 +1429,14 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
    */
   .sidebar-place-card,
   .sidebar-drawer { max-height: none; }
+
+  /*
+   * A full-takeover route card is content-sized in the sheet like every other section: nothing
+   * shrinks here, so the desktop `flex: 1 1 auto` (which outweighs `.map-sidebar > *`'s `flex: none`
+   * on specificity) has to be put back to `none`. This override lives in this second narrow block so
+   * source order lets it win; written into the first one it would silently lose.
+   */
+  .sidebar-place-card.is-full { flex: none; }
 
   /*
    * The sheet's contract runs on `.map-sidebar > *`, a direct-child selector, so the drawer wrapper

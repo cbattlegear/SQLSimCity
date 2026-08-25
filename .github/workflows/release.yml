@@ -11,9 +11,28 @@ on:
         required: true
         default: false
         type: boolean
+  # Callable form. auto-release.yml calls this after CI has gone green
+  # and a tag has been cut, so the image is only published for a commit whose
+  # full .NET and web suites passed -- suites the verify job below does not run.
+  workflow_call:
+    inputs:
+      ref:
+        description: Tag or commit to check out and build (e.g. refs/tags/v1.2.3).
+        required: true
+        type: string
+      version:
+        description: >-
+          Release version as bare semver, without the leading v (e.g. 1.2.3 or
+          1.2.3-rc.1). Used verbatim as the image version label and as the
+          source for the semver tags, so it must be valid semver.
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Keyed on the version when called (each release is its own group) and on the
+  # ref for a hand-cut tag push, so concurrent releases of different versions do
+  # not serialize behind one another while a re-run of the same one still does.
+  group: release-${{ inputs.version != '' && inputs.version || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -25,6 +44,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -38,7 +59,7 @@ jobs:
           tags: sqlsimcity-release:dry-run
           build-args: |
             BUILD_DATE=1970-01-01T00:00:00Z
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ inputs.version != '' && inputs.version || github.ref_name }}
             REVISION=${{ github.sha }}
           cache-from: type=gha,scope=sqlsimcity-release
           cache-to: type=gha,mode=max,scope=sqlsimcity-release
@@ -48,10 +69,18 @@ jobs:
 
   publish:
     needs: verify
+    # Publish for an owner-created v* tag push (or a dispatch that opts in via
+    # the publish input) or when a caller supplied a version (the reusable-call
+    # path). The actor gate stays: only the repository owner can publish.
     if: >-
       github.actor == github.repository_owner &&
-      startsWith(github.ref, 'refs/tags/v') &&
-      (github.event_name == 'push' || inputs.publish)
+      (
+        inputs.version != '' ||
+        (
+          startsWith(github.ref, 'refs/tags/v') &&
+          (github.event_name == 'push' || inputs.publish)
+        )
+      )
     environment: release
     permissions:
       artifact-metadata: write
@@ -64,6 +93,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
@@ -92,15 +123,79 @@ jobs:
         run: |
           echo "epoch=$(git show -s --format=%ct HEAD)" >> "${GITHUB_OUTPUT}"
           echo "created=$(git show -s --format=%cI HEAD)" >> "${GITHUB_OUTPUT}"
+          # The revision label must name the commit that was actually built, which
+          # is the checked-out ref. github.sha is not that commit on the reusable
+          # path: a workflow_run-triggered caller reports the default branch tip,
+          # which has usually moved on from the tag being released.
+          echo "revision=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          # Caller-supplied bare semver (reusable path); empty for a tag push.
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          raw="${INPUT_VERSION}"
+          # A tag push has no caller version, so fall back to the tag name with
+          # its leading v stripped -- v1.2.3 -> 1.2.3 -- because the leading v is
+          # not valid semver for the org.opencontainers.image.version label.
+          if [[ -z "${raw}" ]]; then
+            raw="${REF_NAME#v}"
+          fi
+          tag="v${raw}"
+          major="${raw%%.*}"
+
+          prerelease=false
+          case "${raw}" in
+            *-*) prerelease=true ;;
+          esac
+
+          # The floating major tag is suppressed for 0.x: a bare "0" would move
+          # across every unstable 0.x release and mean nothing useful. type=semver
+          # already suppresses it for prereleases; this also drops it for 0.x.
+          publish_major=false
+          if [[ "${prerelease}" == false && "${major}" =~ ^[0-9]+$ && "${major}" -ge 1 ]]; then
+            publish_major=true
+          fi
+
+          # latest moves to the newest stable release regardless of major, so it
+          # is published for 0.x too, but never for a prerelease.
+          publish_latest=false
+          if [[ "${prerelease}" == false ]]; then
+            publish_latest=true
+          fi
+
+          {
+            echo "raw=${raw}"
+            echo "tag=${tag}"
+            echo "publish_major=${publish_major}"
+            echo "publish_latest=${publish_latest}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Generate image metadata
         id: metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ steps.image.outputs.name }}
+          # latest=false disables the action's own latest handling; latest is
+          # instead published explicitly below (type=raw) so it can be gated on
+          # "not a prerelease" rather than the action's newest-semver heuristic.
           flavor: latest=false
+          # value= feeds the version source explicitly: on the reusable-call path
+          # there is no tag ref for the action to read, so it comes from the
+          # caller's version; a tag push falls back to github.ref_name.
+          #
+          # {{major}}.{{minor}} and {{major}} are suppressed for prereleases by
+          # type=semver itself; enable= additionally drops the bare-major tag for
+          # 0.x. latest is a raw tag gated on the same prerelease check.
           tags: |
-            type=semver,pattern={{version}}
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.version.outputs.tag }},enable=${{ steps.version.outputs.publish_major }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.publish_latest }}
             type=sha
           labels: |
             org.opencontainers.image.created=${{ steps.source.outputs.created }}
@@ -119,8 +214,8 @@ jobs:
           build-args: |
             BUILD_DATE=${{ steps.source.outputs.created }}
             SOURCE_DATE_EPOCH=${{ steps.source.outputs.epoch }}
-            VERSION=${{ github.ref_name }}
-            REVISION=${{ github.sha }}
+            VERSION=${{ steps.version.outputs.raw }}
+            REVISION=${{ steps.source.outputs.revision }}
           provenance: mode=max
           sbom: true
           cache-from: type=gha,scope=sqlsimcity-release

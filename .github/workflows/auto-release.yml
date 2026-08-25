@@ -1,0 +1,253 @@
+name: Auto release
+
+# Cut a release automatically when a commit lands on main with green CI.
+#
+# The trigger is workflow_run on CI rather than push, on purpose: release.yml's
+# verify job only builds and smokes the image, it does not run the .NET or web
+# suites. Gating on CI's success is what stops an image being published for a
+# commit whose tests failed. Publishing is then delegated to release.yml via a
+# reusable call, because a tag pushed with GITHUB_TOKEN cannot itself start
+# another workflow run -- so tagging here and relying on release.yml's own
+# "push: tags" trigger would never fire.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Exact release version to cut, as bare semver without the leading v
+          (e.g. 1.3.0). Leave empty to derive the next version from the bump
+          input and the highest existing tag.
+        required: false
+        type: string
+      bump:
+        description: Version bump to apply when version is empty.
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+# No global permissions: each job requests only what it needs.
+permissions: {}
+
+concurrency:
+  # One release pipeline for main at a time; do not cancel a run that may have
+  # already pushed a tag or started publishing.
+  group: auto-release-main
+  cancel-in-progress: false
+
+jobs:
+  version:
+    # For workflow_run, only proceed on a successful CI run on main; a manual
+    # dispatch always proceeds.
+    #
+    # The repository-owner check is duplicated from release.yml's publish gate on
+    # purpose. Without it a pull request merged by anyone else would be tagged and
+    # given a GitHub Release here, and then publish would silently decline to build
+    # the image -- a release that exists everywhere except the registry. Declining
+    # before the tag is cut keeps the two decisions in agreement.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.actor == github.repository_owner
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      release: ${{ steps.resolve.outputs.release }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # workflow_run's github.sha/github.ref point at the default branch tip,
+          # not the commit that CI ran, so target the triggering run's head_sha
+          # explicitly. A dispatch checks out its selected ref.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # actions/checkout shallow-clones by default and fetches no tags, so
+          # ask for full history and tags -- the next-version calculation reads
+          # every existing v* tag.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve next version
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          # Untrusted-ish dispatch inputs are passed through env, never
+          # interpolated into the script body.
+          DISPATCH_VERSION: ${{ inputs.version }}
+          DISPATCH_BUMP: ${{ inputs.bump }}
+        run: |
+          set -Eeuo pipefail
+
+          no_release() {
+            echo "release=false" >> "${GITHUB_OUTPUT}"
+            echo "No release: $1"
+            exit 0
+          }
+
+          # Guard against re-running for a commit that is already tagged, so a
+          # re-run of CI (or of this workflow) does not cut a second release.
+          if git tag --points-at "${COMMIT_SHA}" | grep -qE '^v[0-9]'; then
+            no_release "commit ${COMMIT_SHA} is already tagged"
+          fi
+
+          bump=""
+          explicit_version=""
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ -n "${DISPATCH_VERSION}" ]]; then
+              explicit_version="${DISPATCH_VERSION#v}"
+            else
+              bump="${DISPATCH_BUMP:-patch}"
+            fi
+          else
+            # Resolve the merged PR for this commit and read its release labels.
+            labels="$(gh api "/repos/${OWNER}/${REPO}/commits/${COMMIT_SHA}/pulls" \
+              --jq '.[] | select(.merged_at != null) | .labels[].name' 2>/dev/null || true)"
+
+            if [[ -z "${labels}" ]]; then
+              # A direct push to main (no merged PR) does not release: the safer
+              # default, so an untested/unlabelled hotfix push is not shipped
+              # automatically. Cut it by hand with workflow_dispatch if wanted.
+              no_release "no merged pull request found for ${COMMIT_SHA}"
+            fi
+
+            if grep -qx 'release:skip' <<< "${labels}"; then
+              no_release "pull request carries release:skip"
+            fi
+
+            if grep -qx 'release:major' <<< "${labels}"; then
+              bump="major"
+            elif grep -qx 'release:minor' <<< "${labels}"; then
+              bump="minor"
+            else
+              # Default to patch, including when only release:patch is present or
+              # no release:* label is set at all.
+              bump="patch"
+            fi
+          fi
+
+          if [[ -n "${explicit_version}" ]]; then
+            new="${explicit_version}"
+          else
+            # Highest existing stable tag is the base. Prereleases are ignored so
+            # a v1.2.0-rc.1 never becomes the base for the next bump.
+            latest="$(git tag -l 'v*' \
+              | sed 's/^v//' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n1 || true)"
+            if [[ -z "${latest}" ]]; then
+              latest="0.0.0"
+            fi
+            IFS='.' read -r major minor patch <<< "${latest}"
+            case "${bump}" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+              *) echo "::error::unknown bump '${bump}'"; exit 1 ;;
+            esac
+            new="${major}.${minor}.${patch}"
+          fi
+
+          tag="v${new}"
+
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            no_release "tag ${tag} already exists"
+          fi
+
+          {
+            echo "release=true"
+            echo "tag=${tag}"
+            echo "version=${new}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Resolved next release: ${tag}"
+
+  tag:
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Create tag and release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -Eeuo pipefail
+
+          # Idempotent: only create and push the annotated tag if it is not
+          # already present, so a re-run after a partial failure does not fail on
+          # an existing tag.
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists locally; skipping tag creation."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "Release ${TAG}" "${COMMIT_SHA}"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+          # Create the GitHub Release with generated notes, unless one already
+          # exists for this tag.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; skipping release creation."
+          else
+            gh release create "${TAG}" \
+              --target "${COMMIT_SHA}" \
+              --title "${TAG}" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+  publish:
+    needs:
+      - version
+      - tag
+    if: needs.version.outputs.release == 'true'
+    # Delegate to the reusable release workflow. secrets: inherit passes the
+    # caller's secrets (GITHUB_TOKEN) through; permissions here must cover what
+    # release.yml's publish job declares.
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/release.yml
+    with:
+      ref: ${{ needs.version.outputs.tag }}
+      version: ${{ needs.version.outputs.version }}
+    secrets: inherit

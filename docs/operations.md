@@ -146,7 +146,7 @@ gh attestation verify \
   --repo cbattlegear/SQLSimCity
 cosign verify \
   --certificate-identity \
-  'https://github.com/cbattlegear/SQLSimCity/.github/workflows/release.yml@refs/tags/<tag>' \
+  'https://github.com/cbattlegear/SQLSimCity/.github/workflows/release.yml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/cbattlegear/sqlsimcity@sha256:<digest>
 docker buildx imagetools inspect \
@@ -159,19 +159,97 @@ cosign download sbom \
   ghcr.io/cbattlegear/sqlsimcity@sha256:<digest> > sqlsimcity.spdx.json
 ```
 
-The release workflow publishes only owner-created `v*` tags through the
-`release` environment. Repository administrators must configure that environment
+The signing identity depends on how the release was cut, and it is the same
+workflow file either way. Signing happens inside `release.yml`, and the Fulcio
+certificate's subject is the OIDC `job_workflow_ref` claim — the workflow that
+*runs* the job, not the one that called it. So:
+
+- an **automatic** release, where `auto-release.yml` calls `release.yml` as a
+  reusable workflow from `main`, signs as
+  `.../.github/workflows/release.yml@refs/heads/main`;
+- a **hand-cut** `v*` tag push, where `release.yml` is itself the entry point,
+  signs as `.../.github/workflows/release.yml@refs/tags/<tag>`, exactly as before.
+
+Use whichever matches the release you are verifying. To accept both without
+loosening the issuer or the repository, match the ref instead of pinning it:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp \
+  '^https://github\.com/cbattlegear/SQLSimCity/\.github/workflows/release\.yml@refs/(heads/main|tags/v.+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/cbattlegear/sqlsimcity@sha256:<digest>
+```
+
+The release workflow publishes only owner-initiated releases through the
+`release` environment — either a `v*` tag the owner pushed, or a tag cut for them
+by `auto-release.yml` on a merge they made (see "Cut a release" below).
+Repository administrators must configure that environment
 with required independent reviewers, prevent self-review, and protect `v*` tag
 creation before enabling releases. BuildKit emits maximum provenance and an SPDX
 SBOM, GitHub records an artifact attestation, and cosign signs by digest with
 GitHub OIDC. Release tags are attached only after those steps succeed, and there
-is no long-lived signing key. A manual run defaults to a local, non-publishing
-smoke build; manually publishing still requires a selected `v*` tag, the
-repository owner, and environment approval.
+is no long-lived signing key. A manual run of `release.yml` defaults to a local,
+non-publishing smoke build; manually publishing that way still requires a selected
+`v*` tag, the repository owner, and environment approval.
 
 Dependabot updates GitHub Actions, NuGet, web npm, and Docker references weekly.
 Action references remain pinned to immutable commits; review the version comment
 and upstream release notes when accepting an update.
+
+## Cut a release
+
+Merging a pull request into `main` cuts a release automatically once CI passes.
+`auto-release.yml` waits for the `CI` workflow to finish successfully on `main`
+— `release.yml`'s own verify job builds and smokes the image but does not run the
+.NET or web suites, so gating on CI is what stops an image being published for a
+commit whose tests failed — then reads the merged pull request's labels to decide
+the version bump:
+
+| Label | Bump | Example from `1.4.2` |
+| --- | --- | --- |
+| `release:major` | major | `2.0.0` |
+| `release:minor` | minor | `1.5.0` |
+| `release:patch` | patch | `1.4.3` |
+| _none_ | patch | `1.4.3` |
+| `release:skip` | none | no release |
+
+The base is the highest existing stable `v*` tag; prereleases are ignored so a
+`v1.5.0-rc.1` never becomes the base for the next bump. The labels must exist on
+the repository before they can be applied:
+
+```bash
+gh label create release:major --description 'Release: bump the major version' --color B60205
+gh label create release:minor --description 'Release: bump the minor version' --color 0E8A16
+gh label create release:patch --description 'Release: bump the patch version' --color 1D76DB
+gh label create release:skip  --description 'Release: do not cut a release for this merge' --color 6A737D
+```
+
+Two cases deliberately do **not** release: a direct push to `main` with no merged
+pull request, and a merge by anyone other than the repository owner. The second
+mirrors the publish gate in `release.yml`; declining before the tag is cut is what
+stops a tag and a GitHub Release existing for an image that was never published.
+Cut either by hand with the `Auto release` workflow's `workflow_dispatch`, which
+takes an explicit version or a bump, or by pushing a `v*` tag yourself — the tag
+path runs `release.yml` directly and is unchanged.
+
+### Published image tags
+
+Each release publishes, all pointing at the same signed manifest digest:
+
+- `X.Y.Z` — immutable, and the only one that names one specific release;
+- `X.Y` and `X` — floating, moved to the newest matching release. `X` is only
+  published from `1.0.0` onward, because a bare `0` spanning every unstable `0.x`
+  release would say nothing useful;
+- `latest` — floating, moved to the newest stable release;
+- `sha-<commit>` — the commit the image was built from.
+
+Prereleases (`1.0.0-rc.1`) publish only their exact version and commit tags; they
+never move `X.Y`, `X` or `latest`.
+
+Floating tags exist for convenience only. **Deploy by digest**, as the upgrade and
+verification steps above require — a moving tag defeats both the rollback plan and
+the signature check.
 
 ## NuGet lock files
 

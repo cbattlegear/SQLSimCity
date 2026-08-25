@@ -106,17 +106,34 @@ function queryEntry(family: DatabaseCityQueryFamily, objectNames: ReadonlyMap<st
   const stops = family.objectIds
     .map(id => objectNames.get(id))
     .filter((value): value is string => value !== undefined)
-  const visits = stops.length > 0
-    ? stops.slice(0, 3).join(', ') + (stops.length > 3 ? ` +${stops.length - 3} more` : '')
-    : 'no loaded object named'
+  // Ids that did not resolve are references to objects in *other* databases: the collector carries
+  // them as three-part names it cannot place on this city's map. Distinguishing that from "no
+  // reference at all" is the same distinction the collector draws between absent and cross-database
+  // evidence, and collapsing both into one phrase is what made real multi-object plans read as empty.
+  const unresolved = family.objectIds.length - stops.length
+  let address: string
+  if (stops.length > 0) {
+    const visits = stops.slice(0, 3).join(', ') + (stops.length > 3 ? ` +${stops.length - 3} more` : '')
+    address = unresolved > 0
+      ? `Visits ${visits} (+${unresolved} in another database)`
+      : `Visits ${visits}`
+  } else if (family.objectIds.length > 0) {
+    address = family.objectIds.length === 1
+      ? 'Names one object in another database'
+      : `Names ${family.objectIds.length} objects in another database`
+  } else {
+    address = 'Plans named no object in this database'
+  }
   return {
     id: `query:${family.familyId}`,
     kind: 'query',
     targetId: family.familyId,
     name: `Query ${family.queryHash}`,
     meta: `${compactCount(family.executionCount)} executions · ${compactCount(family.totalCpuMicroseconds)} µs CPU`,
-    address: `Visits ${visits}`,
-    searchText: `${family.queryHash} ${family.familyId} ${stops.join(' ')} ${family.rationale}`.toLowerCase(),
+    address,
+    // Search over every reference the family named, resolved names and the raw ids of the
+    // cross-database ones alike, so a query stays findable by a table it touches in either database.
+    searchText: `${family.queryHash} ${family.familyId} ${stops.join(' ')} ${family.objectIds.join(' ')} ${family.rationale}`.toLowerCase(),
     rank: toNumber(family.totalCpuMicroseconds),
   }
 }

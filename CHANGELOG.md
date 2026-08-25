@@ -276,6 +276,18 @@ First MVP release candidate. There is no tagged release yet.
 
 ### Changed
 
+- **A query route takes over the sidebar instead of sharing it.** Clicking a query in the address
+  book used to leave the query list in place and pin the route to a 46vh card below it, and the panel
+  carried both a `Clear` button and a `Back` button whose difference was never explained by anything
+  on screen. Now opening a route collapses the address book, the route card fills the rail
+  (`.sidebar-place-card.is-full`), and the header takes the route's identity: the title becomes
+  *This query's route*, the subtitle names the plan and how many of its tables were placed, and the
+  one remaining back button returns to the database — which restores the list, the drawers and the
+  header exactly as they were. Leaving the database is then a second, separate press, which is what
+  makes the two destinations distinguishable. Measured at 1115x800 the route card grows 103px -> 698px
+  with zero unreachable pixels and scrolls inside itself; at 820px the sheet keeps it content-sized.
+  The decision lives in `web/src/sidebarMode.ts` so it is unit-testable without a DOM.
+
 - **Buildings are scattered by a seed rather than packed into a rectangle.** `web/src/citySeed.ts`
   adds a small seeded generator, and the seed is a stable hash of the database's own id, so a city
   looks like a city while laying out identically on every load, in every browser, on every machine —
@@ -597,6 +609,22 @@ First MVP release candidate. There is no tagged release yet.
   rebuilds from SQL Server, not a system of record, so the cost is one collection interval.
 
 ### Fixed
+
+- **Query families named only the last loaded page's objects.** Attribution is computed per bounded
+  page — `QueryStoreCityAttribution` resolves a plan's object references against an index built from
+  *that page's* objects only, so a reference to an object on any other page survives as prose in the
+  rationale and never as an id. `mergeCityPage` then took `topQueryFamilies` from the newest page
+  wholesale, so once the view finished walking the cursor every family carried only the final page's
+  attribution. Measured against a real 10-table database paged three objects at a time, **11 of 12
+  families named nothing** by the end of the walk, which is where the "no loaded object named" line in
+  the address book came from. Families are now folded across pages like routes already were: object
+  ids are unioned, per-object wait shares are unioned and `unattributedWaitMilliseconds` recomputed in
+  `BigInt` so the contract's exact-sum invariant still holds, and confidence is recomputed from the
+  union rather than inherited — more than one object means the totals belong to no single building, so
+  it is `Probable`. The same merged families feed road grading, facility traffic and the wait lanes,
+  so those were reading one page's worth of attribution too. The address book now distinguishes the
+  two silences it used to collapse together: references that name another database say so, and only a
+  family whose plans named no object in this database at all says that.
 
 - **A connected instance reported no object total at all** ([#41]). `DatabaseCityPageV1.TotalObjects`
   was only ever populated on the archive path; the connected source hard-coded `null` because its

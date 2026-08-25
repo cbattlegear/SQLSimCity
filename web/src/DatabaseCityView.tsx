@@ -23,6 +23,7 @@ import { FACILITY_LABELS, projectFacilities, type Facility, type FacilityKind } 
 import { projectFacilityTraffic, type FacilityTraffic } from './cityFacilityTraffic'
 import { AddressBook } from './AddressPanel'
 import { buildAddressBook, type AddressEntry } from './addressBook'
+import { resolveSidebarMode } from './sidebarMode'
 import { CityLoadingScreen } from './CityLoadingScreen'
 import { MapShell, SidebarHeader, StatusChip, ViewModeTile, type MapViewMode } from './MapShell'
 import { projectIncidents } from './cityIncidents'
@@ -527,6 +528,17 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
     ? facilities.find(facility => `facility:${facility.kind}` === selectedAddressId) ?? null
     : null
 
+  /**
+   * Close an open query route and return to the database. The route was opened from a query address,
+   * so its list row is still selected; clearing that too keeps the address list from coming back with
+   * a stale `is-selected` row highlighted.
+   */
+  const clearRoute = useCallback(() => {
+    setActivePlan(null)
+    setSelectedAddressId(null)
+    setRouteError(null)
+  }, [])
+
   const planFinder = (
     <details className="sidebar-drawer">
       <summary>Route a captured query plan</summary>
@@ -588,7 +600,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
 
   /** The place card: whatever the map is currently pointing at, rendered over the address list. */
   const placeCard = route
-    ? <RoutePanel route={route} plan={activePlan!} onClear={() => setActivePlan(null)} />
+    ? <RoutePanel route={route} plan={activePlan!} />
     : selectedRoad
       ? <RoadPanel
         road={selectedRoad}
@@ -604,87 +616,106 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
           ? <BuildingPanel object={selected} metric={metric} facilityCount={facilities.length} />
           : null
 
+  const sidebarMode = resolveSidebarMode({
+    databaseName,
+    // `totalObjects` is a decimal string because it can exceed `Number.MAX_SAFE_INTEGER`, so it is
+    // passed through as it arrives rather than being routed through a lossy `Number`.
+    totalObjectsLabel: page?.totalObjects ?? '—',
+    route: route
+      ? {
+        planId: activePlan!.choice.planId,
+        placedStops: route.stops.length - route.offMapStops.length,
+        totalStops: route.stops.length,
+        offMapStops: route.offMapStops.length,
+      }
+      : null,
+  })
+
   const sidebar = (
     <>
       <SidebarHeader
         brand={<div className="sidebar-brand"><span className="sidebar-mark" aria-hidden="true" />SQLSimCity</div>}
-        title={databaseName}
-        subtitle={`${page?.totalObjects ?? '—'} objects · database city`}
-        onBack={onBack}
-        backLabel="Back to the server atlas"
+        title={sidebarMode.title}
+        subtitle={sidebarMode.subtitle}
+        onBack={sidebarMode.clearsRoute ? clearRoute : onBack}
+        backLabel={sidebarMode.backLabel}
       />
 
-      {placeCard && <div className="sidebar-place-card">{placeCard}</div>}
+      {placeCard && (
+        <div className={`sidebar-place-card${route ? ' is-full' : ''}`}>{placeCard}</div>
+      )}
 
-      <AddressBook
-        entries={addressEntries}
-        term={addressTerm}
-        onTermChange={setAddressTerm}
-        selectedId={selectedAddressId}
-        onSelect={openAddress}
-        footer={
-          <>
-            <div className="sidebar-metric">
-              <label>Rank workload
-                <select value={metric} onChange={event => setMetric(event.target.value as Metric)}>
-                  {metrics.map(value => <option key={value}>{value}</option>)}
-                </select>
-              </label>
-              {backfilling && (
-                /*
-                 * Not a live region any more. The loading screen is up for the whole backfill and its
-                 * progressbar already announces the same count; leaving `role="status"` here made a
-                 * long walk fire up to eighty announcements of a number nobody asked to hear.
-                 */
-                <p className="load-progress">
-                  Loading the rest of the city… {loadedCount.toLocaleString()} of{' '}
-                  {Number(page?.totalObjects ?? loadedCount).toLocaleString()} objects placed.
-                </p>
-              )}
-              {!backfilling && page?.nextPageToken && (
-                <button type="button" className="load-more" onClick={loadMore}>
-                  Load next bounded object page
-                </button>
-              )}
-            </div>
-            {/*
-              * One shared height budget, not two independent caps.
-              *
-              * Both drawers are capped, and a flex item's automatic minimum is its content clamped
-              * by its own `max-height`, so two flat `46vh` caps floor at 46vh each and no shrink
-              * pressure can take either lower. Measured at 1115x800 with a populated plan finder,
-              * that left 167px of the column unreachable and squeezed the address list to 0px.
-              * The wrapper owns the budget and hands each drawer its share; see `.sidebar-drawers`.
-              *
-              * It has to be a real element: everything between here and `.map-sidebar` is a
-              * fragment, so without it both drawers are direct flex children of the rail.
-              */}
-            <div className="sidebar-drawers">
-              {planFinder}
-              {page && <LegendDrawer
-                page={page}
-                objects={visibleObjects}
-                metric={metric}
-                selectedId={selectedId}
-                selectedRoadId={selectedRoadId}
-                onSelectObject={selectObject}
-                onSelectRoad={selectRoad}
-                endpointName={endpointName}
-                roads={roads}
-                facilities={facilities}
-                facilityTraffic={facilityTraffic}
-                waitAttribution={waitAttribution}
-                blocking={blocking}
-                displayedSchemas={displayedSchemas}
-                activePlanFamilyId={activePlan?.choice.familyId ?? null}
-                mappingFamilyId={mappingFamilyId}
-                onShowFamily={showFamilyOnMap}
-                selectedObject={selected}
-              />}
-            </div>
-          </>
-        }
-      />
+      {sidebarMode.showsAddressBook && (
+        <AddressBook
+          entries={addressEntries}
+          term={addressTerm}
+          onTermChange={setAddressTerm}
+          selectedId={selectedAddressId}
+          onSelect={openAddress}
+          footer={
+            <>
+              <div className="sidebar-metric">
+                <label>Rank workload
+                  <select value={metric} onChange={event => setMetric(event.target.value as Metric)}>
+                    {metrics.map(value => <option key={value}>{value}</option>)}
+                  </select>
+                </label>
+                {backfilling && (
+                  /*
+                   * Not a live region any more. The loading screen is up for the whole backfill and its
+                   * progressbar already announces the same count; leaving `role="status"` here made a
+                   * long walk fire up to eighty announcements of a number nobody asked to hear.
+                   */
+                  <p className="load-progress">
+                    Loading the rest of the city… {loadedCount.toLocaleString()} of{' '}
+                    {Number(page?.totalObjects ?? loadedCount).toLocaleString()} objects placed.
+                  </p>
+                )}
+                {!backfilling && page?.nextPageToken && (
+                  <button type="button" className="load-more" onClick={loadMore}>
+                    Load next bounded object page
+                  </button>
+                )}
+              </div>
+              {/*
+                * One shared height budget, not two independent caps.
+                *
+                * Both drawers are capped, and a flex item's automatic minimum is its content clamped
+                * by its own `max-height`, so two flat `46vh` caps floor at 46vh each and no shrink
+                * pressure can take either lower. Measured at 1115x800 with a populated plan finder,
+                * that left 167px of the column unreachable and squeezed the address list to 0px.
+                * The wrapper owns the budget and hands each drawer its share; see `.sidebar-drawers`.
+                *
+                * It has to be a real element: everything between here and `.map-sidebar` is a
+                * fragment, so without it both drawers are direct flex children of the rail.
+                */}
+              <div className="sidebar-drawers">
+                {planFinder}
+                {page && <LegendDrawer
+                  page={page}
+                  objects={visibleObjects}
+                  metric={metric}
+                  selectedId={selectedId}
+                  selectedRoadId={selectedRoadId}
+                  onSelectObject={selectObject}
+                  onSelectRoad={selectRoad}
+                  endpointName={endpointName}
+                  roads={roads}
+                  facilities={facilities}
+                  facilityTraffic={facilityTraffic}
+                  waitAttribution={waitAttribution}
+                  blocking={blocking}
+                  displayedSchemas={displayedSchemas}
+                  activePlanFamilyId={activePlan?.choice.familyId ?? null}
+                  mappingFamilyId={mappingFamilyId}
+                  onShowFamily={showFamilyOnMap}
+                  selectedObject={selected}
+                />}
+              </div>
+            </>
+          }
+        />
+      )}
     </>
   )
 
@@ -1250,24 +1281,12 @@ const RESOURCE_TAGS: Readonly<Record<FacilityKind, string>> = {
 function RoutePanel({
   route,
   plan,
-  onClear,
 }: {
   route: CityRoute
   plan: { choice: PlanChoice; showplan: NormalizedShowplan }
-  onClear: () => void
 }) {
-  const placed = route.stops.length - route.offMapStops.length
   return (
-    <aside className="hud-slideover" aria-labelledby="city-route-title">
-      <div className="detail-title">
-        <h2 id="city-route-title">This query&rsquo;s route</h2>
-        <button type="button" onClick={onClear}>Clear</button>
-      </div>
-      <p className="hud-note">
-        Plan {plan.choice.planId} · {placed} of {route.stops.length} table
-        {route.stops.length === 1 ? '' : 's'} placed on this map
-        {route.offMapStops.length > 0 ? ` · ${route.offMapStops.length} off-map` : ''}
-      </p>
+    <aside className="hud-slideover" aria-label={`This query's route · plan ${plan.choice.planId}`}>
       <ol className="route-directions">
         {route.stops.map(stop => (
           <li key={stop.ordinal} className={`stop-${stop.kind}`}>

@@ -366,8 +366,24 @@ describe('the sidebar column scrolls its own overflow', () => {
   })
 
   /**
-   * The drawer shrinks, but never past the control you open it with.
+   * A query route takes the whole rail over. When one is open the address book is not rendered, so
+   * the route card is the only section under the header and must fill the column rather than sit
+   * under the shared-with-a-list `46vh` cap that would strand the rest of the rail empty. The base
+   * card keeps its cap (asserted above); the `.is-full` modifier lifts it and lets the card grow.
    *
+   * The narrow sheet shrinks nothing -- it scrolls -- so the modifier's desktop `flex: 1 1 auto`,
+   * which outweighs `.map-sidebar > *`'s `flex: none` on specificity, is put back to `none` there.
+   */
+  it('lets a full-takeover route card fill the desktop rail and stay content-sized in the sheet', () => {
+    const full = desktopRule('.sidebar-place-card.is-full')
+    expect(full, '.sidebar-place-card.is-full has no desktop rule').not.toBeNull()
+    expect(full, '.is-full does not fill the rail').toMatch(/flex:\s*1\s+1\s+auto/)
+    expect(full, '.is-full keeps a height cap').toMatch(/max-height:\s*none/)
+    expect(narrowRule('.sidebar-place-card.is-full'), '.is-full still grows in the sheet')
+      .toMatch(/flex:\s*none/)
+  })
+
+  /**
    * `min-height: 0` here is the difference between "the legend collapses to its summary" and "the
    * legend collapses to ten pixels and you can no longer click it", which is what a full column
    * actually did when this was first written. Leaving the drawer's minimum at `auto` floors it on its
