@@ -122,16 +122,28 @@ jobs:
               bump="${DISPATCH_BUMP:-patch}"
             fi
           else
-            # Resolve the merged PR for this commit and read its release labels.
-            labels="$(gh api "/repos/${OWNER}/${REPO}/commits/${COMMIT_SHA}/pulls" \
-              --jq '.[] | select(.merged_at != null) | .labels[].name' 2>/dev/null || true)"
+            # Two separate questions, asked separately on purpose. Reading labels
+            # alone cannot answer the first one: a merged pull request carrying no
+            # labels produces exactly the same empty output as no merged pull
+            # request at all, and conflating the two makes the unlabelled-defaults-
+            # to-patch branch below unreachable. That is not hypothetical -- it is
+            # why v0.6.3 through v0.7.0 never cut themselves.
+            #
+            # `|| true` only guards a genuinely absent PR, so keep the query and
+            # the label read distinct.
+            merged_prs="$(gh api "/repos/${OWNER}/${REPO}/commits/${COMMIT_SHA}/pulls" \
+              --jq '.[] | select(.merged_at != null) | .number' 2>/dev/null || true)"
 
-            if [[ -z "${labels}" ]]; then
+            if [[ -z "${merged_prs}" ]]; then
               # A direct push to main (no merged PR) does not release: the safer
               # default, so an untested/unlabelled hotfix push is not shipped
               # automatically. Cut it by hand with workflow_dispatch if wanted.
               no_release "no merged pull request found for ${COMMIT_SHA}"
             fi
+
+            # An empty label set is legitimate here and falls through to patch.
+            labels="$(gh api "/repos/${OWNER}/${REPO}/commits/${COMMIT_SHA}/pulls" \
+              --jq '.[] | select(.merged_at != null) | .labels[].name' 2>/dev/null || true)"
 
             if grep -qx 'release:skip' <<< "${labels}"; then
               no_release "pull request carries release:skip"

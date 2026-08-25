@@ -171,6 +171,37 @@ npm run typecheck
 
 Those counts are the baselines to compare against. Investigate any delta rather than accepting it.
 
+## Every pull request needs a `release:*` label
+
+Merging to `main` with green CI cuts a release automatically (`.github/workflows/auto-release.yml`),
+and the label on the pull request is what picks the version bump. There is no prompt and no second
+chance: the tag is cut, the GitHub Release is written and the image is pushed to GHCR within a
+couple of minutes of the merge.
+
+Apply exactly one before merging. All four already exist, so use `gh pr create --label` or
+`gh pr edit --add-label`:
+
+| label | when |
+|---|---|
+| `release:major` | Anyone running the image must change something to stay working — a removed or renamed API route or response field, a renamed configuration key or environment variable, a changed default that alters behaviour, a database or archive format that old readers cannot open. |
+| `release:minor` | New capability that costs the operator nothing — a new view, endpoint, opt-in setting or supported source. Nothing that worked before behaves differently. |
+| `release:patch` | Bug fix, performance work, a rendering or layout correction, dependency bumps, refactors with no visible effect. |
+| `release:skip` | Nothing reaches the shipped artifact: docs, `AGENTS.md`, tests, CI workflows, repository chores. |
+
+**The bump describes the promise to whoever runs the image, not the size of the diff.** A one-line
+change that renames a config key is `major`. A thousand-line refactor that no operator can observe
+is `patch`. Do not reach for the label by counting files.
+
+When a pull request spans categories, take the highest one it earns. A feature that also removes an
+old route is `major`, not `minor`.
+
+Omitting the label is not neutral — it silently means `patch`, so feature work ships understated.
+That is exactly how v0.7.0 came to need a hand-cut `workflow_dispatch`: #69, #70 and #71 all merged
+unlabelled.
+
+If a change genuinely should not ship on its own, prefer `release:skip` over leaving it bare, so the
+intent is recorded rather than inferred.
+
 ## Scratch files
 
 Probe pages and measurement scaffolding do not get committed. Delete them and confirm
