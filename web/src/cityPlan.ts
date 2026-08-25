@@ -270,17 +270,34 @@ export const BLOCK_COLS = 1
 export const BLOCK_ROWS = 1
 export const CELLS_PER_BLOCK = BLOCK_COLS * BLOCK_ROWS
 
-export const STREET_WIDTH = 15
-export const ARTERIAL_WIDTH = 23
+/**
+ * Carriageway widths, in world units.
+ *
+ * Scenery, and scaled with the street *spacing* rather than fixed: a road is wide relative to the
+ * block it runs between, and the two numbers only stay in proportion if they move together. When the
+ * centre-line spacing was 2.2 cells an ordinary street at 15 was about a fifth of the gap between two
+ * of them. {@link SEPARATION_PER_CELL} is now 1.5, so holding 15 would have handed a third of the
+ * ground back to tarmac — and, because a block is dropped when it cannot stand its building clear of
+ * the widest carriageway that fronts it, would have thinned the supply of blocks below one per table.
+ * Ten and fifteen keep the old road-to-block proportion at the new spacing.
+ */
+export const STREET_WIDTH = 10
+export const ARTERIAL_WIDTH = 15
 /**
  * Clear ground a block keeps around its building, split evenly on all four sides.
  *
  * This is the verge: the pavement, the street trees and the front garden. Because `chooseCell` sizes a
  * cell as `footprint + LOT_MARGIN` and planning drops any block that cannot hold a square that wide,
  * the block a building lands on always has room for it, so a building edge never reaches its kerb.
+ *
+ * The verge is an *absolute* width added to a footprint the logarithmic mapping keeps small, so it is
+ * the largest term in the cell for every ordinary building: at sixteen, a mean building of fifteen
+ * units was given a cell of thirty-one and covered under a quarter of it before the street spacing
+ * multiplied that gap again. Ten is a pavement and a front garden either side rather than a paddock,
+ * and it is still twice {@link BLOCK_SETBACK}, so the kerb clearance the verge exists for survives.
  */
-export const LOT_MARGIN = 16
-export const MIN_CELL = 26
+export const LOT_MARGIN = 10
+export const MIN_CELL = 20
 
 /** Footprint and height used for an object whose page counts are unavailable. Nonquantitative by design. */
 export const UNKNOWN_FOOTPRINT = 11
@@ -302,11 +319,26 @@ export const ARCHETYPE_THRESHOLD_PAGES = {
  * across. Sized so even that tightest block still inscribes a square wider than the largest building —
  * the capacity filter drops any that does not — with the verge to spare. Larger only wastes ground;
  * smaller and the filter starts discarding blocks the city needs.
+ *
+ * At 2.2 the drawing was mostly ground. A traced face comes out at roughly 1.6 separations across
+ * rather than one — the tracer only guarantees streamlines are *at least* a separation apart — and
+ * {@link EDGE_SEPARATION_SCALE} widened everything outside the centre again. Measured over a
+ * 120-object city the median block was 144 units across against a mean building of 15, so a building
+ * covered **0.86% of its own block** and the city read as huts scattered on open moor.
+ *
+ * 1.5 is the tightest value that keeps the capacity filter's guarantee arithmetic rather than
+ * empirical. The tightest block is about two-thirds of a separation, so it inscribes roughly
+ * `(2/3) × 1.5 × (widest + LOT_MARGIN)` = `widest + LOT_MARGIN`, still clear of the
+ * `widest + BLOCK_CAPACITY_HEADROOM` the filter demands, for any building the mapping can produce.
+ * Below 1.5 that margin goes negative and the filter starts discarding blocks the city needs.
  */
-const SEPARATION_PER_CELL = 2.2
+const SEPARATION_PER_CELL = 1.5
 
 /** Never trace streets tighter than this, however small the buildings, so a small city still reads. */
-const SEPARATION_FLOOR = 46
+const SEPARATION_FLOOR = 34
+
+/** The verge between a block's kerb and its buildable ground, in world units. */
+const BLOCK_SETBACK = 5
 
 /**
  * The narrowest square a block must inscribe to survive planning, above the widest building.
@@ -314,12 +346,21 @@ const SEPARATION_FLOOR = 46
  * A block that cannot hold the widest footprint is dropped rather than kept and overhung, so a
  * building never spills into the carriageway around it. Floored so a database of only tiny tables
  * still gets blocks with room to stand a building clear of its kerb.
+ *
+ * Capacity is measured on the *buildable* ring, which is already pulled {@link BLOCK_SETBACK} in off
+ * the centre lines, so the clearance a building actually has from the nearest carriageway centre line
+ * is `capacity / 2 + BLOCK_SETBACK`. For that to clear the widest carriageway the network can draw —
+ * an {@link ARTERIAL_WIDTH} motorway, whose kerb is half that from its centre line — the headroom has
+ * to be `ARTERIAL_WIDTH - 2 × BLOCK_SETBACK`, and the floor has to sit above the same figure.
+ *
+ * A headroom of 2 was never sufficient for that; it went unnoticed only because blocks were traced so
+ * much wider than the buildings on them that no block near the floor was ever reached. Tightening the
+ * street spacing brings blocks near the floor into use, and an arterial promptly clipped five
+ * buildings across two seeded cities. Derived rather than tuned, so it cannot drift out of step with
+ * the carriageway table again.
  */
+const BLOCK_CAPACITY_HEADROOM = ARTERIAL_WIDTH - 2 * BLOCK_SETBACK
 const BLOCK_CAPACITY_FLOOR = 12
-const BLOCK_CAPACITY_HEADROOM = 2
-
-/** The verge between a block's kerb and its buildable ground, in world units. */
-const BLOCK_SETBACK = 5
 
 /**
  * City radius per root object, in separations.
@@ -454,8 +495,16 @@ function plannedFootprint(objects: readonly DatabaseCityObject[]): number {
 /** How far past the field radius streamlines may run, so the network reaches the map edge. */
 const SPAN_SCALE = 1.1
 
-/** How much wider block spacing grows from centre to edge, handed to the streamline tracer. */
-const EDGE_SEPARATION_SCALE = 2.3
+/**
+ * How much wider block spacing grows from centre to edge, handed to the streamline tracer.
+ *
+ * A real city does loosen toward its edge, so this is not one. But at 2.3 the outer ring — which is
+ * most of a disc's area, and so most of the blocks anyone actually sees — was traced at more than
+ * twice the centre's spacing, and a building standing on one of those blocks was a speck on a field.
+ * 1.35 keeps the gradient legible while leaving the periphery recognisably the same city as the
+ * middle.
+ */
+const EDGE_SEPARATION_SCALE = 1.35
 
 /** Shortest streamline kept, in separations: anything shorter is tracing noise, not a street. */
 const MIN_STREAMLINE_STEPS = 1.45
@@ -507,11 +556,11 @@ const CROSSING_MAX_BLOCK_AREA_STEPS = 12
  */
 const CARRIAGEWAY_WIDTH: Readonly<Record<RoadClass, number>> = {
   motorway: ARTERIAL_WIDTH,
-  primary: 20,
-  secondary: 17,
+  primary: 13,
+  secondary: 11,
   tertiary: STREET_WIDTH,
-  residential: 12,
-  service: 9,
+  residential: 8,
+  service: 6,
 }
 
 /** How far one straight-line bearing must dominate the other before a street is called `x` or `z`. */

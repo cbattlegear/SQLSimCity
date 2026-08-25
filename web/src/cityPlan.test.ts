@@ -312,6 +312,36 @@ describe('planCity placement', () => {
     }
   })
 
+  /**
+   * The city used to be almost entirely ground: measured over a 220-object city the median block was
+   * about 144 units across against a mean building of 15, so a building covered under 1% of the block
+   * it stood on and the drawing read as huts scattered on open moor (#70). The block is sized from the
+   * cell and the cell from the widest building, so this ratio is a property of the planning constants
+   * — {@link LOT_MARGIN}, the street separation and the centre-to-edge spacing — and not of the data.
+   *
+   * Deliberately a ratio and not an absolute size. Footprint and height are measured quantities that
+   * may not be adjusted to make a picture look better, so the only honest way to fill a block is to
+   * stop cutting the block so much larger than the building that has to stand on it.
+   */
+  it('stands a building on a block sized for it rather than on a paddock', () => {
+    const plan = planCity(largeCity(), largeOptions())
+    const shares: number[] = []
+    for (const lot of plan.lots.values()) {
+      if (lot.footprint === null) continue
+      const polygon = plan.warp.blockCorners(lot.blockCol, lot.blockRow)
+      if (polygon.length < 3) continue
+      let twiceArea = 0
+      for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+        twiceArea += (polygon[j]!.x + polygon[i]!.x) * (polygon[j]!.z - polygon[i]!.z)
+      }
+      shares.push((lot.footprint * lot.footprint) / (Math.abs(twiceArea) / 2))
+    }
+    expect(shares.length).toBeGreaterThan(50)
+    shares.sort((left, right) => left - right)
+    const median = shares[Math.floor(shares.length / 2)]!
+    expect(median).toBeGreaterThan(0.02)
+  })
+
   it('never puts a building on a facility block', () => {
     const plan = planCity(sampleCity(), options())
     const facilityBlocks = new Set(
