@@ -1142,7 +1142,54 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
 /* ------------------------------------------------------------ legend drawer */
 
 /*
+ * One height budget, shared, for a column that stacks more than one drawer.
+ *
+ * A flex item's automatic minimum is its content height clamped by its own definite `max-height`,
+ * so a capped drawer floors at `min(content, cap)` and no shrink pressure from the column can take
+ * it lower. That floor is the point -- it is what keeps the summary clickable -- but it does not
+ * compose: two drawers each capped at a flat 46vh floor at 46vh *each*, and 2 x 368 will not fit an
+ * 800px rail alongside a header, a search field and a metric. Measured on the city column at
+ * 1115x800 with a populated plan finder, before this rule: `.map-sidebar` 800 client / 967 scroll,
+ * `overflow: hidden`, 167px unreachable, the address list squeezed to 0px and its entries no longer
+ * hit-testable (#65).
+ *
+ * So the budget moves up one level. The wrapper takes the 46vh, and the drawers inside divide it
+ * via `--sidebar-drawer-cap`. The region then costs the column what a single drawer costs today.
+ *
+ * The default is the *half* share, and the `:has()` rule below widens it when only one drawer is
+ * open. That direction is deliberate: `:not()` takes a non-forgiving selector list, so an engine
+ * without `:has()` drops the widening rule entirely and lands on the half share -- which always
+ * fits. Getting this backwards reintroduces the overflow, so do not add `:where()` around the
+ * argument to "hold the specificity down": `:has()` takes a *relative* selector list and `:where()`
+ * takes a *complex* one, which may not begin with a combinator, so `:where(> ...)` has its argument
+ * discarded by forgiving parsing. Chromium then reports the selector back as literally
+ * `:not(:has(:where()))` -- an empty list matches nothing, `:not()` is therefore always true, and
+ * the widened cap applies unconditionally. Verified by reading `selectorText` off the parsed
+ * `CSSStyleSheet`, not by reasoning about it.
+ *
+ * No `min-height: 0` here either. The wrapper is `overflow: visible`, so a shrinkable wrapper would
+ * simply spill its drawers back out of the clipped rail -- the #63 defect, one level out.
+ */
+.sidebar-drawers {
+  --sidebar-drawer-budget: 46vh;
+  --sidebar-drawer-cap: calc(var(--sidebar-drawer-budget) / 2);
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  max-height: var(--sidebar-drawer-budget);
+}
+/* Only one drawer open: it may spend the budget less the other's collapsed summary (34.5px). */
+.sidebar-drawers:not(:has(> .sidebar-drawer[open] ~ .sidebar-drawer[open])) {
+  --sidebar-drawer-cap: calc(var(--sidebar-drawer-budget) - 2.5rem);
+}
+
+/*
  * Same shape as the place card: the cap sits on the drawer so the drawer can shrink below it too.
+ *
+ * The cap is read from `--sidebar-drawer-cap` rather than written here, so a column holding more
+ * than one drawer can hand each of them a share of one budget instead of giving both a flat 46vh
+ * that cannot fit together -- see `.sidebar-drawers`. The `46vh` fallback is what an *unwrapped*
+ * drawer gets, which is the atlas, so that column is unchanged.
  *
  * Deliberately no `min-height: 0` on `.sidebar-drawer` itself. Its automatic minimum is its content
  * height clamped by this `max-height` -- 368px in an 800px viewport, with the summary always inside
@@ -1151,7 +1198,7 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
  */
 .sidebar-drawer {
   flex: 0 1 auto;
-  max-height: 46vh;
+  max-height: var(--sidebar-drawer-cap, 46vh);
   display: flex;
   flex-direction: column;
   border-top: 1px solid #1c2733;
@@ -1353,8 +1400,14 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
    * could give way gave way entirely so the one that could not -- the drawer -- kept its size, and
    * the total still overflowed. Sized from content, the column simply outgrows the sheet, which is
    * the one thing the sheet now knows how to handle.
+   *
+   * `.sidebar-drawers > *` is here because `display: contents` below removes the wrapper's box but
+   * not the wrapper itself: the drawers inside become flex items of the sheet, while `.map-sidebar
+   * > *` goes on matching the wrapper, where `flex` is inert. Without this the drawers would hold
+   * their size only by their content-based automatic minimum -- true today, and true by accident.
    */
-  .map-sidebar > * { flex: none; }
+  .map-sidebar > *,
+  .sidebar-drawers > * { flex: none; }
 
   /*
    * The caps exist to let a section shrink inside a fixed-height column. There is no such column
@@ -1362,6 +1415,20 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
    */
   .sidebar-place-card,
   .sidebar-drawer { max-height: none; }
+
+  /*
+   * The sheet's contract runs on `.map-sidebar > *`, a direct-child selector, so the drawer wrapper
+   * would take both drawers out of its reach. Rather than duplicate every sheet rule for the
+   * wrapper's children, the wrapper stops generating a box: at this breakpoint the drawers are
+   * direct flex children of the sheet again and every rule above lands exactly where it did before
+   * the wrapper existed. `.tray-open` uses the same idiom.
+   *
+   * Custom properties still inherit through `display: contents`, so the drawers below go on
+   * inheriting `--sidebar-drawer-cap` -- a 23vh half-share, tighter than the 46vh that predates the
+   * wrapper. That is harmless only because `max-height: none` above discards it. Weaken that
+   * override and the sheet's drawers do not merely return to their old cap, they get a worse one.
+   */
+  .sidebar-drawers { display: contents; }
 
   /*
    * No scrollers inside the scrolling sheet. A nested scroller in a bottom sheet traps the gesture:

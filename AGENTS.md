@@ -28,10 +28,34 @@ console.log(el.clientHeight, el.scrollHeight, getComputedStyle(el).overflowY)
 That is the bug signature to look for. Also check that you have not created nested scroll traps,
 and that scrolling does not chain into the map canvas — `.map-shell` is `position: fixed`.
 
+**Zero unreachable pixels is necessary, not sufficient.** A column where the address list is 0px and
+the place card is 12px does not overflow and is still useless — the same class of mistake as the
+10px drawer. Record the actual heights of the sections that gave way, not just the overflow number,
+and say whether the result is usable.
+
+The sharpest usability check is a **trusted** click. `locator.click()` hit-tests, so it fails when a
+sibling overlaps the target; that is how the #65 column turned out to be uninteractable and not
+merely unreadable. `element.click()` via `evaluate`, and `click({ force: true })`, both bypass
+hit-testing and will pass while the defect is still there — use them only to reach a later state,
+never as evidence. Report the trusted click as its own pass/fail line, with the timing.
+
 Measure at **both** breakpoints. The sidebar is a rail above 860px and a bottom sheet at or below
 it, and the two behave differently on purpose.
 
 Put the measured numbers in the pull request body.
+
+### Reaching the city view
+
+`npm run dev` alone serves the atlas but not the city column — that needs the API. Run SQL Server
+locally, point `ConnectionStrings__SqlSimCity` at it, `dotnet run --project src\SqlSimCity.Api
+--urls http://127.0.0.1:5080`, and open `?view=city&database=<endpoint>%2Fdatabase%2F<db>`.
+
+The plan finder is empty until Query Store has captured something, and an empty finder is a short
+form that hides every height defect in that drawer. Query Store's default `QUERY_CAPTURE_MODE =
+AUTO` discards cheap ad-hoc queries, so a seed workload can run and still leave one family behind;
+set `QUERY_CAPTURE_MODE = ALL` before seeding. Submitting the finder with an **empty** search term
+lists everything, which is the reliable way to populate it. Measure the real component with real
+rows rather than reconstructing the column out of a different drawer's content.
 
 ## A new test must fail against the broken state
 
@@ -83,13 +107,40 @@ and does not need it: without that box the summary and the body are the flex ite
 body already scrolls. The defect exists only where the box does.
 
 `.sidebar-drawer` keeps `min-height: auto`, and a flex item's automatic minimum is its content size
-clamped by its own definite `max-height`. So each drawer still floors at `min(content, 46vh)` —
-368px in an 800px viewport, summary always inside that. Two open drawers therefore cannot both
-shrink out of the way, which is a separate defect from this one.
+clamped by its own definite `max-height`. So each drawer still floors at `min(content, cap)` —
+summary always inside that. Two open drawers therefore cannot both shrink out of the way.
+
+That is why the cap is no longer a flat `46vh` per drawer. Two drawers each floored at 46vh floor at
+46vh *each*, and 2 × 368 does not fit an 800px rail: measured at 1115×800 with a populated plan
+finder, 167px of the city column was unreachable, the address list was squeezed to 0px, and its
+entries stopped being clickable at all. So a `.sidebar-drawers` wrapper owns one budget and the
+drawers inside divide it via `--sidebar-drawer-cap`, half each by default and widened by a `:has()`
+rule when only one is open. The drawer's `max-height: var(--sidebar-drawer-cap, 46vh)` fallback is
+what keeps an *unwrapped* drawer — the atlas — byte-identical.
+
+Two traps in that arrangement, both of which fail quietly:
+
+- **Never put `:where()` inside that `:has()`.** `:has()` takes a *relative* selector list, in which
+  a selector may start with a combinator; `:where()` takes a *complex* one, in which it may not. So
+  `:where(> .sidebar-drawer[open] ~ …)` has its argument dropped by forgiving parsing rather than
+  failing — Chromium reads the rule back as `:not(:has(:where()))`, which matches everything, so the
+  widened cap applies with both drawers open and the overflow returns. Plain `:not(:has(> …))` is
+  correct: `:not()` is *not* forgiving, so an engine without `:has()` drops the whole rule and lands
+  on the half share, which always fits.
+- **`display: contents` removes a box, not an element.** At ≤860px the wrapper is `display:
+  contents`, so `.map-sidebar > *` goes on matching the *wrapper* while the drawers are the flex
+  items — hence `.sidebar-drawers > *` alongside it in that block. Custom properties still inherit
+  through it too, so the drawers keep inheriting a 23vh half-share there; `max-height: none` in the
+  same block is the only thing discarding it, and weakening that gives the sheet a *tighter* cap
+  than existed before the wrapper.
 
 There are three `.sidebar-drawer` instances — one in `App.tsx` and two in `DatabaseCityView.tsx`.
 Check the change against more than one. The two in `DatabaseCityView.tsx` are siblings in the same
 column, so they are the case where the caps compete.
+
+`.sidebar-place-card` is a third `46vh` consumer on that same column and is *not* part of the
+budget. It shrinks freely, so it does not overflow the rail, but it is squeezed hard: measured at
+1115×800 with a place card open and both drawers open, it holds 81px and scrolls its own content.
 
 ## NuGet lock files move together
 
@@ -114,7 +165,7 @@ Do not weaken `--locked-mode` in CI to get around this. It is a supply-chain con
 ```powershell
 dotnet build SqlSimCity.slnx -c Release        # 0 warnings expected
 dotnet test SqlSimCity.slnx -c Release         # 1,139 tests
-cd web; npm ci; npm run build; npm test -- --run   # 681 tests / 39 files
+cd web; npm ci; npm run build; npm test -- --run   # 688 tests / 39 files
 npm run typecheck
 ```
 

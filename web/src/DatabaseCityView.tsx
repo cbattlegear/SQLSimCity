@@ -647,27 +647,41 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
                 </button>
               )}
             </div>
-            {planFinder}
-            {page && <LegendDrawer
-              page={page}
-              objects={visibleObjects}
-              metric={metric}
-              selectedId={selectedId}
-              selectedRoadId={selectedRoadId}
-              onSelectObject={selectObject}
-              onSelectRoad={selectRoad}
-              endpointName={endpointName}
-              roads={roads}
-              facilities={facilities}
-              facilityTraffic={facilityTraffic}
-              waitAttribution={waitAttribution}
-              blocking={blocking}
-              displayedSchemas={displayedSchemas}
-              activePlanFamilyId={activePlan?.choice.familyId ?? null}
-              mappingFamilyId={mappingFamilyId}
-              onShowFamily={showFamilyOnMap}
-              selectedObject={selected}
-            />}
+            {/*
+              * One shared height budget, not two independent caps.
+              *
+              * Both drawers are capped, and a flex item's automatic minimum is its content clamped
+              * by its own `max-height`, so two flat `46vh` caps floor at 46vh each and no shrink
+              * pressure can take either lower. Measured at 1115x800 with a populated plan finder,
+              * that left 167px of the column unreachable and squeezed the address list to 0px.
+              * The wrapper owns the budget and hands each drawer its share; see `.sidebar-drawers`.
+              *
+              * It has to be a real element: everything between here and `.map-sidebar` is a
+              * fragment, so without it both drawers are direct flex children of the rail.
+              */}
+            <div className="sidebar-drawers">
+              {planFinder}
+              {page && <LegendDrawer
+                page={page}
+                objects={visibleObjects}
+                metric={metric}
+                selectedId={selectedId}
+                selectedRoadId={selectedRoadId}
+                onSelectObject={selectObject}
+                onSelectRoad={selectRoad}
+                endpointName={endpointName}
+                roads={roads}
+                facilities={facilities}
+                facilityTraffic={facilityTraffic}
+                waitAttribution={waitAttribution}
+                blocking={blocking}
+                displayedSchemas={displayedSchemas}
+                activePlanFamilyId={activePlan?.choice.familyId ?? null}
+                mappingFamilyId={mappingFamilyId}
+                onShowFamily={showFamilyOnMap}
+                selectedObject={selected}
+              />}
+            </div>
           </>
         }
       />

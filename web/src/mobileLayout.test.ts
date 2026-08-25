@@ -347,9 +347,15 @@ describe('the sidebar column scrolls its own overflow', () => {
    * so these rules are switched off there; see the bottom-sheet suite below.
    */
   it('lets the capped sections shrink inside the desktop rail', () => {
+    expect(desktopRule('.sidebar-place-card'), '.sidebar-place-card lost its height cap')
+      .toMatch(/max-height:\s*46vh/)
+    // The drawer reads its cap from the wrapper's budget instead of writing 46vh itself; see the
+    // shared-budget suite below for why, and for the 46vh fallback that keeps an unwrapped drawer
+    // -- the atlas -- exactly as it was.
+    expect(desktopRule('.sidebar-drawer'), '.sidebar-drawer lost its height cap')
+      .toMatch(/max-height:\s*var\(--sidebar-drawer-cap,\s*46vh\)/)
     for (const selector of ['.sidebar-place-card', '.sidebar-drawer']) {
       const body = desktopRule(selector)
-      expect(body, `${selector} lost its height cap`).toMatch(/max-height:\s*46vh/)
       expect(body, `${selector} is not shrinkable`).toMatch(/flex:\s*0\s+1\s+auto/)
       // A column layout, or the section below the cap cannot be told to scroll instead of overflow.
       expect(body, `${selector} is not a column`).toMatch(/flex-direction:\s*column/)
@@ -408,7 +414,7 @@ describe('the sidebar column scrolls its own overflow', () => {
     expect(content).toMatch(/flex-direction:\s*column/)
     expect(desktopRule('.sidebar-drawer-body'), 'nothing to receive the shrink').toMatch(/overflow:\s*auto/)
     // The drawer element itself is untouched: it still caps, and it still floors on its content.
-    expect(desktopRule('.sidebar-drawer')).toMatch(/max-height:\s*46vh/)
+    expect(desktopRule('.sidebar-drawer')).toMatch(/max-height:\s*var\(--sidebar-drawer-cap,\s*46vh\)/)
   })
 })
 
@@ -444,9 +450,17 @@ describe('the narrow bottom sheet scrolls as one region', () => {
    * Nothing in the sheet shrinks. Shrinking is what produced the 0px address list: the sections that
    * could give way gave way entirely, the one that could not kept its size, and the column still
    * overflowed. Sized from content it simply outgrows the sheet, which the sheet now handles.
+   *
+   * Both halves of the selector matter. `.sidebar-drawers` is `display: contents` here, which removes
+   * the wrapper's box but not the wrapper: the drawers become flex items of the sheet while
+   * `.map-sidebar > *` goes on matching the wrapper, where `flex` is inert. Drop the second half and
+   * the drawers hold their size only by their content-based automatic minimum -- true today, and true
+   * by accident.
    */
   it('sizes every section from its content instead of shrinking it', () => {
-    expect(narrowCss).toMatch(/\.map-sidebar > \*\s*\{[^}]*flex:\s*none/)
+    expect(narrowRule('.map-sidebar > *'), 'the sheet lets its sections shrink').toMatch(/flex:\s*none/)
+    expect(narrowRule('.sidebar-drawers > *'), 'flex: none no longer reaches the drawers')
+      .toMatch(/flex:\s*none/)
   })
 
   /**
@@ -475,7 +489,8 @@ describe('the narrow bottom sheet scrolls as one region', () => {
    */
   it('never compresses the drawer content box inside the sheet', () => {
     expect(narrowRule('.sidebar-drawer'), '.sidebar-drawer keeps a cap in the sheet').toMatch(/max-height:\s*none/)
-    expect(narrowCss).toMatch(/\.map-sidebar > \*\s*\{[^}]*flex:\s*none/)
+    expect(narrowRule('.map-sidebar > *')).toMatch(/flex:\s*none/)
+    expect(narrowRule('.sidebar-drawers > *')).toMatch(/flex:\s*none/)
     // The desktop fix is defined once, outside any media query, and is inert here rather than undone.
     expect(desktopRule('.sidebar-drawer::details-content')).not.toBeNull()
     expect(narrowRule('.sidebar-drawer::details-content')).toBeNull()
@@ -508,5 +523,148 @@ describe('the narrow bottom sheet scrolls as one region', () => {
     // And the overrides really are in that last block rather than an earlier, losing one.
     expect(css.slice(block)).toMatch(/\.map-sidebar\s*\{[^}]*overflow:\s*auto/)
     expect(css.slice(block)).toMatch(/\.sidebar-drawer\s*\{[^}]*max-height:\s*none/)
+  })
+})
+
+/**
+ * Two drawers in one rail share one height budget (#65).
+ *
+ * A flex item's automatic minimum is its content height clamped by its own definite `max-height`, so
+ * a capped drawer floors at `min(content, cap)` and the column cannot push it lower. That floor is
+ * the point -- it is what keeps the summary clickable, and removing it is the ten-pixel-drawer defect
+ * pinned above -- but it does not compose. Two drawers each capped at a flat 46vh floor at 46vh
+ * *each*, and the city rail has two: the plan finder and the legend.
+ *
+ * Measured in Chromium at 1115x800 against a live backend, with the plan finder holding 12 real
+ * captured plans and both drawers open: `.map-sidebar` 800 client / 967 scroll, `overflow: hidden`,
+ * 167px unreachable, `.sidebar-scroll` squeezed to 0px, and the address entries no longer clickable
+ * -- a trusted Playwright click timed out after 8s. After the wrapper: 800/800, 0 unreachable,
+ * `.sidebar-scroll` 154px, trusted click passes in 9ms.
+ *
+ * So the budget moves up one level, onto a wrapper the drawers divide. What this file can check is
+ * the shape of that arrangement; that the resulting column is *usable* rather than merely
+ * non-overflowing is a browser measurement, which is how both previous defects here got past a green
+ * suite.
+ */
+describe('two drawers in one rail share one height budget', () => {
+  const cityMarkup = readFileSync(new URL('./DatabaseCityView.tsx', import.meta.url), 'utf8')
+  const atlasMarkup = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8')
+
+  /** The wrapper carries the whole budget, so the drawer region costs what one drawer costs. */
+  it('caps the wrapper rather than each drawer', () => {
+    const wrapper = desktopRule('.sidebar-drawers')
+    expect(wrapper, '.sidebar-drawers has no rule at all').not.toBeNull()
+    expect(wrapper, 'the budget is not declared').toMatch(/--sidebar-drawer-budget:\s*46vh/)
+    expect(wrapper, 'the wrapper does not cap at the budget')
+      .toMatch(/max-height:\s*var\(--sidebar-drawer-budget\)/)
+    expect(wrapper, 'the wrapper cannot shrink into the rail').toMatch(/flex:\s*0\s+1\s+auto/)
+    // A column, or the shrink never reaches the drawers inside.
+    expect(wrapper).toMatch(/display:\s*flex/)
+    expect(wrapper).toMatch(/flex-direction:\s*column/)
+  })
+
+  /**
+   * And never `min-height: 0` on the wrapper either. It is `overflow: visible`, so a shrinkable
+   * wrapper would simply spill its drawers back out of a clipped rail -- the #63 defect one level out.
+   */
+  it('never lets the wrapper shrink out from under its drawers', () => {
+    const wrapperRules = rules().filter((one) => one.selector.split(',')
+      .some((part) => part.trim() === '.sidebar-drawers'))
+    expect(wrapperRules.length, 'no .sidebar-drawers rule to check').toBeGreaterThan(0)
+    for (const rule of wrapperRules) {
+      expect(rule.body, 'a .sidebar-drawers rule sets min-height: 0').not.toMatch(/min-height:\s*0/)
+    }
+  })
+
+  /**
+   * The drawer reads the cap; it does not write one. The `46vh` fallback is what an *unwrapped*
+   * drawer gets, which is the atlas, so that column is byte-identical -- measured at 1115x800 as
+   * 800/800, 0 unreachable, drawer at 368px, legend body scrolling 332 internally, before and after.
+   */
+  it('hands each drawer a share of the budget, with the old cap as the fallback', () => {
+    expect(desktopRule('.sidebar-drawer'))
+      .toMatch(/max-height:\s*var\(--sidebar-drawer-cap,\s*46vh\)/)
+    expect(desktopRule('.sidebar-drawers'))
+      .toMatch(/--sidebar-drawer-cap:\s*calc\(var\(--sidebar-drawer-budget\)\s*\/\s*2\)/)
+  })
+
+  /**
+   * `:has()` widens, it never narrows, and it is written without `:where()`.
+   *
+   * The default is the half share, which always fits, and the conditional rule relaxes it when only
+   * one drawer is open. That direction is the whole safety argument: `:not()` takes a *non-forgiving*
+   * selector list, so an engine without `:has()` invalidates and drops the widening rule and lands on
+   * the half share.
+   *
+   * `:where()` inside `:has()` inverts that, dangerously. `:has()` takes a relative selector list, in
+   * which a selector may begin with a combinator; `:where()` takes a *complex* selector list, in which
+   * it may not. So `:where(> .sidebar-drawer[open] ~ ...)` has its argument dropped by forgiving
+   * parsing rather than failing -- Chromium reads the rule back as literally `:not(:has(:where()))`,
+   * an empty list matches nothing, `:not()` is therefore always true, and the widened cap applies with
+   * both drawers open. Verified by reading `selectorText` off the parsed `CSSStyleSheet`: the
+   * `:where()` form matched all three fixtures including both-open, the plain form matched only the
+   * two that should widen. In the browser, with the real rule: 0 matches with both drawers open, 1
+   * with one open.
+   */
+  it('widens the cap for a lone drawer instead of narrowing it for two', () => {
+    const conditional = rules().find((one) => /^\.sidebar-drawers:not\(:has\(/.test(one.selector))
+    expect(conditional, 'no conditional cap rule at all').toBeDefined()
+    expect(conditional!.selector, ':where() drops its argument here and inverts the rule')
+      .not.toMatch(/:where\(/)
+    expect(conditional!.selector)
+      .toContain(':not(:has(> .sidebar-drawer[open] ~ .sidebar-drawer[open]))')
+    // It relaxes the cap, so an engine that drops the rule keeps the share that always fits.
+    expect(conditional!.body)
+      .toMatch(/--sidebar-drawer-cap:\s*calc\(var\(--sidebar-drawer-budget\)\s*-\s*2\.5rem\)/)
+    // And it comes after the base rule it relaxes, or it would lose on source order.
+    expect(css.indexOf('.sidebar-drawers:not('), 'the conditional rule is not in the stylesheet')
+      .toBeGreaterThan(css.indexOf('\n.sidebar-drawers {'))
+  })
+
+  /** A budget nothing is inside is not a budget. Both drawers have to be in the wrapper. */
+  it('renders both city drawers inside the wrapper', () => {
+    const open = cityMarkup.indexOf('<div className="sidebar-drawers">')
+    expect(open, 'DatabaseCityView renders no .sidebar-drawers wrapper').toBeGreaterThan(-1)
+    const close = cityMarkup.indexOf('</div>', open)
+    const wrapped = cityMarkup.slice(open, close)
+    expect(wrapped, 'the plan finder is outside the budget').toContain('{planFinder}')
+    expect(wrapped, 'the legend drawer is outside the budget').toContain('<LegendDrawer')
+    // The metric stays outside: it is `flex: none` and shrinking it was never the problem.
+    expect(wrapped).not.toContain('sidebar-metric')
+  })
+
+  /**
+   * The atlas is deliberately not wrapped. It renders one drawer, so it has nothing to divide, and
+   * wrapping it would halve a cap that already fits -- a regression dressed as consistency. The
+   * `46vh` fallback is what makes leaving it alone a no-op rather than an omission.
+   */
+  it('leaves the single-drawer atlas column unwrapped', () => {
+    expect(atlasMarkup).toContain('className="sidebar-drawer"')
+    expect(atlasMarkup, 'the atlas has one drawer and nothing to share a budget with')
+      .not.toContain('sidebar-drawers')
+    expect((cityMarkup.match(/className="sidebar-drawer"/g) ?? []).length,
+      'the city rail no longer has the two drawers this budget exists for').toBe(2)
+  })
+
+  /**
+   * At <=860px the wrapper stops generating a box, so the sheet is structurally what it was before
+   * the wrapper existed rather than re-patched around it.
+   *
+   * The load-bearing part is subtle: custom properties inherit through `display: contents`, so the
+   * drawers below go on inheriting `--sidebar-drawer-cap` -- a 23vh half-share, *tighter* than the
+   * 46vh that predates this change. `max-height: none` in the same block is the only thing discarding
+   * it. Weaken that override and the sheet's drawers do not return to their old cap, they get a worse
+   * one, which is why it is pinned here as well as in the sheet suite above.
+   */
+  it('dissolves the wrapper in the narrow sheet', () => {
+    expect(narrowRule('.sidebar-drawers'), '.sidebar-drawers has no narrow rule')
+      .toMatch(/display:\s*contents/)
+    expect(narrowRule('.sidebar-drawer'), 'the inherited half-share cap is no longer discarded')
+      .toMatch(/max-height:\s*none/)
+    // In the last block, or a media query with no extra specificity loses to the base rule.
+    const block = css.lastIndexOf(`@media (max-width: ${SHEET}px)`)
+    expect(css.slice(block)).toMatch(/\.sidebar-drawers\s*\{[^}]*display:\s*contents/)
+    expect(block, 'the wrapper is dissolved before it is defined')
+      .toBeGreaterThan(css.indexOf('\n.sidebar-drawers {'))
   })
 })
