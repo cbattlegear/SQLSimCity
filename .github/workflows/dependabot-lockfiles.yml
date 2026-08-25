@@ -1,0 +1,319 @@
+# Keeps NuGet lock files in sync on Dependabot pull requests.
+#
+# ---------------------------------------------------------------------------
+# The problem this solves
+# ---------------------------------------------------------------------------
+# This repository uses Central Package Management (Directory.Packages.props)
+# together with a packages.lock.json in every project, and CI restores with
+# `--locked-mode`. When Dependabot bumps a package it only regenerates the lock
+# files it considers directly affected. Every other project that still carries a
+# stale transitive or CentralTransitive entry then aborts the locked-mode restore
+# with NU1004, so essentially every NuGet Dependabot pull request arrives red and
+# needs a manual `dotnet restore SqlSimCity.slnx --force-evaluate`.
+#
+# This workflow does that regeneration automatically and pushes the result back
+# to the Dependabot branch, so the pull request settles green on its own.
+#
+# ---------------------------------------------------------------------------
+# Why this is a `pull_request` workflow with a GitHub App token
+# ---------------------------------------------------------------------------
+# Pushing to the pull request branch needs a write-capable credential, and for
+# Dependabot-triggered runs GitHub deliberately restricts what is available
+# (see docs: "Dependabot on GitHub Actions"):
+#
+#   * `pull_request` (this workflow): GITHUB_TOKEN is read-only and the
+#     `permissions:` block cannot elevate it. Secrets ARE available, but they are
+#     populated from *Dependabot* secrets -- Actions secrets are not visible.
+#   * `pull_request_target`: GITHUB_TOKEN is read-only *and* no secrets are
+#     available at all when the pull request was authored by Dependabot. It is
+#     the reflexive answer to "I need a write token on a PR" and it simply does
+#     not work here.
+#   * `workflow_run`: would give a write GITHUB_TOKEN, but pushes made with
+#     GITHUB_TOKEN do not trigger new workflow runs, so the pull request would
+#     get fixed lock files and still display the previous red CI result. It is
+#     also the classic privilege-escalation trigger. Rejected on both counts.
+#
+# So: `pull_request`, plus a short-lived GitHub App installation token minted
+# from credentials stored as *Dependabot* secrets. An App token is not
+# GITHUB_TOKEN, so the push does re-trigger CI and the pull request goes green.
+#
+# ---------------------------------------------------------------------------
+# Maintainer setup required (this workflow is inert until it is done)
+# ---------------------------------------------------------------------------
+#  1. Create a GitHub App owned by the repository owner with exactly one
+#     repository permission: Contents -> Read and write. Install it on this
+#     repository only.
+#  2. Store its App ID and a generated private key as **Dependabot** secrets
+#     (Settings -> Secrets and variables -> Dependabot), named
+#     LOCKFILE_SYNC_APP_ID and LOCKFILE_SYNC_PRIVATE_KEY.
+#
+# They must be Dependabot secrets. Actions secrets are invisible to
+# Dependabot-triggered runs; if they are stored in the wrong place this workflow
+# will take the "warn, do not fail" path and say so in the job summary.
+#
+# ---------------------------------------------------------------------------
+# Security posture
+# ---------------------------------------------------------------------------
+# The uncomfortable part of this design is that `dotnet restore` evaluates
+# MSBuild logic, in a job that will later hold a write credential. Mitigations,
+# in the order they take effect:
+#
+#  1. The job only runs for pull requests authored by Dependabot, initiated by
+#     Dependabot, on a `dependabot/nuget/` branch (see the `if:` below).
+#  2. tools/verify-dependency-only-diff.sh runs BEFORE any dotnet command and
+#     fails closed unless the entire diff is Directory.Packages.props and
+#     **/packages.lock.json -- so repository-supplied build logic is provably
+#     unchanged from the base branch.
+#  3. Checkout does not persist credentials, so nothing executing during restore
+#     can read a token off disk.
+#  4. The App token is minted in the second-to-last step, after restore has
+#     already finished, and is scoped to this repository with Contents write
+#     only. It is passed to `git push` through an environment variable and is
+#     never written into .git/config.
+#  5. Only paths that have been individually validated as packages.lock.json are
+#     staged. There is no `git add -A` / `git add .` anywhere in this file.
+#
+# Residual, knowingly accepted risk: a malicious *package* published to nuget.org
+# and proposed by Dependabot could still execute build logic in this job. The
+# guard constrains the repository, not the package feed.
+name: Dependabot lock files
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    # Narrow the trigger to NuGet dependency manifests so that npm, Docker and
+    # github-actions Dependabot pull requests never even queue a run.
+    paths:
+      - Directory.Packages.props
+      - "**/packages.lock.json"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-lockfiles-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    # Three ANDed conditions:
+    #
+    #   * `pull_request.user.login` is the *author* of the pull request. This is
+    #     the primary gate because it describes the artifact we are willing to
+    #     modify. `github.actor` alone would not do: it reflects whoever
+    #     triggered this particular run, and becomes a human login when a
+    #     maintainer pushes to a Dependabot branch or re-runs the workflow.
+    #   * `github.actor` is checked as well, as defense in depth. Requiring the
+    #     run to also be Dependabot-*initiated* excludes human pushes to
+    #     Dependabot branches, and is exactly the condition under which GitHub
+    #     guarantees the read-only-GITHUB_TOKEN / Dependabot-secrets regime this
+    #     design relies on. (A human push would not receive the Dependabot
+    #     secrets anyway, so it could not push -- but failing at the gate is
+    #     clearer than failing at the end.)
+    #   * `head_ref` scopes this to the NuGet ecosystem and asserts Dependabot's
+    #     branch naming.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.actor == 'dependabot[bot]'
+      && startsWith(github.head_ref, 'dependabot/nuget/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      # The only elevated permission required: this job pushes a commit. It does
+      # not comment, label, approve or merge, so `pull-requests: write` is not
+      # granted. No `id-token` either -- actions/create-github-app-token
+      # authenticates with the App private key, not with OIDC.
+      #
+      # Note that for Dependabot-triggered `pull_request` runs GITHUB_TOKEN stays
+      # read-only regardless of what is declared here; this block is declared for
+      # correctness and least privilege, not because it grants the push.
+      contents: write
+    env:
+      DOTNET_NOLOGO: "true"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+      # An App ID is an identifier, not a credential, so exposing it at job level
+      # is safe and lets steps test for "are the secrets configured at all?".
+      # The private key is referenced only in the token step's `with:` block.
+      LOCKFILE_SYNC_APP_ID: ${{ secrets.LOCKFILE_SYNC_APP_ID }}
+      # Marker used to recognise our own commits and guarantee termination.
+      SYNC_MARKER: "Automated-Lockfile-Sync: dependabot-lockfiles.yml"
+    steps:
+      - name: Check out pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Check out the head commit explicitly rather than the synthetic merge
+          # commit, because that is what we are going to push back to.
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Full history so the guard can compute a merge base against the base
+          # branch. This also fetches refs/remotes/origin/*, so no further
+          # authenticated fetch is needed after credentials are dropped.
+          fetch-depth: 0
+          # Do not leave a token in .git/config. Restore runs later in this job.
+          persist-credentials: false
+
+      - name: Verify the pull request diff is dependency-only
+        # This is the load-bearing mitigation and it runs before anything else
+        # touches the tree. If the base ref is somehow unavailable, `git
+        # merge-base` fails and `set -e` aborts -- fail closed by construction.
+        #
+        # Event-derived values are passed through the environment rather than
+        # interpolated into the script body, so they cannot be parsed as shell.
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: tools/verify-dependency-only-diff.sh "origin/${BASE_REF}" "${HEAD_SHA}"
+
+      - name: Check whether this branch was already synchronized
+        id: previous
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -Eeuo pipefail
+          if git log -1 --format=%B "${HEAD_SHA}" | grep --quiet --fixed-strings "${SYNC_MARKER}"; then
+            echo "Head commit is a previous automated lock-file sync."
+            echo "already-synced=true" >>"${GITHUB_OUTPUT}"
+          else
+            echo "already-synced=false" >>"${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
+
+      - name: Regenerate lock files
+        # --force-evaluate is the documented fix for NU1004: it re-resolves the
+        # graph and rewrites every lock file, including the ones Dependabot never
+        # touched (src/SqlSimCity.Archive.Tool being the recurring offender).
+        run: dotnet restore SqlSimCity.slnx --force-evaluate
+
+      - name: Detect and stage lock-file drift
+        id: drift
+        run: |
+          set -Eeuo pipefail
+
+          # Collect everything restore changed. Build output (bin/, obj/) is
+          # gitignored, so anything surfacing here that is not a lock file is
+          # unexpected and treated as a hard failure rather than being ignored.
+          paths=()
+          while IFS= read -r -d '' entry; do
+            paths+=("${entry:3}")
+          done < <(git status --porcelain=v1 --untracked-files=all -z)
+
+          if [[ ${#paths[@]} -eq 0 ]]; then
+            echo "changed=false" >>"${GITHUB_OUTPUT}"
+            echo "Lock files are already in sync; nothing to do." \
+              >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          unexpected=()
+          for path in "${paths[@]}"; do
+            case "${path}" in
+              packages.lock.json | */packages.lock.json) ;;
+              *) unexpected+=("${path}") ;;
+            esac
+          done
+
+          if [[ ${#unexpected[@]} -gt 0 ]]; then
+            echo "::error::dotnet restore modified files that are not lock files; refusing to commit."
+            printf '  %s\n' "${unexpected[@]}" >&2
+            exit 1
+          fi
+
+          # Termination guard. Normally the first sync push re-triggers this
+          # workflow, restore finds no drift, and the run above exits via the
+          # "already in sync" path. If we still see drift on a branch whose head
+          # is already one of our sync commits, restore is not deterministic and
+          # pushing again would ping-pong forever. Stop loudly instead.
+          if [[ "${ALREADY_SYNCED}" == "true" ]]; then
+            echo "::error::Lock files still drift after a previous automated sync." \
+              "Restore is not converging; refusing to push again. Investigate manually" \
+              "with 'dotnet restore SqlSimCity.slnx --force-evaluate'."
+            exit 1
+          fi
+
+          # Stage only paths that were individually validated as lock files
+          # above. Deliberately never 'git add -A' / 'git add .'.
+          git add -- "${paths[@]}"
+
+          echo "changed=true" >>"${GITHUB_OUTPUT}"
+          {
+            echo "### Regenerated NuGet lock files"
+            echo
+            printf -- '- `%s`\n' "${paths[@]}"
+          } >>"${GITHUB_STEP_SUMMARY}"
+        env:
+          ALREADY_SYNCED: ${{ steps.previous.outputs.already-synced }}
+
+      - name: Mint a scoped GitHub App token
+        id: app-token
+        # Minted only when there is actually something to push, and only after
+        # restore has finished, so no write credential exists in the job while
+        # MSBuild logic is executing.
+        if: steps.drift.outputs.changed == 'true' && env.LOCKFILE_SYNC_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.LOCKFILE_SYNC_APP_ID }}
+          private-key: ${{ secrets.LOCKFILE_SYNC_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Commit and push regenerated lock files
+        if: steps.drift.outputs.changed == 'true' && steps.app-token.conclusion == 'success'
+        env:
+          # The token exists only for the lifetime of this step's process
+          # environment. It is never written to .git/config.
+          PUSH_TOKEN: ${{ steps.app-token.outputs.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -Eeuo pipefail
+
+          # Commit as Dependabot so the pull request keeps its Dependabot
+          # attribution and @dependabot commands keep working.
+          git config user.name 'dependabot[bot]'
+          git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
+
+          git commit --message 'Regenerate NuGet lock files' \
+            --message 'Central Package Management means a version bump invalidates lock files in projects Dependabot does not update, which breaks "dotnet restore --locked-mode". Regenerated with "dotnet restore SqlSimCity.slnx --force-evaluate".' \
+            --message "${SYNC_MARKER}"
+
+          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${HEAD_REF}"
+
+          echo "Pushed regenerated lock files to ${HEAD_REF}." >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Report missing credentials
+        # Deliberately does not fail: CI already reports the real problem, and a
+        # second red check would just add noise. This surfaces the one-time setup
+        # the maintainer still owes.
+        if: steps.drift.outputs.changed == 'true' && steps.app-token.conclusion != 'success'
+        run: |
+          {
+            echo "### Lock files are out of sync, but they were not pushed"
+            echo
+            echo "This workflow could not mint a GitHub App token, so the"
+            echo "regenerated \`packages.lock.json\` files were left uncommitted."
+            echo
+            echo "To enable automatic synchronization, create a GitHub App with"
+            echo "only the \`Contents: Read and write\` repository permission,"
+            echo "install it on this repository, and store its credentials as"
+            echo "**Dependabot** secrets (Settings -> Secrets and variables ->"
+            echo "Dependabot) named \`LOCKFILE_SYNC_APP_ID\` and"
+            echo "\`LOCKFILE_SYNC_PRIVATE_KEY\`. Actions secrets will not work:"
+            echo "they are not visible to Dependabot-triggered runs."
+            echo
+            echo "Until then, fix this pull request manually:"
+            echo
+            echo '```'
+            echo 'dotnet restore SqlSimCity.slnx --force-evaluate'
+            echo 'git add -- "**/packages.lock.json"'
+            echo 'git commit -m "Regenerate NuGet lock files"'
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+          echo "::warning::Lock files are out of sync and no GitHub App credentials are configured. See the job summary."

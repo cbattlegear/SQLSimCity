@@ -42,7 +42,55 @@ jobs:
         run: node --test fixtures/v1/test/validate-fixtures.test.mjs
 
       - name: Restore .NET dependencies
-        run: dotnet restore SqlSimCity.slnx --locked-mode
+        # --locked-mode is a genuine supply-chain control: restore must fail
+        # rather than silently resolve a version that is not in the lock files.
+        # It stays. This wrapper only makes the most common failure legible.
+        #
+        # With Central Package Management, bumping a version in
+        # Directory.Packages.props invalidates the packages.lock.json of every
+        # project that carries a matching transitive/CentralTransitive entry --
+        # including projects nobody edited. The resulting wall of NU1004 buries
+        # the one thing a maintainer needs to know, which is the fix below.
+        run: |
+          set -Eeuo pipefail
+          log="${RUNNER_TEMP}/dotnet-restore.log"
+          status=0
+          dotnet restore SqlSimCity.slnx --locked-mode 2>&1 | tee "${log}" || status=$?
+
+          if [[ ${status} -eq 0 ]]; then
+            exit 0
+          fi
+
+          # Any other restore failure is re-raised untouched, so unrelated
+          # problems are not misdiagnosed as a lock-file drift.
+          if ! grep --quiet --extended-regexp 'NU100[45]|NU1403' "${log}"; then
+            exit "${status}"
+          fi
+
+          {
+            echo "### NuGet lock files are out of sync"
+            echo
+            echo 'Restore refused to run in `--locked-mode` because one or more'
+            echo '`packages.lock.json` files disagree with `Directory.Packages.props`.'
+            echo
+            echo 'Regenerate every lock file and commit the result:'
+            echo
+            echo '```'
+            echo 'dotnet restore SqlSimCity.slnx --force-evaluate'
+            echo 'git add -- "**/packages.lock.json"'
+            echo 'git commit -m "Regenerate NuGet lock files"'
+            echo '```'
+            echo
+            echo 'Projects reporting the mismatch:'
+            echo
+            grep --extended-regexp 'NU100[45]|NU1403' "${log}" \
+              | grep --only-matching --extended-regexp '[^ /\\]+\.csproj' \
+              | sort --unique \
+              | sed 's/^/- /' || true
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+          echo "::error::NuGet lock files are out of sync. Run 'dotnet restore SqlSimCity.slnx --force-evaluate' and commit the regenerated packages.lock.json files. See the job summary for details."
+          exit "${status}"
 
       - name: Test .NET
         run: dotnet test SqlSimCity.slnx --configuration Release --no-restore
@@ -80,6 +128,9 @@ jobs:
 
       - name: Test operational scripts
         run: tools/tests/operations.test.sh
+
+      - name: Test dependency-only diff guard
+        run: tools/tests/verify-dependency-only-diff.test.sh
 
   container:
     needs: verify

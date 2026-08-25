@@ -172,3 +172,49 @@ repository owner, and environment approval.
 Dependabot updates GitHub Actions, NuGet, web npm, and Docker references weekly.
 Action references remain pinned to immutable commits; review the version comment
 and upstream release notes when accepting an update.
+
+## NuGet lock files
+
+Package versions live in `Directory.Packages.props` (Central Package Management)
+and every project carries a `packages.lock.json`. CI restores with
+`--locked-mode`, so a restore fails rather than silently resolving a version that
+is not in the lock files.
+
+A consequence is that changing one version in `Directory.Packages.props`
+invalidates the lock file of every project holding a matching transitive or
+`CentralTransitive` entry, including projects nobody edited. Restore then stops
+with `NU1004`. The fix is always the same:
+
+```bash
+dotnet restore SqlSimCity.slnx --force-evaluate
+git add -- "**/packages.lock.json"
+git commit -m "Regenerate NuGet lock files"
+```
+
+CI detects this specific failure and prints those commands in the job summary.
+
+### Automatic synchronization on Dependabot pull requests
+
+Dependabot regenerates only the lock files it considers directly affected, so its
+NuGet pull requests hit `NU1004` on the rest.
+`.github/workflows/dependabot-lockfiles.yml` closes that gap: on a NuGet
+Dependabot pull request it verifies the diff touches nothing but
+`Directory.Packages.props` and `packages.lock.json` files, runs
+`--force-evaluate`, and pushes the regenerated lock files back to the branch. It
+no-ops when the lock files are already in sync, and never runs for the npm,
+Docker, or GitHub Actions ecosystems.
+
+Pushing requires a credential that is not `GITHUB_TOKEN`, because Dependabot
+runs receive a read-only token and because pushes made with `GITHUB_TOKEN` do not
+re-trigger CI. To enable the workflow:
+
+1. Create a GitHub App owned by the repository owner whose only repository
+   permission is **Contents: Read and write**, and install it on this repository
+   alone.
+2. Store its App ID and a generated private key as **Dependabot** secrets
+   (Settings → Secrets and variables → **Dependabot**) named
+   `LOCKFILE_SYNC_APP_ID` and `LOCKFILE_SYNC_PRIVATE_KEY`.
+
+They must be Dependabot secrets. Actions secrets are not visible to
+Dependabot-triggered runs. Until they exist the workflow still runs, detects the
+drift, and writes the manual fix into the job summary instead of pushing.
