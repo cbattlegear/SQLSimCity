@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { directActivityWidth } from './databaseCity'
 import type { DatabaseCityObject } from './databaseCityContracts'
-import { ARTERIAL_WIDTH, planCity, streetPitch, streetPolyline, streetPolylineThrough, streetRoute, type CityLot, type CityPlan, type CityPlanOptions, type StreetClass } from './cityPlan'
+import { ARTERIAL_WIDTH, streetPitch, streetPolyline, streetPolylineThrough, streetRoute, type CityLot, type CityPlan, type StreetClass } from './cityPlan'
 import { buildBuildingGeometry, buildingColor, mapBuildingColor, neighborhoodTint } from './cityBuildings'
 import { assignQueryRoutes } from './cityQueryTraffic'
 import { roadWidth, type RoadTraffic } from './cityTraffic'
@@ -171,7 +171,12 @@ export type CameraNudge =
   | 'rotateRight'
 
 export type DatabaseCitySceneController = {
-  setObjects(objects: readonly DatabaseCityObject[], planOptions?: CityPlanOptions): void
+  /**
+   * Takes the plan the surrounding view already computed rather than planning again. `planCity` is
+   * the expensive part of drawing a city, and the view needs the same plan for the address book,
+   * the route, and the traffic map, so planning it here too did the whole layout twice per update.
+   */
+  setObjects(objects: readonly DatabaseCityObject[], cityPlan: CityPlan): void
   /** Roads are graded outside the scene so the map and the HUD read the same numbers. */
   setRoads(roads: readonly RoadTraffic[]): void
   /** The aggregate street-load layer built from the workload's executions and apportioned waits. */
@@ -2409,8 +2414,8 @@ export function createDatabaseCityScene(
   })
 
   return {
-    setObjects(objects, planOptions) {
-      plan = planCity(objects, planOptions)
+    setObjects(objects, cityPlan) {
+      plan = cityPlan
       facilitySites = plan.facilities
       buildGround(plan)
       buildDistricts(plan)

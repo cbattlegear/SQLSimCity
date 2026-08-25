@@ -747,7 +747,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
       {page && (
         <DatabaseCityViewport
           objects={visibleObjects}
-          planOptions={planOptions}
+          cityPlan={cityPlan}
           viewMode={viewMode}
           roads={roads}
           traffic={workloadTraffic}

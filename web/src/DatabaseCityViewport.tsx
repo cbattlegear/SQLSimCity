@@ -11,7 +11,7 @@ import { LANE_COLORS, type FacilityTraffic } from './cityFacilityTraffic'
 import { FACILITY_LABELS, type Facility, type FacilityKind } from './cityInfrastructure'
 import type { CityRoute } from './cityRoute'
 import type { WorkloadTraffic } from './cityWorkloadTraffic'
-import type { CityPlanOptions } from './cityPlan'
+import type { CityPlan } from './cityPlan'
 import type { MapViewMode } from './mapStyle'
 import {
   incidentDemandsAttention,
@@ -26,10 +26,10 @@ import { MapTray, useNarrowViewport, type TrayItem } from './MapTray'
 type Props = {
   objects: readonly DatabaseCityObject[]
   /**
-   * Seed and totals that make placement deterministic and stable across pages. Passed straight to
-   * `planCity`, so the scene plans the same city the surrounding view does.
+   * The plan the view has already computed. Passed in rather than recomputed so the scene, the
+   * address book, the route, and the traffic map all read one layout produced once.
    */
-  planOptions: CityPlanOptions
+  cityPlan: CityPlan
   /** Flat basemap or oblique 3D city. Both draw the same plan and the same measurements. */
   viewMode: MapViewMode
   roads: readonly RoadTraffic[]
@@ -104,7 +104,7 @@ function swatch(color: number): string {
 
 export function DatabaseCityViewport({
   objects,
-  planOptions,
+  cityPlan,
   viewMode,
   roads,
   traffic,
@@ -160,7 +160,7 @@ export function DatabaseCityViewport({
     }
   }, [onSelect, onSelectRoad])
 
-  useEffect(() => sceneRef.current?.setObjects(objects, planOptions), [objects, planOptions])
+  useEffect(() => sceneRef.current?.setObjects(objects, cityPlan), [objects, cityPlan])
   useEffect(() => sceneRef.current?.setRoads(roads), [roads])
   useEffect(() => sceneRef.current?.setTraffic(traffic), [traffic])
   useEffect(() => sceneRef.current?.setFacilities(facilities), [facilities])
