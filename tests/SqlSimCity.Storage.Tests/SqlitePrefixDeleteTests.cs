@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using Microsoft.Data.Sqlite;
+using SqlSimCity.Storage.Crypto;
 using SqlSimCity.Storage.Sqlite;
 
 namespace SqlSimCity.Storage.Tests;
@@ -126,7 +127,7 @@ public sealed class SqlitePrefixDeleteTests : IDisposable
 
         foreach (var prefix in AdversarialPrefixes)
         {
-            await SeedAsync(store, AdversarialIds);
+            await SeedAsync(AdversarialIds);
             var expectedSurvivors = await SubstrNonMatchingIdsAsync(prefix);
 
             // The replacement set is empty, so every surviving row is one the delete spared.
@@ -284,12 +285,52 @@ public sealed class SqlitePrefixDeleteTests : IDisposable
     public void ANonUtf8DatabaseGetsNoBound() =>
         Assert.False(SqlitePrefixRange.TryGetExclusiveUpperBound("qs:", false, out _));
 
-    private static async Task SeedAsync(SqliteProtectedRecordStore store, IEnumerable<string> ids)
+    /// <summary>
+    /// Writes exactly the rows <see cref="SqliteProtectedRecordStore.PutAsync"/> would write, but
+    /// in one transaction instead of one connection and one durable commit each.
+    ///
+    /// The subject of this fixture is which rows the delete selects, not what a write costs, and
+    /// the seed runs once per adversarial prefix -- 36 ids across 22 prefixes, so 792 writes.
+    /// Paid a row at a time that was 15s and the most expensive test in the solution; batched it
+    /// is under a second. Same reasoning as <see cref="SeedUnrelatedRowsAsync"/> below.
+    ///
+    /// Envelopes come from the production codec rather than being faked, so these rows are the
+    /// real thing and stay readable through <see cref="SqliteProtectedRecordStore.GetAsync"/> if
+    /// a later test wants to read one back. The upsert keeps re-seeding idempotent across
+    /// prefixes, which is what <c>PutAsync</c> gave this loop before.
+    /// </summary>
+    private async Task SeedAsync(IEnumerable<string> ids)
     {
         var payload = Encoding.UTF8.GetBytes("payload");
         var capturedAt = new DateTimeOffset(2026, 8, 25, 12, 0, 0, TimeSpan.Zero);
-        foreach (var id in ids)
-            await store.PutAsync(id, "kind", capturedAt, StorageResolution.Detail, payload);
+        await using var connection = new SqliteConnection(RawConnectionString);
+        await connection.OpenAsync();
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO protected_records
+                (id, record_kind, captured_at_unix_ms, resolution, envelope, stored_at_unix_ms)
+            VALUES ($id, 'kind', $capturedAt, 'Detail', $envelope, $storedAt)
+            ON CONFLICT(id) DO UPDATE SET
+                record_kind = excluded.record_kind,
+                captured_at_unix_ms = excluded.captured_at_unix_ms,
+                resolution = excluded.resolution,
+                envelope = excluded.envelope,
+                stored_at_unix_ms = excluded.stored_at_unix_ms;
+            """;
+        command.Parameters.AddWithValue("$capturedAt", capturedAt.ToUnixTimeMilliseconds());
+        command.Parameters.AddWithValue("$storedAt", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        var id = command.Parameters.Add("$id", SqliteType.Text);
+        var envelope = command.Parameters.Add("$envelope", SqliteType.Blob);
+        foreach (var recordId in ids)
+        {
+            id.Value = recordId;
+            envelope.Value = EnvelopeCodec.Wrap("kind", recordId, payload);
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await transaction.CommitAsync();
     }
 
     /// <summary>

@@ -164,9 +164,9 @@ Do not weaken `--locked-mode` in CI to get around this. It is a supply-chain con
 
 ```powershell
 dotnet build SqlSimCity.slnx -c Release        # 0 warnings expected
-dotnet test SqlSimCity.slnx -c Release         # 1,226 tests
+dotnet test SqlSimCity.slnx -c Release         # 1,251 tests
 npm test                                       # 598 probe-catalog tests
-cd web; npm ci; npm run build; npm test -- --run   # 772 tests / 42 files
+cd web; npm ci; npm run build; npm test -- --run   # 772 tests / 45 files
 npm run typecheck
 ```
 
@@ -175,6 +175,26 @@ Those counts are the baselines to compare against. Investigate any delta rather 
 The root `npm test` is easy to miss because the web suite is the one usually meant by "the
 frontend tests". It validates `sql/manifest.json` against the probe files, and it is what pins
 the shape of the Query Store paging probes — a probe edit can leave both other suites green.
+
+### The slow tests are isolated on purpose
+
+Suite wall time is set by a few individual tests, not by the total, so the layout that spreads
+them out is load-bearing and easy to undo by tidying.
+
+The `cityGrowth` family is four spec files over one `cityGrowth.testkit.ts`, and
+`cityGrowthRetrace.test.ts` holds exactly one test because that test alone is the web suite's
+critical path — it was 17.7s of a 44s run. Vitest schedules a *file* onto a worker, so merging
+these back into one spec re-serialises them and roughly doubles the suite. Add growth tests to
+one of the other three; leave the retrace file alone.
+
+The cost there is `planCity`, not the test scaffolding: measured over counts 80..140, planning is
+16,150ms against 116ms of signature building. Nothing done in a test file will move it.
+
+For the .NET side the rule is the same one `SeedUnrelatedRowsAsync` already illustrates. Seeding
+through `SqliteProtectedRecordStore.PutAsync` costs 19–43ms per row, because the store sets
+`Pooling = false` on purpose and every call therefore opens a connection and commits — an fsync
+apiece. Batching a seed into one connection and one transaction gets the same rows in at ~8µs
+each. Seed in bulk and reserve `PutAsync` for what is actually under test.
 
 ## Every pull request needs a `release:*` label
 

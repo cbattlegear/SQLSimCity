@@ -13,8 +13,26 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The four jobs below are deliberately independent and run in parallel.
+#
+# They were one serial `verify` job, which meant the .NET suite, the web suite
+# and the container build queued behind each other for no reason: none of them
+# consumes another's output. Splitting them puts the run's wall time at the
+# slowest single job rather than at the sum.
+#
+# `container` in particular no longer carries `needs: verify`. That gate only
+# ever saved a runner on a red pull request; it cost every green one the full
+# .NET and web suites before the image build could start. Auto-release keys on
+# the CI *workflow* conclusion, not on any one job, so a red suite still blocks
+# a release exactly as before -- the workflow only concludes green when all
+# four jobs do.
+#
+# Keep a step in the job that owns its inputs. `Publish release` needs the .NET
+# restore, so it lives with the .NET suite; the web build needs `npm ci` under
+# web/, so it lives with the web suite. Anything needing both would have to
+# reintroduce a dependency edge, so prefer not to write one.
 jobs:
-  verify:
+  dotnet:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -27,19 +45,6 @@ jobs:
           dotnet-version: 10.0.x
           cache: true
           cache-dependency-path: "**/packages.lock.json"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: Validate SQL manifest
-        run: npm test
-
-      - name: Validate fixtures
-        run: node --test fixtures/v1/test/validate-fixtures.test.mjs
 
       - name: Restore .NET dependencies
         # --locked-mode is a genuine supply-chain control: restore must fail
@@ -95,6 +100,35 @@ jobs:
       - name: Test .NET
         run: dotnet test SqlSimCity.slnx --configuration Release --no-restore
 
+      - name: Publish release
+        run: >-
+          dotnet publish src/SqlSimCity.Api/SqlSimCity.Api.csproj
+          --configuration Release
+          --no-restore
+          --output artifacts/publish
+          -p:ContinuousIntegrationBuild=true
+          -p:Deterministic=true
+          -p:UseAppHost=false
+
+      - name: Verify published legal notices
+        run: |
+          cmp LICENSE artifacts/publish/legal/LICENSE
+          cmp NOTICE artifacts/publish/legal/NOTICE
+
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Install web dependencies
         working-directory: web
         run: npm ci
@@ -111,20 +145,26 @@ jobs:
         working-directory: web
         run: npm run build
 
-      - name: Publish release
-        run: >-
-          dotnet publish src/SqlSimCity.Api/SqlSimCity.Api.csproj
-          --configuration Release
-          --no-restore
-          --output artifacts/publish
-          -p:ContinuousIntegrationBuild=true
-          -p:Deterministic=true
-          -p:UseAppHost=false
+  scripts:
+    # The catalog and shell guards need neither the .NET SDK nor web/'s
+    # node_modules -- the root package has no dependencies at all -- so they
+    # finish long before either suite and no longer delay them.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Verify published legal notices
-        run: |
-          cmp LICENSE artifacts/publish/legal/LICENSE
-          cmp NOTICE artifacts/publish/legal/NOTICE
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Validate SQL manifest
+        run: npm test
+
+      - name: Validate fixtures
+        run: node --test fixtures/v1/test/validate-fixtures.test.mjs
 
       - name: Test operational scripts
         run: tools/tests/operations.test.sh
@@ -133,7 +173,6 @@ jobs:
         run: tools/tests/verify-dependency-only-diff.test.sh
 
   container:
-    needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
