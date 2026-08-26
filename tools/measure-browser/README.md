@@ -9,8 +9,9 @@ measured in a running browser*. The suite in `web/` reads `App.css` as source te
 renders nothing, so it can confirm a declaration exists and cannot see the layout — or the
 frame time — that results. Two real defects here were invisible to a green suite.
 
-Nothing here runs in CI. It is a workbench, and it is the sibling of `tools/measure/`,
-which measures what the same product costs the SQL Server it watches.
+Nothing here runs in CI. It is a workbench, and it is one of three: `tools/measure/`
+measures what the same product costs the SQL Server it watches, and `tools/measure-api/`
+measures what a request costs the API process in between.
 
 ## What it measures, and why each number is trustworthy
 

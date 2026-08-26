@@ -10,7 +10,9 @@ facts about a query plan, not about the SQL text. A figure from here is evidence
 estimate from reading the probe is not — and the review that created issues #74–#83
 produced several confident numbers that turned out to be worst-case arithmetic.
 
-Nothing here runs in CI. It is a workbench.
+Nothing here runs in CI. It is a workbench. Its siblings are `tools/measure-api/`, which
+measures what a request costs the API process, and `tools/measure-browser/`, which measures
+what the app costs the browser. Both reuse the rig this one stands up.
 
 ## Standing it up
 
