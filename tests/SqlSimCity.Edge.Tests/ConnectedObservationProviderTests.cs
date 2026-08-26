@@ -197,7 +197,8 @@ public sealed class ConnectedObservationProviderTests
                 new(
                     51, "private-login", "private-host", "private-program", "running",
                     now, now, 1, "running", "SELECT", null, null, null, null, now,
-                    10, 2, 1, 0, 1, 0, 5, "appdb", "RAW SQL BATCH", "RAW SQL STATEMENT"),
+                    10, 2, 1, 0, 1, 0, 5, "appdb", "RAW SQL BATCH", "RAW SQL STATEMENT",
+                    1, 1, "RAW SQL BATCH".Length, "RAW SQL STATEMENT".Length),
             ]);
 
         public Task<IReadOnlyList<WaitingTaskFact>> GetWaitingTasksAsync(CancellationToken cancellationToken) =>

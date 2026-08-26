@@ -112,7 +112,7 @@ public static class LiveIncidentsServiceCollectionExtensions
                 break;
 
             case LiveIncidentsMode.Connected:
-                RegisterConnected(services, options.Connection, probeCatalog, sectionName, connectionString);
+                RegisterConnected(services, options.Connection, options.SampleBounds, probeCatalog, sectionName, connectionString);
                 break;
 
             default:
@@ -126,11 +126,19 @@ public static class LiveIncidentsServiceCollectionExtensions
     private static void RegisterConnected(
         IServiceCollection services,
         LiveIncidentsConnectionOptions connection,
+        LiveIncidentsSampleBoundsOptions sampleBounds,
         ProbeCatalog probeCatalog,
         string sectionName,
         string? connectionString)
     {
         var connectionSection = $"{sectionName}:{nameof(LiveIncidentsOptions.Connection)}";
+        var boundsSection = $"{sectionName}:{nameof(LiveIncidentsOptions.SampleBounds)}";
+        var maxRequestRows = ParseBound(
+            sampleBounds.MaxRequestRows, boundsSection, nameof(LiveIncidentsSampleBoundsOptions.MaxRequestRows));
+        var maxTextLength = ParseBound(
+            sampleBounds.MaxTextLength, boundsSection, nameof(LiveIncidentsSampleBoundsOptions.MaxTextLength));
+        var maxTempdbRows = ParseBound(
+            sampleBounds.MaxTempdbRows, boundsSection, nameof(LiveIncidentsSampleBoundsOptions.MaxTempdbRows));
 
         // Building the profile, platform, and secret provider now -- not lazily inside a
         // service factory -- guarantees every validation exception below surfaces the moment
@@ -170,7 +178,10 @@ public static class LiveIncidentsServiceCollectionExtensions
                 sp.GetRequiredKeyedService<ISqlConnectionFactory>(ConnectionFactoryServiceKey),
                 profile,
                 probeCatalog,
-                platform));
+                platform,
+                maxRequestRows: maxRequestRows,
+                maxTextLength: maxTextLength,
+                maxTempdbRows: maxTempdbRows));
         services.AddSingleton<ILiveIncidentCollector>(sp =>
             new LiveIncidentCollector(
                 sp.GetRequiredService<ILiveIncidentProbeExecutor>(),
@@ -179,8 +190,22 @@ public static class LiveIncidentsServiceCollectionExtensions
                 configuredPlatform: platform));
     }
 
-    private static ConnectionStringProfile ParseConnectionString(
-        string connectionString,
+    /// <summary>
+    /// Turns one configured sample bound into the probe parameter it becomes: a positive value caps,
+    /// and <c>0</c> means "no cap" so an operator can deliberately restore the unbounded behaviour.
+    /// A negative value is rejected rather than quietly treated as either, because "-1" is a
+    /// plausible guess at "unlimited" and silently capping at nothing -- or at everything -- would
+    /// misreport the instance in opposite directions.
+    /// </summary>
+    private static int? ParseBound(int value, string section, string key) => value switch
+    {
+        0 => null,
+        > 0 => value,
+        _ => throw new LiveIncidentsConfigurationException(
+            $"{section}:{key} must be a positive row/character count, or 0 for no bound."),
+    };
+
+    private static ConnectionStringProfile ParseConnectionString(        string connectionString,
         LiveIncidentsConnectionOptions connection,
         string connectionSection)
     {

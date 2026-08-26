@@ -267,6 +267,43 @@ Sampling is not a trace: a request or blocking chain that begins and ends betwee
 Every result carries source/freshness timestamps and explicit stale, disconnected, permission-denied,
 or unsupported states.
 
+#### Sample bounds
+
+A snapshot's size is set by the watched instance, not by SqlSimCity: session count is bounded only by
+the server's connection limit, and batch text by whatever a client submits. Both are collected and
+serialized in full on every cycle and then broadcast whole to every connected client, so
+`LiveIncidents:SampleBounds` bounds them.
+
+| key | default | effect |
+|---|---:|---|
+| `MaxRequestRows` | `1000` | Session/request rows per snapshot. Kept active-requests-first, then longest-running, then by session id. |
+| `MaxTextLength` | `16384` | Characters of batch text, and of executing-statement text, per row. |
+| `MaxTempdbRows` | `1000` | tempdb session rows and task rows per snapshot. Kept heaviest-allocator-first. |
+
+Set any of them to `0` to remove that bound and restore the unbounded behaviour. A negative value is
+rejected at startup rather than guessed at.
+
+**Nothing a bound omits is omitted silently.** A capped snapshot reports the pre-cap counts in
+`diagnostics.truncations`, and a shortened value reports its untruncated length in the row's
+`batchTextTruncation` / `currentStatementTextTruncation`. So "5,009 sessions, showing 1,000" stays
+distinguishable from "1,000 sessions", and 16,384 characters of a 1,048,576-character batch from a
+16,384-character batch. A row that was cut by the row cap is never reported as having *disappeared*
+either, because a capped sample is no evidence that the request ended.
+
+Raising `MaxTextLength` is a real trade rather than a free one — collection cost grows faster than
+linearly in it, because the text has to be materialized out of the engine before anything can shorten
+it. Measured against SQL Server 2022 with 250 concurrent requests each executing a 64 KiB
+single-statement batch:
+
+| `MaxTextLength` | snapshot | collect | allocated per cycle |
+|---|---:|---:|---:|
+| 4096 | 2.6 MiB | 68 ms | 15 MiB |
+| 16384 (default) | 8.4 MiB | 149 ms | 99 MiB |
+| 65536 | 31.9 MiB | 457 ms | 1158 MiB |
+| `0` (no bound) | 31.7 MiB | 487 ms | 2183 MiB |
+
+That is per cycle, every 2–5 seconds. Reproduce with `tools/measure/`.
+
 ## TLS and reverse proxies
 
 - `Mandatory` requires encrypted transport and supports an explicit per-profile

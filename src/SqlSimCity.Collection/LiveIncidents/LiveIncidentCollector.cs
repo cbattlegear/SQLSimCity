@@ -97,7 +97,8 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
         var isAzureSqlDatabase = platform == EnginePlatform.AzureSqlDatabase;
         var isPlatformKnown = platform != EnginePlatform.Unknown;
 
-        var (requests, requestsSucceeded) = await CollectRequestsAsync(unavailable, cancellationToken).ConfigureAwait(false);
+        var truncations = new List<SampleTruncationV1>();
+        var (requests, requestsSucceeded) = await CollectRequestsAsync(unavailable, truncations, cancellationToken).ConfigureAwait(false);
         anyOperationalSuccess = anyOperationalSuccess || requestsSucceeded;
 
         IReadOnlyList<BlockingInputFact> blockingFacts = [];
@@ -140,7 +141,7 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
             unavailable.Add(new UnavailableFieldV1("memoryGrants", status, reason));
         }
 
-        var tempdb = await CollectTempdbAsync(platform, cancellationToken).ConfigureAwait(false);
+        var tempdb = await CollectTempdbAsync(platform, truncations, cancellationToken).ConfigureAwait(false);
         anyOperationalSuccess = anyOperationalSuccess || tempdb.Status == DataStatus.Available;
         if (tempdb.Status != DataStatus.Available)
         {
@@ -196,7 +197,10 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
             DurationMs: (long)(completedAt - startedAt).TotalMilliseconds,
             MissedCycles: 0,
             SkippedCycles: 0,
-            UnavailableFields: unavailable);
+            UnavailableFields: unavailable)
+        {
+            Truncations = truncations,
+        };
 
         return new LiveIncidentSnapshotV1(
             "1.0",
@@ -228,6 +232,7 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
 
     private async Task<(IReadOnlyList<LiveRequestV1> Requests, bool Succeeded)> CollectRequestsAsync(
         List<UnavailableFieldV1> unavailable,
+        List<SampleTruncationV1> truncations,
         CancellationToken cancellationToken)
     {
         IReadOnlyList<ActiveRequestRow> rows;
@@ -266,19 +271,92 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
             current[mapped.RequestId] = mapped;
         }
 
-        var disappeared = _previousRequests
-            .Where(kvp => !current.ContainsKey(kvp.Key) && kvp.Value.Availability == SampleAvailability.Available)
-            .Select(kvp => kvp.Value with
-            {
-                Availability = SampleAvailability.Disappeared,
-                AvailabilityReason = "This request was present in the previous sampling cycle and is no longer visible: " +
-                    "it completed, was killed, or its session ended. A request that both started and finished between " +
-                    "two sampling cycles is never observed at all (requirement 6's short-lived-query disclosure).",
-            })
-            .ToList();
+        // The probe reports how many rows matched before its row cap applied, so a bounded sample
+        // discloses its own bound instead of looking like a smaller server. A cap that reports
+        // nothing would be a silent omission, which is the one thing a bound here is not allowed to
+        // be. Flooring at the row count keeps the disclosure from ever claiming more was omitted
+        // than actually was, for a source that under-reports the total.
+        var visibleRowCount = rows.Count > 0 ? Math.Max(rows[0].VisibleSessionCount, rows.Count) : 0;
+        var wasTruncated = visibleRowCount > rows.Count;
+        if (wasTruncated)
+        {
+            truncations.Add(new SampleTruncationV1(
+                "requests",
+                rows.Count,
+                visibleRowCount,
+                $"The active-requests sample is capped at {rows.Count.ToString(CultureInfo.InvariantCulture)} rows and " +
+                $"{visibleRowCount.ToString(CultureInfo.InvariantCulture)} sessions were visible, so the rest are absent " +
+                "from this snapshot. Rows are kept active-requests-first, then longest-running, then by session id. " +
+                "Disappearance detection is suspended for this cycle: a request missing from a capped sample may simply " +
+                "be below the cap, and reporting it as having ended would be a claim this cycle cannot support."));
+        }
+
+        // Requirement 6's disappearance disclosure depends on "absent from this cycle" meaning
+        // "no longer there". Once a row cap is in play that inference no longer holds -- a row can
+        // be absent purely because it ranked below the cap -- so a Disappeared row would be a
+        // fabrication. The cap's own disclosure above says so explicitly rather than leaving the
+        // consumer to infer it.
+        var disappeared = wasTruncated
+            ? []
+            : _previousRequests
+                .Where(kvp => !current.ContainsKey(kvp.Key) && kvp.Value.Availability == SampleAvailability.Available)
+                .Select(kvp => kvp.Value with
+                {
+                    Availability = SampleAvailability.Disappeared,
+                    AvailabilityReason = "This request was present in the previous sampling cycle and is no longer visible: " +
+                        "it completed, was killed, or its session ended. A request that both started and finished between " +
+                        "two sampling cycles is never observed at all (requirement 6's short-lived-query disclosure).",
+                })
+                .ToList();
 
         _previousRequests = current;
         return (current.Values.Concat(disappeared).ToList(), true);
+    }
+
+    /// <summary>
+    /// Records that a row cap bounded one collection, or records nothing when it did not. Flooring
+    /// the visible count at the returned count keeps the disclosure from ever claiming more was
+    /// omitted than actually was, for a source that under-reports its own total.
+    /// </summary>
+    private static void AddRowTruncation(
+        List<SampleTruncationV1> truncations, string field, int returnedRows, int visibleRows, string subject)
+    {
+        var total = Math.Max(visibleRows, returnedRows);
+        if (total <= returnedRows)
+        {
+            return;
+        }
+
+        truncations.Add(new SampleTruncationV1(
+            field,
+            returnedRows,
+            total,
+            $"This sample is capped at {returnedRows.ToString(CultureInfo.InvariantCulture)} rows and " +
+            $"{total.ToString(CultureInfo.InvariantCulture)} {subject} were visible, so the rest are absent from " +
+            "this snapshot. Rows are kept heaviest-allocator-first, so what is missing is the quiet tail rather " +
+            "than an arbitrary slice; the total is reported here so the omission is never invisible."));
+    }
+
+    /// <summary>
+    /// Builds the per-row disclosure for one text column that the probe's <c>@MaxTextLength</c> cap
+    /// may have shortened. Returns null when nothing was removed, so a null truncation is the
+    /// positive claim "this is the whole value" rather than an absence of information.
+    /// </summary>
+    private static LiveTextTruncationV1? DescribeTextTruncation(string? retained, int? totalCharacters, string field)
+    {
+        if (retained is null || totalCharacters is not { } total || total <= retained.Length)
+        {
+            return null;
+        }
+
+        return new LiveTextTruncationV1(
+            retained.Length,
+            total,
+            $"Only the first {retained.Length.ToString(CultureInfo.InvariantCulture)} of " +
+            $"{total.ToString(CultureInfo.InvariantCulture)} characters of this row's {field} were collected. " +
+            "Live sampling caps text length because the cost of materializing it grows faster than linearly " +
+            "and is paid on every cycle; the untruncated length is reported here so the value is never " +
+            "mistaken for the whole of a short statement.");
     }
 
     private static LiveRequestV1 MapActiveRequest(ActiveRequestRow row) => new(
@@ -329,6 +407,9 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
         // already names the object id, while a KEY:/HOBT: lock is reported RequiresLookup and names
         // the probe that would resolve it. No object is ever guessed.
         LockResource = LockResourceParser.Parse(row.WaitResource),
+        BatchTextTruncation = DescribeTextTruncation(row.BatchText, row.BatchTextLength, "batch text"),
+        CurrentStatementTextTruncation = DescribeTextTruncation(
+            row.CurrentStatementText, row.CurrentStatementTextLength, "current statement text"),
     };
 
     private static MemoryGrantV1 MapMemoryGrant(MemoryGrantRow row) => new(
@@ -350,7 +431,8 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
         row.WaitTimeMs?.ToString(CultureInfo.InvariantCulture),
         row.BatchText);
 
-    private async Task<TempdbUsageV1> CollectTempdbAsync(EnginePlatform platform, CancellationToken cancellationToken)
+    private async Task<TempdbUsageV1> CollectTempdbAsync(
+        EnginePlatform platform, List<SampleTruncationV1> truncations, CancellationToken cancellationToken)
     {
         // Requirement 4: never attempt a tempdb-scoped connection profile for Azure SQL Database
         // (impossible -- Azure SQL Database cannot open with tempdb as its initial catalog, and has
@@ -382,6 +464,24 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
         try
         {
             var raw = await _probes.GetTempdbUsageAsync(azureScoped: false, cancellationToken).ConfigureAwait(false);
+
+            // sys.dm_db_session_space_usage and sys.dm_db_task_space_usage carry a row per session
+            // and per task whether or not tempdb was touched, so they scale with connection count
+            // rather than tempdb activity. Both are capped to the heaviest allocators, and both
+            // report the pre-cap count so a bounded view is never read as a quieter instance.
+            AddRowTruncation(
+                truncations,
+                "tempdb.sessions",
+                raw.Sessions.Count,
+                raw.Sessions.Count > 0 ? raw.Sessions[0].VisibleSessionCount : 0,
+                "sessions with tempdb allocation counters");
+            AddRowTruncation(
+                truncations,
+                "tempdb.tasks",
+                raw.Tasks.Count,
+                raw.Tasks.Count > 0 ? raw.Tasks[0].VisibleTaskCount : 0,
+                "tasks with tempdb allocation counters");
+
             return new TempdbUsageV1(
                 raw.Files.Select(f => new TempdbFileUsageV1(
                     f.FileId, f.TotalMb, f.AllocatedMb, f.FreeMb, f.VersionStoreMb, f.UserObjectsMb, f.InternalObjectsMb, f.MixedExtentMb)).ToList(),

@@ -25,18 +25,20 @@ public sealed class IdleSessionAtlasActivityTests
     // An idle user session: connected, holding no request. Every column the LEFT JOIN to
     // sys.dm_exec_requests would supply is null, which is exactly what the probe returns for it.
     // database_name still resolves, via the probe's COALESCE onto the session's current database.
+    // The trailing 0s are the probe's cap-disclosure columns; these tests do not exercise a cap,
+    // and the collector floors the visible count at the number of rows it actually received.
     private static ActiveRequestRow IdleSession(int sessionId, string databaseName) => new(
         sessionId, "app_user", "app-host", "MyApp", "sleeping",
         DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch,
         null, null, null, null, null, null, null,
         null, null, null, null, null, null, null,
-        7, databaseName, null, null);
+        7, databaseName, null, null, 0, 1, null, null);
 
     private static ActiveRequestRow RunningRequest(int sessionId, string databaseName) => new(
         sessionId, "app_user", "app-host", "MyApp", "running",
         null, null, 1, "running", "SELECT", null, null, null, null,
         DateTimeOffset.UnixEpoch, 10, 5, 100, 50, 200, 0,
-        7, databaseName, "SELECT 1", "SELECT 1");
+        7, databaseName, "SELECT 1", "SELECT 1", 0, 1, "SELECT 1".Length, "SELECT 1".Length);
 
     private static async Task<LiveActivityV1> SampleThenProjectAsync(params ActiveRequestRow[] rows)
     {

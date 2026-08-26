@@ -241,4 +241,83 @@ public sealed class LiveIncidentsServiceCollectionExtensionsTests
 
     private static IConfiguration BuildConfiguration(Dictionary<string, string?> overrides) =>
         new ConfigurationBuilder().AddInMemoryCollection(overrides).Build();
+    // --- Issue #81 part 3: the sample bounds an operator can move. ---
+    //
+    // The bounds exist because a live snapshot's size is set by the watched workload rather than by
+    // anything SqlSimCity controls. They are deliberately adjustable: 0 restores the unbounded
+    // behaviour for an operator who would rather pay for it than lose statement text, so the
+    // defaults are a starting point and never a ceiling on what the tool can report.
+
+    [Fact]
+    public void SampleBoundsAreOptionalAndFallBackToTheMeasuredDefaults()
+    {
+        var configuration = BuildConfiguration(ValidConnectedConfiguration());
+        var services = new ServiceCollection();
+
+        services.AddLiveIncidents(configuration, LoadCatalog());
+        using var provider = services.BuildServiceProvider();
+
+        var executor = Assert.IsType<SqlLiveIncidentProbeExecutor>(
+            provider.GetRequiredService<ILiveIncidentProbeExecutor>());
+        Assert.Equal(1_000, executor.MaxRequestRows);
+        Assert.Equal(16_384, executor.MaxTextLength);
+        Assert.Equal(1_000, executor.MaxTempdbRows);
+    }
+
+    [Theory]
+    [InlineData("MaxRequestRows")]
+    [InlineData("MaxTextLength")]
+    [InlineData("MaxTempdbRows")]
+    public void ZeroRemovesABoundEntirelyRatherThanCappingAtNothing(string key)
+    {
+        var settings = ValidConnectedConfiguration();
+        settings[$"LiveIncidents:SampleBounds:{key}"] = "0";
+        var services = new ServiceCollection();
+
+        services.AddLiveIncidents(BuildConfiguration(settings), LoadCatalog());
+        using var provider = services.BuildServiceProvider();
+
+        var executor = Assert.IsType<SqlLiveIncidentProbeExecutor>(
+            provider.GetRequiredService<ILiveIncidentProbeExecutor>());
+        var resolved = key switch
+        {
+            "MaxRequestRows" => executor.MaxRequestRows,
+            "MaxTextLength" => executor.MaxTextLength,
+            _ => executor.MaxTempdbRows,
+        };
+        Assert.Null(resolved);
+    }
+
+    // "-1" is a plausible guess at "unlimited", and 0 already means that here. Accepting it would
+    // either cap at nothing or cap at everything, and the two misreport the instance in opposite
+    // directions, so it fails closed during registration instead.
+    [Theory]
+    [InlineData("MaxRequestRows")]
+    [InlineData("MaxTextLength")]
+    [InlineData("MaxTempdbRows")]
+    public void ANegativeBoundIsRejectedDuringRegistrationNotGuessedAtRuntime(string key)
+    {
+        var settings = ValidConnectedConfiguration();
+        settings[$"LiveIncidents:SampleBounds:{key}"] = "-1";
+        var services = new ServiceCollection();
+
+        var ex = Assert.Throws<LiveIncidentsConfigurationException>(
+            () => services.AddLiveIncidents(BuildConfiguration(settings), LoadCatalog()));
+        Assert.Contains($"LiveIncidents:SampleBounds:{key}", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AConfiguredBoundIsAcceptedSoAnOperatorCanRaiseTheTextCap()
+    {
+        var settings = ValidConnectedConfiguration();
+        settings["LiveIncidents:SampleBounds:MaxTextLength"] = "1048576";
+        var services = new ServiceCollection();
+
+        services.AddLiveIncidents(BuildConfiguration(settings), LoadCatalog());
+        using var provider = services.BuildServiceProvider();
+
+        var executor = Assert.IsType<SqlLiveIncidentProbeExecutor>(
+            provider.GetRequiredService<ILiveIncidentProbeExecutor>());
+        Assert.Equal(1_048_576, executor.MaxTextLength);
+    }
 }

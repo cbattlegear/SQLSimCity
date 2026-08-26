@@ -23,10 +23,22 @@
 -- Parameters:
 --   @IncludeSystemSessions (bit, optional, default 0) -- when 0, session_id <= 50 (system
 --     sessions) are excluded from the session/task result sets.
+--   @MaxSessionRows (int, optional, default NULL) -- when supplied, result set 2 returns at most
+--     this many sessions, the heaviest tempdb allocators first. NULL returns every row.
+--   @MaxTaskRows (int, optional, default NULL) -- when supplied, result set 3 returns at most this
+--     many tasks, the heaviest tempdb allocators first. NULL returns every row.
 -- Result contract: THREE result sets, in this order -- (1) one row per tempdb data file from
 --   sys.dm_db_file_space_usage, (2) one row per session from sys.dm_db_session_space_usage, and
 --   (3) one row per task from sys.dm_db_task_space_usage. Consume via NextResult(); page counts are
 --   8-KiB pages, converted here to MiB.
+-- Bounding, and why it is disclosed rather than silent: these two views return one row per session
+--   and one row per task whether or not that session ever touched tempdb, so they grow with the
+--   instance's connection count and not with its tempdb activity. Measured against SQL Server 2022
+--   (tools/measure), 5,028 sessions produced 1.76 MiB of session/task rows in a single live
+--   snapshot -- the largest component of it, and almost all of it zero counters. The cap keeps the
+--   heaviest allocators, which is exactly what "spot a runaway session before tempdb fills up"
+--   needs, and visible_session_count / visible_task_count report how many rows existed before it
+--   applied so a bounded result is never read as a quieter instance.
 -- Relative cost: low; in-memory allocation counters, no page scan.
 SET NOCOUNT ON;
 SET DEADLOCK_PRIORITY LOW;
@@ -47,26 +59,63 @@ SELECT
 FROM sys.dm_db_file_space_usage AS fs;
 
 -- Result set 2: per-session tempdb page allocation/deallocation.
+WITH sessions_visible AS (
+    SELECT
+        ss.session_id,
+        ss.database_id,
+        ss.user_objects_alloc_page_count,
+        ss.user_objects_dealloc_page_count,
+        ss.internal_objects_alloc_page_count,
+        ss.internal_objects_dealloc_page_count,
+        COUNT(*) OVER ()            AS visible_session_count,
+        ROW_NUMBER() OVER (
+            ORDER BY
+                ss.user_objects_alloc_page_count + ss.internal_objects_alloc_page_count DESC,
+                ss.session_id)      AS selection_rank
+    FROM sys.dm_db_session_space_usage AS ss
+    WHERE @IncludeSystemSessions = 1 OR ss.session_id > 50
+)
 SELECT
-    ss.session_id,
-    ss.database_id,
-    ss.user_objects_alloc_page_count,
-    ss.user_objects_dealloc_page_count,
-    ss.internal_objects_alloc_page_count,
-    ss.internal_objects_dealloc_page_count
-FROM sys.dm_db_session_space_usage AS ss
-WHERE @IncludeSystemSessions = 1 OR ss.session_id > 50;
+    v.session_id,
+    v.database_id,
+    v.user_objects_alloc_page_count,
+    v.user_objects_dealloc_page_count,
+    v.internal_objects_alloc_page_count,
+    v.internal_objects_dealloc_page_count,
+    v.visible_session_count
+FROM sessions_visible AS v
+WHERE @MaxSessionRows IS NULL OR v.selection_rank <= @MaxSessionRows;
 
 -- Result set 3: per-task tempdb page allocation/deallocation (exec_context_id preserved for
 -- parallel requests).
+WITH tasks_visible AS (
+    SELECT
+        ts.session_id,
+        ts.request_id,
+        ts.exec_context_id,
+        ts.database_id,
+        ts.user_objects_alloc_page_count,
+        ts.user_objects_dealloc_page_count,
+        ts.internal_objects_alloc_page_count,
+        ts.internal_objects_dealloc_page_count,
+        COUNT(*) OVER ()            AS visible_task_count,
+        ROW_NUMBER() OVER (
+            ORDER BY
+                ts.user_objects_alloc_page_count + ts.internal_objects_alloc_page_count DESC,
+                ts.session_id,
+                ts.exec_context_id) AS selection_rank
+    FROM sys.dm_db_task_space_usage AS ts
+    WHERE @IncludeSystemSessions = 1 OR ts.session_id > 50
+)
 SELECT
-    ts.session_id,
-    ts.request_id,
-    ts.exec_context_id,
-    ts.database_id,
-    ts.user_objects_alloc_page_count,
-    ts.user_objects_dealloc_page_count,
-    ts.internal_objects_alloc_page_count,
-    ts.internal_objects_dealloc_page_count
-FROM sys.dm_db_task_space_usage AS ts
-WHERE @IncludeSystemSessions = 1 OR ts.session_id > 50;
+    v.session_id,
+    v.request_id,
+    v.exec_context_id,
+    v.database_id,
+    v.user_objects_alloc_page_count,
+    v.user_objects_dealloc_page_count,
+    v.internal_objects_alloc_page_count,
+    v.internal_objects_dealloc_page_count,
+    v.visible_task_count
+FROM tasks_visible AS v
+WHERE @MaxTaskRows IS NULL OR v.selection_rank <= @MaxTaskRows;

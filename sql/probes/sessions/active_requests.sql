@@ -18,6 +18,14 @@
 --     visible user sessions/requests.
 --   @IncludeSqlText (bit, optional, default 1) -- when 0, no SQL text function is invoked and both
 --     text columns are NULL. Edge collection uses 0 so raw SQL is never fetched or transmitted.
+--   @MaxRows (int, optional, default NULL) -- when supplied, at most this many rows are returned,
+--     chosen by selection_rank (see below). NULL returns every visible row. visible_session_count
+--     always reports how many rows matched before the cap, so a capped result is never mistaken
+--     for a smaller server.
+--   @MaxTextLength (int, optional, default NULL) -- when supplied, batch_text and
+--     current_statement_text are shortened to this many characters. NULL returns them in full.
+--     batch_text_length and current_statement_text_length always report the untruncated lengths,
+--     so a shortened value is never mistaken for a short statement.
 -- Result contract: zero or more rows, one per (session_id, request_id). current_statement_text is
 --   the substring of the batch actually executing right now, resolved via statement offsets;
 --   batch_text is the full submitted batch. Both are NULL for idle sessions with no sql_handle.
@@ -33,6 +41,24 @@
 --   database_id/database_name use the active request database when present and the session's
 --   current database for an idle row, allowing a per-database atlas to count idle sessions without
 --   assigning them to database zero or treating them as unknown.
+-- Bounding, and why it is disclosed rather than silent: an instance's session count and its batch
+--   text are both unbounded by anything this probe controls, so an uncapped result set is
+--   unbounded too. Measured against SQL Server 2022 (tools/measure), 5,009 idle sessions produced
+--   a 5.88 MiB live snapshot carrying no batch text at all, and 50 sessions each executing a 1 MiB
+--   single-statement batch produced a 100.2 MiB snapshot that took 4.35 s to collect -- longer
+--   than the sampler's own 2-5 s cadence -- and allocated 103 GiB in the collecting process, all
+--   of it before any transport was involved. Text cost is quadratic in text length (4x the text
+--   allocated ~16x), which is why @MaxTextLength is applied here, in SQL: the same workload with
+--   @IncludeSqlText = 0 collected in 39 ms and allocated 0.9 MiB, so the cost is paid materializing
+--   the text out of the engine and a cap applied after the read would save none of it.
+--   Both caps therefore report what they omitted rather than quietly shrinking the result:
+--   visible_session_count is the pre-cap row count, and batch_text_length /
+--   current_statement_text_length are the pre-truncation character counts. A consumer can always
+--   tell "5,009 sessions, showing 1,000" from "1,000 sessions", and "4,096 characters of a
+--   1,048,576-character batch" from "a 4,096-character batch".
+-- selection_rank orders active requests ahead of idle sessions, then longest-running first, then
+--   by session_id so the order is total and a cap is deterministic rather than arbitrary. It is
+--   emitted so a consumer can see which rows a cap would keep.
 -- Excludes the caller's own session (@@SPID): the collector's polling connection would otherwise
 --   appear as a permanently "idle" or churning session in its own sample every cycle.
 -- Relative cost: low; in-memory session/request state, no page or plan-cache scan.
@@ -40,47 +66,124 @@ SET NOCOUNT ON;
 SET DEADLOCK_PRIORITY LOW;
 SET LOCK_TIMEOUT 5000;
 
+WITH visible AS (
+    SELECT
+        s.session_id,
+        s.login_name,
+        s.host_name,
+        s.program_name,
+        s.status                    AS session_status,
+        s.last_request_start_time,
+        s.last_request_end_time,
+        r.request_id,
+        r.status                    AS request_status,
+        r.command,
+        r.wait_type,
+        r.wait_time                 AS wait_time_ms,
+        r.wait_resource,
+        r.blocking_session_id,      -- preserves sentinel values; see sql/README.md
+        r.start_time                AS request_start_time,
+        r.total_elapsed_time        AS total_elapsed_time_ms,
+        r.cpu_time                  AS cpu_time_ms,
+        r.reads,
+        r.writes,
+        r.logical_reads,            -- 8-KiB pages
+        r.open_transaction_count,
+        COALESCE(r.database_id, s.database_id) AS database_id,
+        DB_NAME(COALESCE(r.database_id, s.database_id)) AS database_name,
+        r.sql_handle,
+        r.statement_start_offset,
+        r.statement_end_offset,
+        COUNT(*) OVER ()            AS visible_session_count,
+        ROW_NUMBER() OVER (
+            ORDER BY
+                CASE WHEN r.session_id IS NULL THEN 1 ELSE 0 END,
+                COALESCE(r.total_elapsed_time, 0) DESC,
+                s.session_id)       AS selection_rank
+    FROM sys.dm_exec_sessions AS s
+    LEFT JOIN sys.dm_exec_requests AS r
+        ON r.session_id = s.session_id
+    WHERE s.is_user_process = 1
+      AND s.session_id <> @@SPID
+      AND (@IncludeIdleSessions = 1 OR r.session_id IS NOT NULL)
+      AND (r.request_id IS NULL OR r.total_elapsed_time >= @MinElapsedMs)
+      AND (@DatabaseId IS NULL OR COALESCE(r.database_id, s.database_id) = @DatabaseId)
+)
 SELECT
-    s.session_id,
-    s.login_name,
-    s.host_name,
-    s.program_name,
-    s.status                    AS session_status,
-    s.last_request_start_time,
-    s.last_request_end_time,
-    r.request_id,
-    r.status                    AS request_status,
-    r.command,
-    r.wait_type,
-    r.wait_time                 AS wait_time_ms,
-    r.wait_resource,
-    r.blocking_session_id,      -- preserves sentinel values; see sql/README.md
-    r.start_time                AS request_start_time,
-    r.total_elapsed_time        AS total_elapsed_time_ms,
-    r.cpu_time                  AS cpu_time_ms,
-    r.reads,
-    r.writes,
-    r.logical_reads,            -- 8-KiB pages
-    r.open_transaction_count,
-    COALESCE(r.database_id, s.database_id) AS database_id,
-    DB_NAME(COALESCE(r.database_id, s.database_id)) AS database_name,
-    st.text                     AS batch_text,
+    v.session_id,
+    v.login_name,
+    v.host_name,
+    v.program_name,
+    v.session_status,
+    v.last_request_start_time,
+    v.last_request_end_time,
+    v.request_id,
+    v.request_status,
+    v.command,
+    v.wait_type,
+    v.wait_time_ms,
+    v.wait_resource,
+    v.blocking_session_id,
+    v.request_start_time,
+    v.total_elapsed_time_ms,
+    v.cpu_time_ms,
+    v.reads,
+    v.writes,
+    v.logical_reads,
+    v.open_transaction_count,
+    v.database_id,
+    v.database_name,
+    v.visible_session_count,
+    v.selection_rank,
+    CAST(DATALENGTH(st.text) / 2 AS int) AS batch_text_length,
+    CASE
+        WHEN @MaxTextLength IS NULL THEN st.text
+        ELSE LEFT(st.text, @MaxTextLength)
+    END                         AS batch_text,
+    -- The true character count of the executing statement, with no "+ 1". The classic
+    -- statement-offset idiom below adds one to SUBSTRING's *length argument*, which is harmless
+    -- there because SUBSTRING clamps at the end of the string -- but reporting that figure as the
+    -- statement's length would overstate it by one character on every row, and the application
+    -- compares this against the characters it actually received to decide whether the cap bit.
+    -- Measured: a 562-character statement reported 563, so every single-statement batch claimed to
+    -- have been truncated when nothing had been removed. A cap that fabricates omissions is no
+    -- better than one that hides them.
+    CAST(
+        (CASE v.statement_end_offset
+             WHEN -1 THEN DATALENGTH(st.text)
+             ELSE v.statement_end_offset
+         END - v.statement_start_offset) / 2 AS int) AS current_statement_text_length,
     SUBSTRING(
         st.text,
-        (r.statement_start_offset / 2) + 1,
-        (
-            (CASE r.statement_end_offset
-                 WHEN -1 THEN DATALENGTH(st.text)
-                 ELSE r.statement_end_offset
-             END - r.statement_start_offset) / 2
-        ) + 1
+        (v.statement_start_offset / 2) + 1,
+        CASE
+            WHEN @MaxTextLength IS NULL THEN
+                (
+                    (CASE v.statement_end_offset
+                         WHEN -1 THEN DATALENGTH(st.text)
+                         ELSE v.statement_end_offset
+                     END - v.statement_start_offset) / 2
+                ) + 1
+            ELSE
+                CASE
+                    WHEN (
+                        (
+                            (CASE v.statement_end_offset
+                                 WHEN -1 THEN DATALENGTH(st.text)
+                                 ELSE v.statement_end_offset
+                             END - v.statement_start_offset) / 2
+                        ) + 1
+                    ) > @MaxTextLength THEN @MaxTextLength
+                    ELSE
+                        (
+                            (CASE v.statement_end_offset
+                                 WHEN -1 THEN DATALENGTH(st.text)
+                                 ELSE v.statement_end_offset
+                             END - v.statement_start_offset) / 2
+                        ) + 1
+                END
+        END
     )                            AS current_statement_text
-FROM sys.dm_exec_sessions AS s
-LEFT JOIN sys.dm_exec_requests AS r
-    ON r.session_id = s.session_id
-OUTER APPLY sys.dm_exec_sql_text(CASE WHEN @IncludeSqlText = 1 THEN r.sql_handle END) AS st
-WHERE s.is_user_process = 1
-  AND s.session_id <> @@SPID
-  AND (@IncludeIdleSessions = 1 OR r.session_id IS NOT NULL)
-  AND (r.request_id IS NULL OR r.total_elapsed_time >= @MinElapsedMs)
-  AND (@DatabaseId IS NULL OR COALESCE(r.database_id, s.database_id) = @DatabaseId);
+FROM visible AS v
+OUTER APPLY sys.dm_exec_sql_text(CASE WHEN @IncludeSqlText = 1 THEN v.sql_handle END) AS st
+WHERE @MaxRows IS NULL OR v.selection_rank <= @MaxRows;

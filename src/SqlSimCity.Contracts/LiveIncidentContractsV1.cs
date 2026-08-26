@@ -152,6 +152,36 @@ public sealed record BlockingReferenceV1(long? BlockingSessionId, BlockingSentin
 }
 
 /// <summary>
+/// What a text length cap omitted from one sampled row. Present only when a cap actually shortened
+/// something, and never a substitute for the text itself: <see cref="TotalCharacters"/> is the
+/// untruncated length the engine reported, so a reader can always tell "4,096 characters of a
+/// 1,048,576-character batch" from "a 4,096-character batch".
+/// <para>
+/// The cap exists because batch text is unbounded by anything SqlSimCity controls and is the
+/// dominant cost of a live snapshot -- see <c>sql/probes/sessions/active_requests.sql</c> for the
+/// measurements. Truncating without saying so would trade a bandwidth problem for an
+/// evidence-honesty one, which is why this record travels with the row rather than the cap being
+/// applied silently.
+/// </para>
+/// </summary>
+public sealed record LiveTextTruncationV1(
+    int RetainedCharacters,
+    int TotalCharacters,
+    string Reason);
+
+/// <summary>
+/// What a row cap omitted from one sampled collection. Present only when the cap actually cut rows.
+/// <see cref="TotalRows"/> is the count that matched before the cap, so a bounded sample is never
+/// mistaken for a smaller server -- "5,009 sessions, showing 1,000" stays distinguishable from
+/// "1,000 sessions".
+/// </summary>
+public sealed record SampleTruncationV1(
+    string Field,
+    int ReturnedRows,
+    int TotalRows,
+    string Reason);
+
+/// <summary>
 /// One sampled live session/request from <c>sessions.active_requests</c>. Every bigint counter
 /// (reads/writes/logical reads) is a lossless base-10 string, never a narrowed numeric type.
 /// <see cref="Availability"/>/<see cref="AvailabilityReason"/> record when a previously-seen
@@ -207,6 +237,20 @@ public sealed record LiveRequestV1(
     /// not run, so consumers must not read null as "this request holds no lock".
     /// </summary>
     public LockResourceV1? LockResource { get; init; }
+
+    /// <summary>
+    /// What a text length cap removed from <see cref="BatchText"/>, or null when it was returned
+    /// whole. Null therefore means "this is the entire batch", which is exactly the claim a silent
+    /// truncation would have made falsely.
+    /// </summary>
+    public LiveTextTruncationV1? BatchTextTruncation { get; init; }
+
+    /// <summary>
+    /// What a text length cap removed from <see cref="CurrentStatementText"/>, or null when it was
+    /// returned whole. Tracked separately from <see cref="BatchTextTruncation"/> because a short
+    /// statement inside a very long batch is truncated in the batch and not in the statement.
+    /// </summary>
+    public LiveTextTruncationV1? CurrentStatementTextTruncation { get; init; }
 }
 
 /// <summary>
@@ -420,7 +464,17 @@ public sealed record CollectionDiagnosticsV1(
     long DurationMs,
     long MissedCycles,
     long SkippedCycles,
-    IReadOnlyList<UnavailableFieldV1> UnavailableFields);
+    IReadOnlyList<UnavailableFieldV1> UnavailableFields)
+{
+    /// <summary>
+    /// Every collection a row cap bounded this cycle, and how much it left out. Empty means nothing
+    /// was capped -- the counterpart of <see cref="UnavailableFields"/> for evidence that was
+    /// reached but deliberately not all returned, rather than evidence that could not be sampled at
+    /// all. A consumer that ignores this list will under-report the server; it must never be read
+    /// as decoration.
+    /// </summary>
+    public IReadOnlyList<SampleTruncationV1> Truncations { get; init; } = [];
+}
 
 public sealed record LiveIncidentTargetV1(
     string TargetId,

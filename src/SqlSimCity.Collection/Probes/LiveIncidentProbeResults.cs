@@ -1,6 +1,17 @@
 namespace SqlSimCity.Collection.Probes;
 
-/// <summary>Row shape for <c>sessions.active_requests</c>: one visible session, joined to its active request when one exists.</summary>
+/// <summary>
+/// Row shape for <c>sessions.active_requests</c>: one visible session, joined to its active request
+/// when one exists.
+/// <para>
+/// <see cref="VisibleSessionCount"/>, <see cref="BatchTextLength"/> and
+/// <see cref="CurrentStatementTextLength"/> are the probe's own disclosure of what its two caps
+/// omitted, and are what keep a bounded sample honest: the first is the row count <em>before</em>
+/// <c>@MaxRows</c> applied, and the latter two are character counts <em>before</em>
+/// <c>@MaxTextLength</c> applied. Without them a capped result would be indistinguishable from a
+/// smaller server or a shorter statement.
+/// </para>
+/// </summary>
 public sealed record ActiveRequestRow(
     int SessionId,
     string? LoginName,
@@ -26,7 +37,11 @@ public sealed record ActiveRequestRow(
     int? DatabaseId,
     string? DatabaseName,
     string? BatchText,
-    string? CurrentStatementText);
+    string? CurrentStatementText,
+    int VisibleSessionCount,
+    int SelectionRank,
+    int? BatchTextLength,
+    int? CurrentStatementTextLength);
 
 /// <summary>Row shape for <c>sessions.memory_grants</c>.</summary>
 public sealed record MemoryGrantRow(
@@ -61,15 +76,23 @@ public sealed record TempdbFileRow(
     decimal InternalObjectsMb,
     decimal MixedExtentMb);
 
-/// <summary>One row of tempdb per-session space usage (result set 2 of <c>tempdb.usage</c>).</summary>
+/// <summary>
+/// One row of tempdb per-session space usage (result set 2 of <c>tempdb.usage</c>).
+/// <see cref="VisibleSessionCount"/> is the row count before <c>@MaxSessionRows</c> applied, so a
+/// bounded result discloses its own bound instead of reading as a quieter instance.
+/// </summary>
 public sealed record TempdbSessionRow(
     int SessionId,
     long UserObjectsAllocPageCount,
     long UserObjectsDeallocPageCount,
     long InternalObjectsAllocPageCount,
-    long InternalObjectsDeallocPageCount);
+    long InternalObjectsDeallocPageCount,
+    int VisibleSessionCount);
 
-/// <summary>One row of tempdb per-task space usage (result set 3 of <c>tempdb.usage</c>).</summary>
+/// <summary>
+/// One row of tempdb per-task space usage (result set 3 of <c>tempdb.usage</c>).
+/// <see cref="VisibleTaskCount"/> is the row count before <c>@MaxTaskRows</c> applied.
+/// </summary>
 public sealed record TempdbTaskRow(
     int SessionId,
     int? RequestId,
@@ -77,7 +100,8 @@ public sealed record TempdbTaskRow(
     long UserObjectsAllocPageCount,
     long UserObjectsDeallocPageCount,
     long InternalObjectsAllocPageCount,
-    long InternalObjectsDeallocPageCount);
+    long InternalObjectsDeallocPageCount,
+    int VisibleTaskCount);
 
 /// <summary>The combined, three-result-set output of <c>tempdb.usage</c>.</summary>
 public sealed record TempdbUsageRaw(

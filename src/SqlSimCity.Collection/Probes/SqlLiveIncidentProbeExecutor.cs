@@ -19,28 +19,100 @@ namespace SqlSimCity.Collection.Probes;
 /// </summary>
 public sealed class SqlLiveIncidentProbeExecutor : ILiveIncidentProbeExecutor
 {
+    /// <summary>
+    /// The default row cap handed to <c>sessions.active_requests</c>. A server's session count is
+    /// bounded by nothing this process controls, and an uncapped sample grows linearly with it:
+    /// 5,009 idle sessions carrying no batch text at all measured 5.88 MiB per snapshot
+    /// (tools/measure, SQL Server 2022), rebroadcast whole every 2-5 seconds. The cap is generous
+    /// against what a reader can actually use and, critically, is disclosed -- the probe reports the
+    /// pre-cap count, so a bounded sample is never mistaken for a smaller server.
+    /// </summary>
+    public const int DefaultMaxRequestRows = 1_000;
+
+    /// <summary>
+    /// The default text cap handed to <c>sessions.active_requests</c>. Batch text is the sharper of
+    /// the two unbounded axes by three orders of magnitude: 50 sessions each executing a 1 MiB
+    /// single-statement batch measured a 100.2 MiB snapshot, 4.35 s of collection -- longer than the
+    /// sampler's own 2-5 s cadence -- and 103 GiB allocated in this process, with cost growing
+    /// faster than linearly in text length. The same workload with text resolution off collected in
+    /// 39 ms and allocated 0.9 MiB, which is why the cap is a probe parameter rather than a
+    /// post-read truncation: the cost is paid materializing the text out of the engine.
+    /// 16,384 characters holds any statement a reader is realistically going to read, the
+    /// untruncated length always travels with it, and an operator who needs more can raise or
+    /// remove the cap through <c>LiveIncidents:SampleBounds:MaxTextLength</c>. It is not set higher
+    /// by default because the cost is not linear: at 250 concurrent 64 KiB batches, 16,384 measured
+    /// an 8.4 MiB snapshot and 99 MiB of allocation per cycle against 31.9 MiB and 1,158 MiB at
+    /// 65,536.
+    /// </summary>
+    public const int DefaultMaxTextLength = 16_384;
+
+    /// <summary>
+    /// The default row cap handed to <c>tempdb.usage</c>'s session and task result sets. Those two
+    /// DMVs return a row per session and per task whether or not tempdb was ever touched, so they
+    /// scale with connection count rather than tempdb activity: 5,028 sessions measured 1.76 MiB of
+    /// mostly-zero rows in one snapshot, which was larger than the capped request sample beside it.
+    /// The cap keeps the heaviest allocators, which is what this evidence is for.
+    /// </summary>
+    public const int DefaultMaxTempdbRows = 1_000;
+
     private readonly ISqlConnectionFactory _connectionFactory;
     private readonly ConnectionProfile _profile;
     private readonly Catalog.ProbeCatalog _catalog;
     private readonly EnginePlatform? _configuredPlatform;
     private readonly bool _includeSqlText;
+    private readonly int? _maxRequestRows;
+    private readonly int? _maxTextLength;
+    private readonly int? _maxTempdbRows;
 
     public SqlLiveIncidentProbeExecutor(
         ISqlConnectionFactory connectionFactory,
         ConnectionProfile profile,
         Catalog.ProbeCatalog catalog,
         EnginePlatform? configuredPlatform = null,
-        bool includeSqlText = true)
+        bool includeSqlText = true,
+        int? maxRequestRows = DefaultMaxRequestRows,
+        int? maxTextLength = DefaultMaxTextLength,
+        int? maxTempdbRows = DefaultMaxTempdbRows)
     {
         ArgumentNullException.ThrowIfNull(connectionFactory);
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(catalog);
+        if (maxRequestRows is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxRequestRows), maxRequestRows,
+                "The request row cap must be positive, or null for no cap.");
+        }
+
+        if (maxTextLength is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxTextLength), maxTextLength,
+                "The text length cap must be positive, or null for no cap.");
+        }
+
+        if (maxTempdbRows is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxTempdbRows), maxTempdbRows,
+                "The tempdb row cap must be positive, or null for no cap.");
+        }
+
         _connectionFactory = connectionFactory;
         _profile = profile;
         _catalog = catalog;
         _configuredPlatform = configuredPlatform;
         _includeSqlText = includeSqlText;
+        _maxRequestRows = maxRequestRows;
+        _maxTextLength = maxTextLength;
+        _maxTempdbRows = maxTempdbRows;
     }
+
+    /// <summary>The row cap this executor sends to <c>sessions.active_requests</c>, or null for no cap.</summary>
+    public int? MaxRequestRows => _maxRequestRows;
+
+    /// <summary>The text length cap this executor sends to <c>sessions.active_requests</c>, or null for no cap.</summary>
+    public int? MaxTextLength => _maxTextLength;
+
+    /// <summary>The row cap this executor sends to <c>tempdb.usage</c>'s session and task result sets, or null for no cap.</summary>
+    public int? MaxTempdbRows => _maxTempdbRows;
 
     public Task<ServerIdentityResult> GetServerIdentityAsync(CancellationToken cancellationToken) =>
         ExecuteAsync(
@@ -101,7 +173,11 @@ public sealed class SqlLiveIncidentProbeExecutor : ILiveIncidentProbeExecutor
                         AsNullableInt32(reader, "database_id"),
                         AsString(reader, "database_name"),
                         AsString(reader, "batch_text"),
-                        AsString(reader, "current_statement_text")));
+                        AsString(reader, "current_statement_text"),
+                        Convert.ToInt32(reader["visible_session_count"], CultureInfo.InvariantCulture),
+                        Convert.ToInt32(reader["selection_rank"], CultureInfo.InvariantCulture),
+                        AsNullableInt32(reader, "batch_text_length"),
+                        AsNullableInt32(reader, "current_statement_text_length")));
                 }
 
                 return (IReadOnlyList<ActiveRequestRow>)rows;
@@ -113,6 +189,8 @@ public sealed class SqlLiveIncidentProbeExecutor : ILiveIncidentProbeExecutor
                 ["@MinElapsedMs"] = 0,
                 ["@DatabaseId"] = null,
                 ["@IncludeSqlText"] = _includeSqlText,
+                ["@MaxRows"] = _maxRequestRows,
+                ["@MaxTextLength"] = _maxTextLength,
             });
 
     public Task<IReadOnlyList<Blocking.WaitingTaskFact>> GetWaitingTasksAsync(CancellationToken cancellationToken) =>
@@ -240,7 +318,12 @@ public sealed class SqlLiveIncidentProbeExecutor : ILiveIncidentProbeExecutor
                 return new TempdbUsageRaw(files, sessions, tasks);
             },
             cancellationToken,
-            new Dictionary<string, object?> { ["@IncludeSystemSessions"] = false });
+            new Dictionary<string, object?>
+            {
+                ["@IncludeSystemSessions"] = false,
+                ["@MaxSessionRows"] = _maxTempdbRows,
+                ["@MaxTaskRows"] = _maxTempdbRows,
+            });
 
     private static async Task<List<TempdbSessionRow>> ReadTempdbSessionsAsync(SqlDataReader reader, CancellationToken ct)
     {
@@ -275,7 +358,8 @@ public sealed class SqlLiveIncidentProbeExecutor : ILiveIncidentProbeExecutor
         Convert.ToInt64(reader["user_objects_alloc_page_count"], CultureInfo.InvariantCulture),
         Convert.ToInt64(reader["user_objects_dealloc_page_count"], CultureInfo.InvariantCulture),
         Convert.ToInt64(reader["internal_objects_alloc_page_count"], CultureInfo.InvariantCulture),
-        Convert.ToInt64(reader["internal_objects_dealloc_page_count"], CultureInfo.InvariantCulture));
+        Convert.ToInt64(reader["internal_objects_dealloc_page_count"], CultureInfo.InvariantCulture),
+        Convert.ToInt32(reader["visible_session_count"], CultureInfo.InvariantCulture));
 
     private static TempdbTaskRow ReadTempdbTaskRow(SqlDataReader reader) => new(
         Convert.ToInt32(reader["session_id"], CultureInfo.InvariantCulture),
@@ -284,7 +368,8 @@ public sealed class SqlLiveIncidentProbeExecutor : ILiveIncidentProbeExecutor
         Convert.ToInt64(reader["user_objects_alloc_page_count"], CultureInfo.InvariantCulture),
         Convert.ToInt64(reader["user_objects_dealloc_page_count"], CultureInfo.InvariantCulture),
         Convert.ToInt64(reader["internal_objects_alloc_page_count"], CultureInfo.InvariantCulture),
-        Convert.ToInt64(reader["internal_objects_dealloc_page_count"], CultureInfo.InvariantCulture));
+        Convert.ToInt64(reader["internal_objects_dealloc_page_count"], CultureInfo.InvariantCulture),
+        Convert.ToInt32(reader["visible_task_count"], CultureInfo.InvariantCulture));
 
     public Task<IReadOnlyList<FileIoRow>> GetFileIoStatsAsync(bool azureScoped, CancellationToken cancellationToken) =>
         ExecuteAsync(
