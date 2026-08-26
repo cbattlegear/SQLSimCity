@@ -157,11 +157,15 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
     {
         var familyIds = await SelectTopFamilyIdsAsync(cancellationToken).ConfigureAwait(false);
         var families = new List<QueryFamilyDetailV1>(familyIds.Count);
+        var unreadableFamilies = new List<string>();
         foreach (var familyId in familyIds)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (await _queryStore.GetFamilyAsync(familyId, cancellationToken).ConfigureAwait(false) is { } detail)
+            var read = await _queryStore.ReadFamilyAsync(familyId, cancellationToken).ConfigureAwait(false);
+            if (read.Value is { } detail)
                 families.Add(detail);
+            else if (read.Outcome == QueryStoreReadOutcome.Unavailable)
+                unreadableFamilies.Add($"{familyId}: {read.Reason}");
         }
 
         var plans = await LoadPlansAsync(families, cancellationToken).ConfigureAwait(false);
@@ -173,10 +177,24 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
         {
             // Disclosed rather than silently dropped: a plan that cannot be normalized is missing
             // evidence, and the Showplan rules must not be read as if it had been examined.
-            reason +=
-                $" {plans.Skipped.Count} Showplan(s) could not be normalized and were excluded from Showplan rules: " +
-                string.Join("; ", plans.Skipped.Take(3)) +
-                (plans.Skipped.Count > 3 ? "; …" : string.Empty);
+            reason += Disclose(
+                plans.Skipped,
+                "Showplan(s) could not be normalized and were excluded from Showplan rules");
+        }
+        if (plans.Unreadable.Count > 0)
+        {
+            // A different failure, and deliberately worded as one. A Showplan the source could not
+            // read says nothing about the plan itself; the evaluation is simply short of evidence it
+            // expected to have, and would otherwise present as though it had examined everything.
+            reason += Disclose(
+                plans.Unreadable,
+                "Showplan(s) could not be read from the Query Store source, so the Showplan rules ran on incomplete evidence");
+        }
+        if (unreadableFamilies.Count > 0)
+        {
+            reason += Disclose(
+                unreadableFamilies,
+                "query family read(s) failed against the Query Store source, so this evaluation is missing families it selected");
         }
 
         var evidence = new QueryStoreEvidence(generation, families, plans.Plans, reason);
@@ -193,6 +211,12 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
 
         return evidence;
     }
+
+    /// <summary>One disclosure sentence, naming the first few items and counting the rest.</summary>
+    private static string Disclose(IReadOnlyList<string> items, string lead) =>
+        $" {items.Count} {lead}: " +
+        string.Join("; ", items.Take(3)) +
+        (items.Count > 3 ? "; …" : string.Empty);
 
     private CapabilitiesSnapshotV1? SafeCapabilities()
     {
@@ -227,14 +251,22 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
         return ordered;
     }
 
-    /// <summary>The plans that loaded, and a reason for every plan that could not be normalized.</summary>
-    private sealed record PlanLoad(IReadOnlyList<NormalizedShowplanV1> Plans, IReadOnlyList<string> Skipped);
+    /// <summary>
+    /// The plans that loaded, a reason for every plan that could not be normalized, and a reason for
+    /// every plan the source could not read at all. The last two are kept apart because they are
+    /// different facts: <see cref="PlanLoad.Skipped"/> is about the Showplan, and
+    /// <see cref="PlanLoad.Unreadable"/> is about the source that was asked for it.
+    /// </summary>
+    private sealed record PlanLoad(
+        IReadOnlyList<NormalizedShowplanV1> Plans,
+        IReadOnlyList<string> Skipped,
+        IReadOnlyList<string> Unreadable);
 
     private async Task<PlanLoad> LoadPlansAsync(
         IReadOnlyList<QueryFamilyDetailV1> families, CancellationToken cancellationToken)
     {
         if (_options.MaxPlans == 0)
-            return new PlanLoad([], []);
+            return new PlanLoad([], [], []);
         var planIds = families
             .SelectMany(family => family.Plans.Select(plan => plan.PlanId))
             .Distinct(StringComparer.Ordinal)
@@ -242,13 +274,17 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
             .ToArray();
         var plans = new List<NormalizedShowplanV1>(planIds.Length);
         var skipped = new List<string>();
+        var unreadable = new List<string>();
         foreach (var planId in planIds)
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                if (await _queryStore.GetPlanAsync(planId, cancellationToken).ConfigureAwait(false) is { } plan)
+                var read = await _queryStore.ReadPlanAsync(planId, cancellationToken).ConfigureAwait(false);
+                if (read.Value is { } plan)
                     plans.Add(plan);
+                else if (read.Outcome == QueryStoreReadOutcome.Unavailable)
+                    unreadable.Add($"{planId}: {read.Reason}");
             }
             // One unusable Showplan -- oversized, malformed, or unreadable -- must never take down the
             // whole findings evaluation. Every other source in the bundle is still valid evidence.
@@ -261,6 +297,6 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
                 skipped.Add($"{planId}: {ex.Message}");
             }
         }
-        return new PlanLoad(plans, skipped);
+        return new PlanLoad(plans, skipped, unreadable);
     }
 }

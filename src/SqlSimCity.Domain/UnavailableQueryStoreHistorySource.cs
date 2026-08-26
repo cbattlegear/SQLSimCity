@@ -25,6 +25,23 @@ public sealed class UnavailableQueryStoreHistorySource : IQueryStoreHistorySourc
     public Task<PlanComparisonV1?> ComparePlansAsync(
         string leftPlanId, string rightPlanId, CancellationToken cancellationToken) =>
         Task.FromResult<PlanComparisonV1?>(null);
+
+    // Nothing this source returns nothing for is absent. It has not looked, and it is not going to,
+    // so every empty answer here is unavailable evidence rather than a fact about the target.
+    public Task<QueryStoreReadV1<QueryFamilyDetailV1>> ReadFamilyAsync(
+        string familyId, CancellationToken cancellationToken) =>
+        Task.FromResult(QueryStoreRead.Unavailable<QueryFamilyDetailV1>(DataStatus.Disabled, Disabled));
+    public Task<QueryStoreReadV1<NormalizedShowplanV1>> ReadPlanAsync(
+        string planId, CancellationToken cancellationToken) =>
+        Task.FromResult(QueryStoreRead.Unavailable<NormalizedShowplanV1>(DataStatus.Disabled, Disabled));
+    public Task<QueryStoreReadV1<PlanComparisonV1>> ReadComparisonAsync(
+        string leftPlanId, string rightPlanId, CancellationToken cancellationToken) =>
+        Task.FromResult(QueryStoreRead.Unavailable<PlanComparisonV1>(DataStatus.Disabled, Disabled));
+
+    private const string Disabled =
+        "Connected Query Store history collection is not enabled, so nothing was read; " +
+        "this is not evidence that the target holds no such record.";
+
     public Task<QueryStoreCollectorStatusV1> GetStatusAsync(CancellationToken cancellationToken) =>
         Task.FromResult(new QueryStoreCollectorStatusV1(
             "1.0", QueryStoreCollectorState.Disabled, 0, null, null, null, [],

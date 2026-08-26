@@ -97,6 +97,29 @@ public sealed class ConnectedQueryStoreHistorySource(
             cancellationToken);
 
     /// <summary>
+    /// A family read that separates "the published snapshot has no such family" from "there is no
+    /// published snapshot to look in". The second is unavailable evidence: it says nothing about
+    /// whether the family exists on the target, and a caller that treats it as absence quietly
+    /// evaluates a store it never read.
+    /// </summary>
+    public Task<QueryStoreReadV1<QueryFamilyDetailV1>> ReadFamilyAsync(
+        string familyId,
+        CancellationToken cancellationToken) =>
+        repository.ReadConsistentPublishedSnapshotAsync(
+            async (reader, snapshot, token) =>
+            {
+                if (snapshot is null)
+                    return QueryStoreRead.Unavailable<QueryFamilyDetailV1>(
+                        DataStatus.Unknown,
+                        "No complete connected Query Store snapshot has been published yet.");
+                return await GetFamilyAsync(reader, snapshot, familyId, token).ConfigureAwait(false) is { } detail
+                    ? QueryStoreRead.Available(detail)
+                    : QueryStoreRead.Absent<QueryFamilyDetailV1>(
+                        "The published connected Query Store snapshot holds no detail for this family.");
+            },
+            cancellationToken);
+
+    /// <summary>
     /// Finds the published index set for one metric and database filter. A database name that
     /// differs only in case still resolves, because SQL Server database names are case-insensitive
     /// and the collected key can come from configuration rather than from the server. An ambiguous
@@ -209,14 +232,35 @@ public sealed class ConnectedQueryStoreHistorySource(
 
     public async Task<NormalizedShowplanV1?> GetPlanAsync(
         string planId,
+        CancellationToken cancellationToken) =>
+        (await ReadPlanAsync(planId, cancellationToken).ConfigureAwait(false)).Value;
+
+    /// <summary>
+    /// A Showplan read that says which of the two empty answers it is returning. Everything the
+    /// connected source can fail at here -- a probe that could not reach the target, a principal
+    /// without permission, hydration that is switched off, a plan id belonging to an archive --
+    /// leaves the plan unread rather than proving it absent, and is reported as unavailable so the
+    /// caller can disclose it. Only a probe that ran and came back with nothing is absence.
+    /// </summary>
+    public async Task<QueryStoreReadV1<NormalizedShowplanV1>> ReadPlanAsync(
+        string planId,
         CancellationToken cancellationToken)
     {
         var record = await repository.ReadNormalizedPlanAsync(planId, cancellationToken).ConfigureAwait(false);
-        if (record is not null) return record;
-        if (!allowRawPayloadHydration) return null;
-        if (planId.StartsWith("archived:", StringComparison.Ordinal)) return null;
+        if (record is not null) return QueryStoreRead.Available(record);
+        if (!allowRawPayloadHydration)
+            return QueryStoreRead.Unavailable<NormalizedShowplanV1>(
+                DataStatus.Disabled,
+                "Raw Query Store plan hydration is disabled for this source, so a Showplan that " +
+                "protected storage does not already hold cannot be read.");
+        if (planId.StartsWith("archived:", StringComparison.Ordinal))
+            return QueryStoreRead.Unavailable<NormalizedShowplanV1>(
+                DataStatus.Unsupported,
+                "An archived plan id can only be read from the archive it came from.");
         var separator = planId.LastIndexOf(':');
-        if (separator <= 0 || separator == planId.Length - 1) return null;
+        if (separator <= 0 || separator == planId.Length - 1)
+            return QueryStoreRead.Absent<NormalizedShowplanV1>(
+                "This is not a connected Query Store plan id, so no such Showplan exists.");
         var databaseId = planId[..separator];
         var rawPlanId = planId[(separator + 1)..];
         string? xml;
@@ -225,11 +269,16 @@ public sealed class ConnectedQueryStoreHistorySource(
             xml = await incrementalSource.ReadPlanXmlAsync(
                 databaseId, rawPlanId, cancellationToken).ConfigureAwait(false);
         }
-        catch (ProbeExecutionException)
+        catch (ProbeExecutionException ex)
         {
-            return null;
+            // The defect this replaces: a connection blip, a timeout, or a permission problem used
+            // to return the same null as "there is no such plan", so a caller could not tell that
+            // its evidence had been reduced.
+            return QueryStoreRead.Unavailable<NormalizedShowplanV1>(Status(ex), ex.Reason);
         }
-        if (xml is null) return null;
+        if (xml is null)
+            return QueryStoreRead.Absent<NormalizedShowplanV1>(
+                "Query Store no longer holds a Showplan under this plan id.");
         var normalized = await showplanParser.ParseAsync(planId, xml, cancellationToken).ConfigureAwait(false);
         try
         {
@@ -242,17 +291,34 @@ public sealed class ConnectedQueryStoreHistorySource(
         }
         await repository.StoreNormalizedPlanAsync(
             normalized, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
-        return normalized;
+        return QueryStoreRead.Available(normalized);
     }
+
+    private static DataStatus Status(ProbeExecutionException exception) => exception switch
+    {
+        ProbePermissionDeniedException => DataStatus.PermissionDenied,
+        ProbeObjectUnavailableException => DataStatus.Unsupported,
+        ProbeTimeoutException or ProbeTransientConnectionException or
+            ProbeAuthenticationException or ProbeDatabaseUnavailableException => DataStatus.Disconnected,
+        _ => DataStatus.Unknown,
+    };
 
     public async Task<PlanComparisonV1?> ComparePlansAsync(
         string leftPlanId,
         string rightPlanId,
+        CancellationToken cancellationToken) =>
+        (await ReadComparisonAsync(leftPlanId, rightPlanId, cancellationToken).ConfigureAwait(false)).Value;
+
+    public async Task<QueryStoreReadV1<PlanComparisonV1>> ReadComparisonAsync(
+        string leftPlanId,
+        string rightPlanId,
         CancellationToken cancellationToken)
     {
-        var left = await GetPlanAsync(leftPlanId, cancellationToken).ConfigureAwait(false);
-        var right = await GetPlanAsync(rightPlanId, cancellationToken).ConfigureAwait(false);
-        return left is null || right is null ? null : PlanComparer.Compare(left, right);
+        var left = await ReadPlanAsync(leftPlanId, cancellationToken).ConfigureAwait(false);
+        var right = await ReadPlanAsync(rightPlanId, cancellationToken).ConfigureAwait(false);
+        return left.Value is { } leftPlan && right.Value is { } rightPlan
+            ? QueryStoreRead.Available(PlanComparer.Compare(leftPlan, rightPlan))
+            : QueryStoreRead.NoComparison(left, right);
     }
 
     public async Task<QueryStoreCollectorStatusV1> GetStatusAsync(CancellationToken cancellationToken)
