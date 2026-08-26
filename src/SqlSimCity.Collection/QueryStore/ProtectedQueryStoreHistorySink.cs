@@ -69,15 +69,22 @@ public sealed class ProtectedQueryStoreHistorySink(
     {
         cancellationToken.ThrowIfCancellationRequested();
         var state = GetStage(databaseId);
+        HashSet<string>? pendingTextIds = null;
         foreach (var fact in page.Facts)
         {
             switch (fact)
             {
                 case QueryIdentityFact identity:
                     state.Identities[identity.QueryId] = identity;
-                    if (await repository.ReadTextDescriptorAsync(
-                        databaseId, identity.QueryTextId, cancellationToken).ConfigureAwait(false) is { } descriptor)
-                        state.Text[identity.QueryTextId] = descriptor;
+                    // An Available descriptor is terminal: storage only ever gains one for an
+                    // id that had none, and that is where this in-memory value came from. Any
+                    // weaker descriptor is still re-read, so a Missing one that the API
+                    // hydrated on demand between cycles is picked up exactly as before.
+                    if (state.Text.TryGetValue(identity.QueryTextId, out var staged) &&
+                        staged.Availability == QueryTextAvailability.Available)
+                        break;
+                    pendingTextIds ??= new HashSet<string>(StringComparer.Ordinal);
+                    pendingTextIds.Add(identity.QueryTextId);
                     break;
                 case QueryPlanFact plan:
                     state.Plans[plan.PlanId] = plan;
@@ -94,6 +101,23 @@ public sealed class ProtectedQueryStoreHistorySink(
                     break;
             }
         }
+
+        if (pendingTextIds is null) return;
+        // One storage connection for the whole page. A first or backfill cycle stages tens of
+        // thousands of identities, and opening a connection per identity costs orders of
+        // magnitude more than the read it carries.
+        await repository.ReadBatchAsync(
+            async (reader, token) =>
+            {
+                foreach (var queryTextId in pendingTextIds)
+                {
+                    token.ThrowIfCancellationRequested();
+                    if (await reader.ReadTextDescriptorAsync(databaseId, queryTextId, token)
+                            .ConfigureAwait(false) is { } descriptor)
+                        state.Text[queryTextId] = descriptor;
+                }
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     public Task StageRuntimeBucketsAsync(

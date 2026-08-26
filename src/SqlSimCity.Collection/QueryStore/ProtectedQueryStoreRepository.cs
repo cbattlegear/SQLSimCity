@@ -13,6 +13,53 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     private static readonly ProtectedRecordId CurrentPointerId = new("qs:current-snapshot-pointer");
     private const int IndexPageSize = 200;
 
+    private readonly IProtectedRecordReadSession? _session;
+
+    private ProtectedQueryStoreRepository(
+        IProtectedRecordStore store, IProtectedRecordReadSession session)
+        : this(store) => _session = session;
+
+    /// <summary>
+    /// Runs <paramref name="body"/> against a repository whose point reads are served from
+    /// one storage connection rather than one per record, and closes that connection when it
+    /// returns. Reads that span the batch still see writes committed by other connections,
+    /// because the session never holds an open transaction between statements.
+    /// The repository passed to the body is the one to read through; reads issued on the
+    /// outer instance bypass the session and keep paying per-record connection setup.
+    /// </summary>
+    public async Task<T> ReadBatchAsync<T>(
+        Func<ProtectedQueryStoreRepository, CancellationToken, Task<T>> body,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        if (_session is not null)
+            return await body(this, cancellationToken).ConfigureAwait(false);
+        await using var session = await store.BeginReadSessionAsync(cancellationToken).ConfigureAwait(false);
+        return await body(
+            new ProtectedQueryStoreRepository(store, session), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc cref="ReadBatchAsync{T}(Func{ProtectedQueryStoreRepository, CancellationToken, Task{T}}, CancellationToken)"/>
+    public Task ReadBatchAsync(
+        Func<ProtectedQueryStoreRepository, CancellationToken, Task> body,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        return ReadBatchAsync<object?>(
+            async (batch, token) =>
+            {
+                await body(batch, token).ConfigureAwait(false);
+                return null;
+            },
+            cancellationToken);
+    }
+
+    private Task<ProtectedRecord?> GetRecordAsync(
+        ProtectedRecordId id, CancellationToken cancellationToken) =>
+        _session is null
+            ? store.GetAsync(id, cancellationToken)
+            : _session.GetAsync(id, cancellationToken);
+
     public Task StoreQueryTextAsync(
         string databaseId, string queryTextId, DateTimeOffset capturedAt, string queryText,
         CancellationToken cancellationToken = default) =>
@@ -37,11 +84,23 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
             cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<NormalizedShowplanV1?> ReadNormalizedPlanAsync(
-        string planId, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Reads one normalized plan. A chunked plan is a manifest plus N chunk records, and a
+    /// cold database-city page reads up to 96 plans, so the reads share one connection. When
+    /// the caller is already inside <see cref="ReadBatchAsync{T}"/> this joins that batch
+    /// instead of opening a second connection.
+    /// </summary>
+    public Task<NormalizedShowplanV1?> ReadNormalizedPlanAsync(
+        string planId, CancellationToken cancellationToken = default) =>
+        ReadBatchAsync(
+            (batch, token) => batch.ReadNormalizedPlanCoreAsync(planId, token),
+            cancellationToken);
+
+    private async Task<NormalizedShowplanV1?> ReadNormalizedPlanCoreAsync(
+        string planId, CancellationToken cancellationToken)
     {
         var prefix = NormalizedPlanPrefix(planId);
-        using var record = await store.GetAsync(
+        using var record = await GetRecordAsync(
             new ProtectedRecordId($"{prefix}manifest"), cancellationToken).ConfigureAwait(false);
         if (record is null)
             return await ReadJsonAsync<NormalizedShowplanV1>(
@@ -98,8 +157,18 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
             .ConfigureAwait(false);
     }
 
-    public async Task<QueryStorePublishedSnapshot?> ReadPublishedSnapshotAsync(
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Reads the current published snapshot in full. The pointer, header, index pages and
+    /// families are hundreds of point reads, so they share one storage connection.
+    /// </summary>
+    public Task<QueryStorePublishedSnapshot?> ReadPublishedSnapshotAsync(
+        CancellationToken cancellationToken = default) =>
+        ReadBatchAsync(
+            static (batch, token) => batch.ReadPublishedSnapshotCoreAsync(token),
+            cancellationToken);
+
+    private async Task<QueryStorePublishedSnapshot?> ReadPublishedSnapshotCoreAsync(
+        CancellationToken cancellationToken)
     {
         var pointer = await ReadJsonAsync<QueryStoreSnapshotPointer>(
             CurrentPointerId, cancellationToken).ConfigureAwait(false);
@@ -152,18 +221,32 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
             new ProtectedRecordId(pointer.SnapshotRecordId), cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<T> ReadConsistentPublishedSnapshotAsync<T>(
-        Func<QueryStorePublishedSnapshot?, CancellationToken, Task<T>> reader,
+    /// <summary>
+    /// Reads through a published snapshot, retrying if the snapshot is replaced underneath
+    /// the read. The whole read runs on one storage connection; <paramref name="reader"/>
+    /// receives the repository bound to it and must read through that instance.
+    /// </summary>
+    public Task<T> ReadConsistentPublishedSnapshotAsync<T>(
+        Func<ProtectedQueryStoreRepository, QueryStorePublishedSnapshot?, CancellationToken, Task<T>> reader,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reader);
+        return ReadBatchAsync(
+            (batch, token) => batch.ReadConsistentPublishedSnapshotCoreAsync(reader, token),
+            cancellationToken);
+    }
+
+    private async Task<T> ReadConsistentPublishedSnapshotCoreAsync<T>(
+        Func<ProtectedQueryStoreRepository, QueryStorePublishedSnapshot?, CancellationToken, Task<T>> reader,
+        CancellationToken cancellationToken)
+    {
         for (var attempt = 0; attempt < 2; attempt++)
         {
             var before = await ReadPublishedSnapshotHeaderAsync(cancellationToken).ConfigureAwait(false);
             T result;
             try
             {
-                result = await reader(before, cancellationToken).ConfigureAwait(false);
+                result = await reader(this, before, cancellationToken).ConfigureAwait(false);
             }
             catch (InvalidDataException)
             {
@@ -275,7 +358,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
         CancellationToken cancellationToken = default)
     {
         if (kind is not ("query-text" or "showplan")) throw new ArgumentOutOfRangeException(nameof(kind));
-        using var record = await store.GetAsync(
+        using var record = await GetRecordAsync(
             Id(kind, databaseId, sourceId), cancellationToken).ConfigureAwait(false);
         return record is null ? null : Encoding.UTF8.GetString(record.Payload.Span);
     }
@@ -317,7 +400,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
         ProtectedRecordId id,
         CancellationToken cancellationToken)
     {
-        using var record = await store.GetAsync(id, cancellationToken).ConfigureAwait(false);
+        using var record = await GetRecordAsync(id, cancellationToken).ConfigureAwait(false);
         return record is null ? default : JsonSerializer.Deserialize<T>(record.Payload.Span);
     }
 
@@ -514,7 +597,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
         using var buffer = new MemoryStream();
         for (var index = 0; index < chunkCount; index++)
         {
-            using var record = await store.GetAsync(
+            using var record = await GetRecordAsync(
                 SlotChunkId(slot, familyId, component, index), cancellationToken).ConfigureAwait(false) ??
                 throw new InvalidDataException("A protected Query Store family chunk is missing.");
             await buffer.WriteAsync(record.Payload, cancellationToken).ConfigureAwait(false);
@@ -532,7 +615,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
         using var buffer = new MemoryStream();
         for (var index = 0; index < chunkCount; index++)
         {
-            using var record = await store.GetAsync(
+            using var record = await GetRecordAsync(
                 new ProtectedRecordId($"{prefix}chunk:{index}"), cancellationToken).ConfigureAwait(false) ??
                 throw new InvalidDataException("A protected Query Store plan chunk is missing.");
             await buffer.WriteAsync(record.Payload, cancellationToken).ConfigureAwait(false);

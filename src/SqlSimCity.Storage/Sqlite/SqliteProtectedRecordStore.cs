@@ -10,7 +10,9 @@ namespace SqlSimCity.Storage.Sqlite;
 /// record kind, captured timestamp, resolution, and the record envelope, whose
 /// payload is stored in the clear. A new connection is
 /// opened per operation (each with its own busy timeout), relying on WAL for
-/// reader/writer concurrency rather than in-process locking.
+/// reader/writer concurrency rather than in-process locking. Loops that read many
+/// records should take a <see cref="BeginReadSessionAsync"/> session instead, which
+/// amortises that connection setup over the batch without enabling pooling.
 /// <see cref="EnsureReadyAsync"/> must succeed before any other member is
 /// called; every other member throws <see cref="InvalidOperationException"/>
 /// otherwise, which keeps the store fail-closed if a host forgets to await
@@ -18,12 +20,16 @@ namespace SqlSimCity.Storage.Sqlite;
 /// </summary>
 public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtectedStorageInitializer, IDisposable
 {
+    private const string SelectRecordSql =
+        "SELECT record_kind, captured_at_unix_ms, resolution, envelope FROM protected_records WHERE id = $id;";
+
     private readonly string _connectionString;
     private readonly RetentionOptions _retention;
     private readonly TimeProvider _timeProvider;
     private readonly int _maxRecordKindLength;
     private readonly int _maxPayloadBytes;
     private int _ready;
+    private bool _encodingIsUtf8;
     private bool _disposed;
 
     public int MaxPayloadBytes => _maxPayloadBytes;
@@ -76,6 +82,7 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
         ObjectDisposedException.ThrowIf(_disposed, this);
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await SqliteSchema.EnsureReadyAsync(connection, _timeProvider, cancellationToken);
+        _encodingIsUtf8 = await ReadEncodingIsUtf8Async(connection, cancellationToken);
         Volatile.Write(ref _ready, 1);
     }
 
@@ -128,18 +135,45 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
     {
         EnsureInitialized();
 
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = SelectRecordSql;
+        command.Parameters.AddWithValue("$id", id.Value);
+        return await ReadRecordAsync(command, id, cancellationToken);
+    }
+
+    /// <summary>
+    /// Opens one connection with one prepared select and serves the batch from it. The
+    /// caller decides the batch boundary, so the handle lifetime stays explicit -- unlike
+    /// connection pooling, which keeps a native handle (and on Windows a file lock) alive
+    /// after the wrapper is disposed.
+    /// </summary>
+    public async Task<IProtectedRecordReadSession> BeginReadSessionAsync(
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        var connection = await OpenConnectionAsync(cancellationToken);
+        try
+        {
+            return new SqliteReadSession(connection);
+        }
+        catch
+        {
+            await connection.DisposeAsync();
+            throw;
+        }
+    }
+
+    private static async Task<ProtectedRecord?> ReadRecordAsync(
+        SqliteCommand command, ProtectedRecordId id, CancellationToken cancellationToken)
+    {
         string recordKind;
         long capturedAtUnixMs;
         StorageResolution resolution;
         byte[] envelope;
 
-        await using (var connection = await OpenConnectionAsync(cancellationToken))
-        await using (var command = connection.CreateCommand())
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
         {
-            command.CommandText =
-                "SELECT record_kind, captured_at_unix_ms, resolution, envelope FROM protected_records WHERE id = $id;";
-            command.Parameters.AddWithValue("$id", id.Value);
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             if (!await reader.ReadAsync(cancellationToken))
             {
                 return null;
@@ -192,9 +226,12 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
             await using (var delete = connection.CreateCommand())
             {
                 delete.Transaction = transaction;
-                delete.CommandText = "DELETE FROM protected_records WHERE substr(id, 1, $length) = $prefix;";
-                delete.Parameters.AddWithValue("$length", idPrefix.Length);
-                delete.Parameters.AddWithValue("$prefix", idPrefix);
+                // A half-open range over the primary key seeks the index; substr() on the
+                // indexed column cannot, so it scanned every row on every slot replacement --
+                // and a normalized plan is stored through this path too, up to 96 times per
+                // cold database-city page. Prefixes with no provably equivalent bound keep
+                // the exact predicate.
+                SqlitePrefixRange.ConfigureDelete(delete, idPrefix, _encodingIsUtf8);
                 await delete.ExecuteNonQueryAsync(cancellationToken);
             }
 
@@ -327,5 +364,62 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
         command.CommandText = "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;";
         await command.ExecuteNonQueryAsync(cancellationToken);
         return connection;
+    }
+
+    /// <summary>
+    /// Reports whether BINARY collation compares UTF-8 bytes on this database. Stores this
+    /// code creates are UTF-8, but the encoding is fixed when a file is first written, so a
+    /// file created elsewhere can be UTF-16 -- where memcmp also orders the high byte of an
+    /// ASCII character and a prefix range would select ids that do not share the prefix.
+    /// </summary>
+    private static async Task<bool> ReadEncodingIsUtf8Async(
+        SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA encoding;";
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        return value is string encoding &&
+            encoding.Equals("UTF-8", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed class SqliteReadSession : IProtectedRecordReadSession
+    {
+        private readonly SqliteConnection _connection;
+        private readonly SqliteCommand _command;
+        private readonly SqliteParameter _id;
+        private readonly SemaphoreSlim _gate = new(1, 1);
+
+        public SqliteReadSession(SqliteConnection connection)
+        {
+            _connection = connection;
+            _command = connection.CreateCommand();
+            _command.CommandText = SelectRecordSql;
+            _id = _command.Parameters.Add("$id", SqliteType.Text);
+            _command.Prepare();
+        }
+
+        public async Task<ProtectedRecord?> GetAsync(
+            ProtectedRecordId id, CancellationToken cancellationToken = default)
+        {
+            // One connection cannot run two commands at once. The gate makes an accidental
+            // parallel read wait rather than tear the shared reader.
+            await _gate.WaitAsync(cancellationToken);
+            try
+            {
+                _id.Value = id.Value;
+                return await ReadRecordAsync(_command, id, cancellationToken);
+            }
+            finally
+            {
+                _gate.Release();
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _command.DisposeAsync();
+            await _connection.DisposeAsync();
+            _gate.Dispose();
+        }
     }
 }

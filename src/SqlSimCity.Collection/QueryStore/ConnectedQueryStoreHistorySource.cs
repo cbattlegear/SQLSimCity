@@ -25,11 +25,12 @@ public sealed class ConnectedQueryStoreHistorySource(
         string? pageToken,
         CancellationToken cancellationToken) =>
         repository.ReadConsistentPublishedSnapshotAsync(
-            (snapshot, token) => GetQueriesAsync(
-                snapshot, databaseId, metric, pageSize, pageToken, token),
+            (reader, snapshot, token) => GetQueriesAsync(
+                reader, snapshot, databaseId, metric, pageSize, pageToken, token),
             cancellationToken);
 
-    private async Task<PageV1<QueryFamilySummaryV1>> GetQueriesAsync(
+    private static async Task<PageV1<QueryFamilySummaryV1>> GetQueriesAsync(
+        ProtectedQueryStoreRepository reader,
         QueryStorePublishedSnapshot? snapshot,
         string? databaseId,
         string metric,
@@ -49,7 +50,7 @@ public sealed class ConnectedQueryStoreHistorySource(
 
         if (snapshot.IndexSets is null)
             return await GetLegacyQueriesAsync(
-                snapshot, databaseId, metric, pageSize, cursor, cancellationToken).ConfigureAwait(false);
+                reader, snapshot, databaseId, metric, pageSize, cursor, cancellationToken).ConfigureAwait(false);
 
         var index = ResolveIndexSet(snapshot.IndexSets, NormalizeMetric(metric), databaseId);
         if (index is null) return Empty(pageSize, "No Query Store families match this database filter.");
@@ -61,14 +62,14 @@ public sealed class ConnectedQueryStoreHistorySource(
         var families = new List<QueryFamilySummaryV1>(pageSize);
         while (families.Count < pageSize && pageIndex < index.PageCount)
         {
-            var indexPage = await repository.ReadIndexPageAsync(
+            var indexPage = await reader.ReadIndexPageAsync(
                 snapshot, index.Metric, index.DatabaseId, pageIndex, cancellationToken)
                 .ConfigureAwait(false) ?? throw new InvalidDataException("A protected Query Store index page is missing.");
             if (cursor is not null && families.Count == 0 && offset >= indexPage.FamilyIds.Count)
                 throw new QueryStorePageTokenException("The Query Store page token is outside the published index.");
             while (families.Count < pageSize && offset < indexPage.FamilyIds.Count)
             {
-                var summary = await repository.ReadFamilySummaryAsync(
+                var summary = await reader.ReadFamilySummaryAsync(
                     snapshot, indexPage.FamilyIds[offset++], cancellationToken)
                     .ConfigureAwait(false) ?? throw new InvalidDataException("A protected Query Store family is missing.");
                 families.Add(summary);
@@ -92,7 +93,7 @@ public sealed class ConnectedQueryStoreHistorySource(
         string familyId,
         CancellationToken cancellationToken) =>
         repository.ReadConsistentPublishedSnapshotAsync(
-            (snapshot, token) => GetFamilyAsync(snapshot, familyId, token),
+            (reader, snapshot, token) => GetFamilyAsync(reader, snapshot, familyId, token),
             cancellationToken);
 
     /// <summary>
@@ -118,6 +119,7 @@ public sealed class ConnectedQueryStoreHistorySource(
     }
 
     private async Task<QueryFamilyDetailV1?> GetFamilyAsync(
+        ProtectedQueryStoreRepository reader,
         QueryStorePublishedSnapshot? snapshot,
         string familyId,
         CancellationToken cancellationToken)
@@ -126,9 +128,9 @@ public sealed class ConnectedQueryStoreHistorySource(
         if (snapshot is not null)
         {
             detail = snapshot.IndexSets is null
-                ? (await repository.ReadPublishedSnapshotAsync(snapshot, cancellationToken).ConfigureAwait(false))
+                ? (await reader.ReadPublishedSnapshotAsync(snapshot, cancellationToken).ConfigureAwait(false))
                     .Families.SingleOrDefault(item => item.Family.FamilyId == familyId)
-                : await repository.ReadFamilyAsync(
+                : await reader.ReadFamilyAsync(
                     snapshot, familyId, cancellationToken).ConfigureAwait(false);
         }
         if (detail is null) return null;
@@ -148,7 +150,7 @@ public sealed class ConnectedQueryStoreHistorySource(
                     physical.Add(identity with { Text = descriptor });
                     continue;
                 }
-                descriptor = await repository.ReadTextDescriptorAsync(
+                descriptor = await reader.ReadTextDescriptorAsync(
                     identity.DatabaseId, identity.QueryTextId, cancellationToken).ConfigureAwait(false);
                 if (descriptor is null)
                 {
@@ -189,7 +191,7 @@ public sealed class ConnectedQueryStoreHistorySource(
         var plans = new List<QueryPlanSummaryV1>(detail.Plans.Count);
         foreach (var plan in detail.Plans)
         {
-            var normalized = await repository.ReadNormalizedPlanAsync(
+            var normalized = await reader.ReadNormalizedPlanAsync(
                 plan.PlanId, cancellationToken).ConfigureAwait(false);
             plans.Add(normalized is null ? plan : plan with { Optimization = normalized.Optimization });
         }
@@ -274,7 +276,8 @@ public sealed class ConnectedQueryStoreHistorySource(
     private static string NormalizeMetric(string metric) =>
         metric is "execution" or "executions" ? "execution" : metric;
 
-    private async Task<PageV1<QueryFamilySummaryV1>> GetLegacyQueriesAsync(
+    private static async Task<PageV1<QueryFamilySummaryV1>> GetLegacyQueriesAsync(
+        ProtectedQueryStoreRepository reader,
         QueryStorePublishedSnapshot header,
         string? databaseId,
         string metric,
@@ -282,7 +285,7 @@ public sealed class ConnectedQueryStoreHistorySource(
         QueryPageCursor? cursor,
         CancellationToken cancellationToken)
     {
-        var snapshot = await repository.ReadPublishedSnapshotAsync(header, cancellationToken)
+        var snapshot = await reader.ReadPublishedSnapshotAsync(header, cancellationToken)
             .ConfigureAwait(false);
         var normalizedMetric = NormalizeMetric(metric);
         var ordered = snapshot.Families

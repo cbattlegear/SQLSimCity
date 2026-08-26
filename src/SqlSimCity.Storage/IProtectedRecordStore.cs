@@ -26,6 +26,16 @@ public interface IProtectedRecordStore
     /// <summary>Reads a caller-owned record, or <c>null</c>; dispose it to zero the payload.</summary>
     Task<ProtectedRecord?> GetAsync(ProtectedRecordId id, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Begins a bounded batch of reads over shared storage state. Callers that read many
+    /// records in a loop should use one instead of repeating <see cref="GetAsync"/>, which
+    /// pays full connection setup per record in a connection-backed store. The default holds
+    /// nothing and forwards to <see cref="GetAsync"/>, which is already optimal for stores
+    /// with no per-read setup cost.
+    /// </summary>
+    Task<IProtectedRecordReadSession> BeginReadSessionAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult<IProtectedRecordReadSession>(new PassThroughProtectedRecordReadSession(this));
+
     /// <summary>Deletes a record. Returns <c>false</c> if the id was absent.</summary>
     Task<bool> DeleteAsync(ProtectedRecordId id, CancellationToken cancellationToken = default);
 
