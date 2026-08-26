@@ -164,9 +164,9 @@ Do not weaken `--locked-mode` in CI to get around this. It is a supply-chain con
 
 ```powershell
 dotnet build SqlSimCity.slnx -c Release        # 0 warnings expected
-dotnet test SqlSimCity.slnx -c Release         # 1,251 tests
-npm test                                       # 598 probe-catalog tests
-cd web; npm ci; npm run build; npm test -- --run   # 772 tests / 45 files
+dotnet test SqlSimCity.slnx -c Release         # 1,301 tests
+npm test                                       # 609 probe-catalog tests
+cd web; npm ci; npm run build; npm test -- --run   # 775 tests / 45 files
 npm run typecheck
 ```
 

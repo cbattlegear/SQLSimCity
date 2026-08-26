@@ -130,6 +130,16 @@ This is unsupported and undocumented. It is fine for a throwaway container whose
 purpose is to be measured against. **Never point `Add-DeepHistory.ps1` at a database you
 care about.**
 
+**And never point it at a store another measurement is already using.** It rewrites the
+timeline in place and raises `STALE_QUERY_THRESHOLD_DAYS`, so a probe measurement or a
+publish-cost run against the same container silently changes underneath — its numbers stay
+plausible and stop describing what it thinks it measured. Two workbench sessions hit this
+within an hour of each other: the shared `sqlsimcity-measure-sql` on 11433 was in use, and
+the deep-history run stood up its own container on a second port instead. Do that. A 4 GB
+limit and a few hundred objects is enough, because what this path needs is interval *span*,
+not a large catalog — the 4,200-object floor below is about the browser's page walk and has
+nothing to do with backfill depth.
+
 ### Why the real intervals move to the far end
 
 The real intervals are back-dated to the *old* end of the span and the synthesized ones fill
