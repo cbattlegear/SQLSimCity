@@ -1,4 +1,17 @@
 -- SQL Server 2017+ through 2019 keyset wait variant.
+-- The keyset predicate sits in the base WHERE, before GROUP BY, and deliberately not outside the
+-- CTE. Measured (issue #81): filtering after the aggregate left logical reads flat from the first
+-- page to the last, because every page re-aggregated the whole @StartTime..@EndTime window -- the
+-- optimizer does not push this predicate below the aggregate on its own. Cost was O(window) per
+-- page instead of O(page).
+-- Moving it cannot change which groups come back: all four cursor columns are grouping columns, so
+-- the predicate is constant across every row of a group and either keeps the group whole or drops
+-- it whole. In particular the active interval's flushed and in-memory duplicate rows share that key,
+-- so they are still summed together here and are never split or double-counted -- overlap replay
+-- stays necessary for exactly the reason it was before.
+-- The redundant leading `>= @AfterIntervalId` is implied by the OR chain (every branch requires it)
+-- and exists to give the engine a single-column seekable predicate; the chain itself stays as the
+-- exact residual.
 SET NOCOUNT ON;
 SET DEADLOCK_PRIORITY LOW;
 SET LOCK_TIMEOUT 5000;
@@ -11,15 +24,17 @@ WITH buckets AS (
     JOIN sys.query_store_runtime_stats_interval AS rsi
       ON rsi.runtime_stats_interval_id = ws.runtime_stats_interval_id
     WHERE rsi.end_time > @StartTime AND rsi.start_time < @EndTime
+      AND ws.runtime_stats_interval_id >= @AfterIntervalId
+      AND (ws.runtime_stats_interval_id > @AfterIntervalId
+           OR (ws.runtime_stats_interval_id = @AfterIntervalId AND ws.plan_id > @AfterPlanId)
+           OR (ws.runtime_stats_interval_id = @AfterIntervalId AND ws.plan_id = @AfterPlanId
+               AND ws.execution_type > @AfterExecutionType)
+           OR (ws.runtime_stats_interval_id = @AfterIntervalId AND ws.plan_id = @AfterPlanId
+               AND ws.execution_type = @AfterExecutionType
+               AND ws.wait_category > @AfterWaitCategory))
     GROUP BY ws.runtime_stats_interval_id, ws.plan_id, ws.execution_type,
              ws.wait_category, ws.wait_category_desc
 )
 SELECT TOP (@PageSize) *
 FROM buckets
-WHERE runtime_stats_interval_id > @AfterIntervalId
-   OR (runtime_stats_interval_id = @AfterIntervalId AND plan_id > @AfterPlanId)
-   OR (runtime_stats_interval_id = @AfterIntervalId AND plan_id = @AfterPlanId
-       AND execution_type > @AfterExecutionType)
-   OR (runtime_stats_interval_id = @AfterIntervalId AND plan_id = @AfterPlanId
-       AND execution_type = @AfterExecutionType AND wait_category > @AfterWaitCategory)
 ORDER BY runtime_stats_interval_id, plan_id, execution_type, wait_category;

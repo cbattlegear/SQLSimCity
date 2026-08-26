@@ -732,6 +732,140 @@ describe('regression: query_store_wait_stats_summary replica grouping and divisi
   }
 });
 
+// Issue #81 part 1. These probes aggregate a CTE over @StartTime..@EndTime and then page through
+// the result with a keyset cursor. Measured on a seeded instance: with the cursor predicate applied
+// *outside* the CTE, logical reads stayed flat at 899 from the first page to the last while CPU
+// fell, because every page re-aggregated the whole window -- the optimizer does not push the
+// predicate below the aggregate on its own, so cost was O(window) per page rather than O(page).
+// The predicate must therefore be applied to the base table before GROUP BY. That is safe only
+// because every cursor column is also a grouping column, so the predicate is constant across each
+// group and can never split one -- which is what keeps the active interval's flushed and in-memory
+// duplicate rows summed together and not double-counted.
+describe('regression: Query Store keyset pages filter before the aggregate, not after it', () => {
+  const pagedProbes = [
+    {
+      id: 'querystore.runtime_page_2016',
+      alias: 'rs',
+      cursorColumns: ['runtime_stats_interval_id', 'plan_id', 'execution_type'],
+    },
+    {
+      id: 'querystore.runtime_page_2022',
+      alias: 'rs',
+      cursorColumns: ['runtime_stats_interval_id', 'plan_id', 'execution_type', 'replica_group_id'],
+    },
+    {
+      id: 'querystore.waits_page_2017',
+      alias: 'ws',
+      cursorColumns: ['runtime_stats_interval_id', 'plan_id', 'execution_type', 'wait_category'],
+    },
+    {
+      id: 'querystore.waits_page_2022',
+      alias: 'ws',
+      cursorColumns: [
+        'runtime_stats_interval_id',
+        'plan_id',
+        'execution_type',
+        'replica_group_id',
+        'wait_category',
+      ],
+    },
+  ];
+
+  // Everything from the CTE's opening `WITH ... AS (` to the matching close paren, so an assertion
+  // about "inside the aggregate" cannot accidentally be satisfied by the outer SELECT and vice
+  // versa. Counting parens rather than regex-matching the block is what makes that split reliable.
+  function splitCteAndOuter(source) {
+    const stripped = stripSqlComments(source);
+    const open = stripped.indexOf('(', stripped.search(/\bWITH\s+buckets\s+AS\b/i));
+    assert.ok(open > 0, 'expected a `WITH buckets AS (` common table expression');
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < stripped.length; i += 1) {
+      if (stripped[i] === '(') depth += 1;
+      else if (stripped[i] === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    assert.ok(close > open, 'the buckets CTE has unbalanced parentheses');
+    return { cte: stripped.slice(open + 1, close), outer: stripped.slice(close + 1) };
+  }
+
+  for (const { id, alias, cursorColumns } of pagedProbes) {
+    describe(id, () => {
+      const source = readProbeSource(probeById(id));
+
+      test('every @After* cursor parameter is referenced inside the aggregating CTE', () => {
+        const { cte } = splitCteAndOuter(source);
+        for (const name of extractParameterNames(source)) {
+          if (!name.startsWith('@After')) continue;
+          assert.ok(
+            cte.includes(name),
+            `${name} is not referenced inside the buckets CTE, so the page filter runs after the ` +
+              'aggregate and every page re-aggregates the whole window (issue #81 part 1)',
+          );
+        }
+      });
+
+      test('no cursor predicate survives outside the CTE', () => {
+        const { outer } = splitCteAndOuter(source);
+        assert.doesNotMatch(
+          outer,
+          /@After/i,
+          'a cursor predicate outside the CTE re-introduces the O(window)-per-page cost this ' +
+            'rewrite removed; the outer SELECT must be TOP + ORDER BY only',
+        );
+        assert.doesNotMatch(
+          outer,
+          /\bWHERE\b/i,
+          'the outer SELECT must not filter at all -- filtering there is what forced the full ' +
+            'window through the aggregate on every page',
+        );
+      });
+
+      test('the cursor predicate is applied to the base table, qualified by its alias', () => {
+        const { cte } = splitCteAndOuter(source);
+        for (const column of cursorColumns) {
+          assert.match(
+            cte,
+            new RegExp(`\\b${alias}\\.${column}\\b`, 'i'),
+            `the in-CTE cursor predicate must reference ${alias}.${column} on the base table so the ` +
+              'engine can filter rows before grouping them',
+          );
+        }
+      });
+
+      test('every cursor column is also a grouping column, so the predicate cannot split a group', () => {
+        const { cte } = splitCteAndOuter(source);
+        const groupBy = cte.slice(cte.search(/\bGROUP\s+BY\b/i));
+        assert.ok(groupBy.length > 0, 'expected a GROUP BY inside the buckets CTE');
+        for (const column of cursorColumns) {
+          assert.match(
+            groupBy,
+            new RegExp(`\\b${column}\\b`, 'i'),
+            `${column} is a cursor column but not a grouping column. Filtering on it before ` +
+              'GROUP BY would then drop part of a group rather than the whole group, splitting the ' +
+              "active interval's duplicate rows and corrupting the aggregate",
+          );
+        }
+      });
+
+      test('the window bounds still use overlap semantics alongside the cursor predicate', () => {
+        const { cte } = splitCteAndOuter(source);
+        assert.match(
+          cte,
+          /rsi\.end_time\s*>\s*@StartTime/i,
+          'adding the cursor predicate must not disturb the overlap window bound',
+        );
+        assert.match(cte, /rsi\.start_time\s*<\s*@EndTime/i);
+      });
+    });
+  }
+});
+
 describe('regression: server.identity does not overclaim Azure SQL DB capacity from host DMVs', () => {
   test('probe header does not claim cpu_count/physical_memory_kb reflect the assigned vCore/DTU tier', () => {
     const probe = probeById('server.identity');
