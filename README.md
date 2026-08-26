@@ -73,7 +73,7 @@ permissions, Azure SQL, Query Store, and live sampling.
 
 | Flat map view | Server atlas |
 | --- | --- |
-| ![The same city in flat map mode: a north-up paper basemap with white carriageways over grey casings, infrastructure facilities scattered across the block grid as POIs, and a red pin on the table with a blocked waiter](docs/images/map.png) | ![Server atlas showing every database on the instance as its own city, with the plot sized by allocated storage and the tallest tower by used storage, beside the searchable sidebar](docs/images/atlas.png) |
+| ![The same city in flat map mode: a north-up paper basemap with white carriageways over grey casings, schema neighbourhoods labelled across the block grid, and the graded query-traffic roads drawn over them](docs/images/map.png) | ![Server atlas showing every database on the instance as its own city, with the plot sized by allocated storage and the tallest tower by used storage, beside the searchable sidebar](docs/images/atlas.png) |
 
 Both surfaces are the same map shell: a full-screen map, a searchable sidebar, and one toggle
 between the flat map and the 3D city. The tile at the bottom-left of the map switches between them.
