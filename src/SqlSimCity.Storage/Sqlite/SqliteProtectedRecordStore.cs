@@ -24,6 +24,7 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
         "SELECT record_kind, captured_at_unix_ms, resolution, envelope FROM protected_records WHERE id = $id;";
 
     private readonly string _connectionString;
+    private readonly string _databasePath;
     private readonly RetentionOptions _retention;
     private readonly TimeProvider _timeProvider;
     private readonly int _maxRecordKindLength;
@@ -62,6 +63,7 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
 
         Directory.CreateDirectory(dataDirectory);
         var databasePath = Path.Combine(dataDirectory, databaseFileName);
+        _databasePath = databasePath;
         _connectionString = new SqliteConnectionStringBuilder
         {
             DataSource = databasePath,
@@ -209,7 +211,7 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
         return affected > 0;
     }
 
-    public async Task ReplaceSetAsync(
+    public async Task<ProtectedSetReplacement> ReplaceSetAsync(
         string idPrefix,
         IEnumerable<ProtectedRecordWrite> records,
         CancellationToken cancellationToken = default)
@@ -218,11 +220,34 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
         ArgumentException.ThrowIfNullOrWhiteSpace(idPrefix);
         ArgumentNullException.ThrowIfNull(records);
 
+        var deleted = 0;
+        var deletedBytes = 0L;
+        var written = 0;
+        var payloadBytes = 0L;
+        var storedBytes = 0L;
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var transaction =
             (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        // SQLite takes the write lock at the first write statement, not at BEGIN, so the hold
+        // starts here rather than above. It runs to the commit and therefore covers the caller's
+        // own serialization work: `records` is lazy, so every record it yields is built while
+        // other writers are already waiting. That is the cost being reported, not an artefact.
+        var writeLockHold = System.Diagnostics.Stopwatch.StartNew();
         try
         {
+            // Inside the transaction, so what is measured is exactly what the delete then removes.
+            // It is the same seek the delete performs and reads only row headers, but it is real
+            // work added to a publish, and the byte figure is what makes the churn quantifiable
+            // rather than inferred.
+            await using (var size = connection.CreateCommand())
+            {
+                size.Transaction = transaction;
+                SqlitePrefixRange.ConfigureSize(size, idPrefix, _encodingIsUtf8);
+                await using var reader = await size.ExecuteReaderAsync(cancellationToken);
+                if (await reader.ReadAsync(cancellationToken))
+                    deletedBytes = reader.GetInt64(1);
+            }
+
             await using (var delete = connection.CreateCommand())
             {
                 delete.Transaction = transaction;
@@ -232,7 +257,7 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
                 // cold database-city page. Prefixes with no provably equivalent bound keep
                 // the exact predicate.
                 SqlitePrefixRange.ConfigureDelete(delete, idPrefix, _encodingIsUtf8);
-                await delete.ExecuteNonQueryAsync(cancellationToken);
+                deleted = await delete.ExecuteNonQueryAsync(cancellationToken);
             }
 
             await using var put = connection.CreateCommand();
@@ -266,6 +291,9 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
                     envelopeParameter.Value = envelope;
                     storedParameter.Value = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
                     await put.ExecuteNonQueryAsync(cancellationToken);
+                    written++;
+                    payloadBytes += record.Payload.Length;
+                    storedBytes += envelope.Length;
                 }
                 finally
                 {
@@ -273,12 +301,123 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
                 }
             }
             await transaction.CommitAsync(cancellationToken);
+            writeLockHold.Stop();
+            return new ProtectedSetReplacement(
+                deleted, deletedBytes, written, payloadBytes, storedBytes, writeLockHold.Elapsed);
         }
         catch
         {
             await transaction.RollbackAsync(CancellationToken.None);
             throw;
         }
+    }
+
+    /// <summary>
+    /// One grouped pass for composition plus one indexed count for the backlog. The grouped pass
+    /// is a full table scan -- SQLite answers <c>length(blob)</c> from the row header without
+    /// loading overflow pages, but it still visits every row -- so this belongs on a periodic
+    /// cadence, not in a request. The backlog count seeks
+    /// <c>idx_protected_records_resolution_captured_at</c> and matches
+    /// <see cref="PruneExpiredAsync"/>'s predicate exactly, so the two cannot drift.
+    /// </summary>
+    public async Task<ProtectedStorageUsage> MeasureUsageAsync(CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        var kinds = new List<ProtectedRecordKindUsage>();
+        var recordCount = 0L;
+        var storedBytes = 0L;
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT record_kind, COUNT(*), COALESCE(SUM(length(envelope)), 0)
+                FROM protected_records
+                GROUP BY record_kind
+                ORDER BY 3 DESC, 1 ASC;
+                """;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var kindBytes = reader.GetInt64(2);
+                var kindCount = reader.GetInt64(1);
+                kinds.Add(new ProtectedRecordKindUsage(reader.GetString(0), kindCount, kindBytes));
+                recordCount += kindCount;
+                storedBytes += kindBytes;
+            }
+        }
+
+        var now = _timeProvider.GetUtcNow();
+        long expired;
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT COUNT(*) FROM protected_records
+                WHERE (resolution = 'Detail' AND captured_at_unix_ms < $detailCutoff)
+                   OR (resolution = 'HourlyRollup' AND captured_at_unix_ms < $rollupCutoff);
+                """;
+            command.Parameters.AddWithValue(
+                "$detailCutoff", now.Subtract(_retention.DetailRetention).ToUnixTimeMilliseconds());
+            command.Parameters.AddWithValue(
+                "$rollupCutoff", now.Subtract(_retention.HourlyRollupRetention).ToUnixTimeMilliseconds());
+            expired = Convert.ToInt64(
+                await command.ExecuteScalarAsync(cancellationToken),
+                System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        return new ProtectedStorageUsage(recordCount, storedBytes, MeasureOnDiskBytes(), expired, kinds);
+    }
+
+    /// <summary>
+    /// The database file plus its write-ahead log and shared-memory index. WAL is counted because
+    /// it is disk an operator has actually lost until a checkpoint, and a store written in large
+    /// transactions can carry a WAL comparable to the database itself.
+    /// </summary>
+    private long MeasureOnDiskBytes()
+    {
+        var total = 0L;
+        foreach (var suffix in new[] { "", "-wal", "-shm" })
+        {
+            var info = new FileInfo(_databasePath + suffix);
+            // Racing a checkpoint that removes the WAL is normal, not an error worth failing on.
+            if (info.Exists) total += info.Length;
+        }
+        return total;
+    }
+
+    public async Task<IReadOnlyList<ProtectedRecordId>> ListOldestAsync(
+        IReadOnlyCollection<string> recordKinds,
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureInitialized();
+        ArgumentNullException.ThrowIfNull(recordKinds);
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        if (recordKinds.Count == 0) return [];
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        var parameterNames = new string[recordKinds.Count];
+        var index = 0;
+        foreach (var kind in recordKinds)
+        {
+            parameterNames[index] = $"$kind{index}";
+            command.Parameters.AddWithValue(parameterNames[index], kind);
+            index++;
+        }
+
+        // Ordered by id as well so the sequence is total: a batch of records captured in the same
+        // millisecond -- which every record of one hydrated plan is -- must not be returned in a
+        // different order on each call, or repeated eviction passes would make no progress.
+        command.CommandText =
+            $"SELECT id FROM protected_records WHERE record_kind IN ({string.Join(",", parameterNames)}) " +
+            "ORDER BY captured_at_unix_ms ASC, id ASC LIMIT $limit;";
+        command.Parameters.AddWithValue("$limit", limit);
+        var ids = new List<ProtectedRecordId>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            ids.Add(new ProtectedRecordId(reader.GetString(0)));
+        return ids;
     }
 
     public async Task<int> PruneExpiredAsync(CancellationToken cancellationToken = default)

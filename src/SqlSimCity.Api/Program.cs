@@ -142,6 +142,9 @@ if (acquisitionMode == AcquisitionMode.Fixture && atlasConnected)
         builder.Services.AddSingleton<QueryStoreCollectionStatusTracker>();
         builder.Services.AddSingleton<SecureShowplanParser>();
         builder.Services.AddSingleton<ProtectedQueryStoreHistorySink>();
+        builder.Services.AddSingleton(
+            QueryStoreHistoryConfiguration.BuildPlanCacheOptions(builder.Configuration));
+        builder.Services.AddSingleton<QueryStoreStorageTelemetry>();
         builder.Services.AddSingleton<IQueryStoreHistorySink>(services =>
             services.GetRequiredService<ProtectedQueryStoreHistorySink>());
         builder.Services.AddSingleton<IncrementalQueryStoreCollector>();

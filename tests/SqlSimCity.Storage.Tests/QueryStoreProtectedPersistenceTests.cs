@@ -235,10 +235,16 @@ public sealed class QueryStoreProtectedPersistenceTests
         public Task<bool> DeleteAsync(
             ProtectedRecordId id, CancellationToken cancellationToken = default) =>
             inner.DeleteAsync(id, cancellationToken);
-        public Task ReplaceSetAsync(
+        public Task<ProtectedSetReplacement> ReplaceSetAsync(
             string idPrefix, IEnumerable<ProtectedRecordWrite> records,
             CancellationToken cancellationToken = default) =>
             inner.ReplaceSetAsync(idPrefix, records, cancellationToken);
+        public Task<ProtectedStorageUsage> MeasureUsageAsync(CancellationToken cancellationToken = default) =>
+            inner.MeasureUsageAsync(cancellationToken);
+        public Task<IReadOnlyList<ProtectedRecordId>> ListOldestAsync(
+            IReadOnlyCollection<string> recordKinds, int limit,
+            CancellationToken cancellationToken = default) =>
+            inner.ListOldestAsync(recordKinds, limit, cancellationToken);
         public Task<int> PruneExpiredAsync(CancellationToken cancellationToken = default) =>
             inner.PruneExpiredAsync(cancellationToken);
     }

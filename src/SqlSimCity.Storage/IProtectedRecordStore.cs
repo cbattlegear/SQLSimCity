@@ -41,11 +41,31 @@ public interface IProtectedRecordStore
 
     /// <summary>
     /// Atomically replaces every record whose opaque id starts with <paramref name="idPrefix"/>.
-    /// The replacement sequence is consumed inside one storage transaction.
+    /// The replacement sequence is consumed inside one storage transaction. Returns what the
+    /// replacement cost, because the caller hands over a lazy sequence and cannot otherwise
+    /// know how much was written or how long writers were held out.
     /// </summary>
-    Task ReplaceSetAsync(
+    Task<ProtectedSetReplacement> ReplaceSetAsync(
         string idPrefix,
         IEnumerable<ProtectedRecordWrite> records,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Reports retained size, per-kind composition and the prune backlog. Intended for periodic
+    /// operator telemetry rather than per-request use: an implementation may have to walk every
+    /// retained record to answer it.
+    /// </summary>
+    Task<ProtectedStorageUsage> MeasureUsageAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Ids of the oldest retained records among <paramref name="recordKinds"/>, oldest captured
+    /// first, at most <paramref name="limit"/> of them. Deliberately returns ids rather than
+    /// deleting: only the caller knows which ids belong to the same logical object, and evicting
+    /// half of a chunked one would leave a manifest pointing at chunks that are gone.
+    /// </summary>
+    Task<IReadOnlyList<ProtectedRecordId>> ListOldestAsync(
+        IReadOnlyCollection<string> recordKinds,
+        int limit,
         CancellationToken cancellationToken = default);
 
     /// <summary>

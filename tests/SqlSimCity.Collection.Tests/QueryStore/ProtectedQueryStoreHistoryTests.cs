@@ -468,7 +468,7 @@ public sealed class ProtectedQueryStoreHistoryTests
             ProtectedRecordId id, CancellationToken cancellationToken = default) =>
             Task.FromResult(Records.Remove(id.Value));
 
-        public Task ReplaceSetAsync(
+        public Task<ProtectedSetReplacement> ReplaceSetAsync(
             string idPrefix, IEnumerable<ProtectedRecordWrite> records,
             CancellationToken cancellationToken = default)
         {
@@ -478,13 +478,29 @@ public sealed class ProtectedQueryStoreHistoryTests
                     ? record.Payload.ToArray()
                     : throw new ArgumentException(
                         $"Payload must be {MaxPayloadBytes} bytes or fewer.", nameof(records)))).ToArray();
+            var deleted = 0;
+            var deletedBytes = 0L;
             foreach (var key in Records.Keys.Where(key =>
                          key.StartsWith(idPrefix, StringComparison.Ordinal)).ToArray())
+            {
+                deletedBytes += Records[key].Payload.Length;
                 Records.Remove(key);
+                deleted++;
+            }
             foreach (var record in replacement)
                 Records[record.Id.Value] = record;
-            return Task.CompletedTask;
+            var bytes = replacement.Sum(record => (long)record.Payload.Length);
+            return Task.FromResult(new ProtectedSetReplacement(
+                deleted, deletedBytes, replacement.Length, bytes, bytes, TimeSpan.Zero));
         }
+
+        public Task<IReadOnlyList<ProtectedRecordId>> ListOldestAsync(
+            IReadOnlyCollection<string> recordKinds, int limit,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(InMemoryUsage.ListOldest(Records, recordKinds, limit));
+
+        public Task<ProtectedStorageUsage> MeasureUsageAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(InMemoryUsage.Measure(Records.Values));
 
         public Task<int> PruneExpiredAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(0);

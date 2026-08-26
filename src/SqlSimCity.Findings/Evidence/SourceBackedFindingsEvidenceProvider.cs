@@ -13,6 +13,24 @@ namespace SqlSimCity.Findings.Evidence;
 /// Showplans. It therefore stays bounded even against a 100k-family target, and it never opens its own
 /// SQL connection -- it consumes whatever the already-wired sources return.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Bounded is not the same as cheap. Measured against a seeded instance (79 families, 79 plans), one
+/// assembly costs 351 ms, of which 337 ms is the per-candidate <c>GetFamilyAsync</c> and
+/// <c>GetPlanAsync</c> point reads of the protected store; the rules that consume the result cost
+/// 1.7 ms. Every findings route paid that on every request, including <c>/findings/status</c>, which
+/// returns only a status document. So the Query Store half of the bundle is cached against the
+/// generation it came from -- see <see cref="QueryStoreEvidence"/> -- which takes the same assembly
+/// to 3.3 ms, essentially the one status read needed to establish the key.
+/// </para>
+/// <para>
+/// Only that half. Atlas, capabilities, live incidents, and the clock are re-read on every call
+/// because they are in-memory reads that cost nothing (measured: 0.4 ms to serve the whole atlas)
+/// and because live evidence advances every 2-5 seconds. Caching the whole bundle on a key that
+/// included the live sequence would invalidate constantly and cache nothing; caching it on a key that
+/// did not would serve findings derived from live evidence that has since changed.
+/// </para>
+/// </remarks>
 public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProvider
 {
     private const int FamiliesPerMetricPage = 50;
@@ -23,6 +41,10 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
     private readonly Func<LiveIncidentSnapshotV1?> _liveSnapshot;
     private readonly TimeProvider _timeProvider;
     private readonly FindingsEvidenceOptions _options;
+    private readonly Lock _assembly = new();
+
+    private QueryStoreEvidence? _cached;
+    private (QueryStoreGeneration Generation, Task<QueryStoreEvidence> Task)? _inFlight;
 
     public SourceBackedFindingsEvidenceProvider(
         IAtlasSnapshotSource atlas,
@@ -43,12 +65,96 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
 
     public async Task<FindingsEvidenceBundle> GetBundleAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var generatedAt = _timeProvider.GetUtcNow();
         var atlas = _atlas.GetCurrent();
         var capabilities = SafeCapabilities();
         var live = _liveSnapshot();
         var status = await _queryStore.GetStatusAsync(cancellationToken).ConfigureAwait(false);
 
+        var queryStore = await GetQueryStoreEvidenceAsync(
+            QueryStoreGeneration.Of(status), cancellationToken).ConfigureAwait(false);
+
+        return new FindingsEvidenceBundle(
+            atlas.Target.TargetId,
+            atlas.Target.DisplayName,
+            generatedAt,
+            capabilities,
+            atlas,
+            live,
+            status,
+            queryStore.Families,
+            queryStore.Plans,
+            queryStore.Reason);
+    }
+
+    /// <summary>
+    /// The Query Store half of one bundle, together with the published generation it was read from.
+    /// It is a pure function of that generation, so it is safe to reuse for as long as the generation
+    /// stands and must be discarded the moment it moves.
+    /// </summary>
+    private sealed record QueryStoreEvidence(
+        QueryStoreGeneration Generation,
+        IReadOnlyList<QueryFamilyDetailV1> Families,
+        IReadOnlyList<NormalizedShowplanV1> Plans,
+        string Reason);
+
+    /// <summary>
+    /// Identifies one published Query Store snapshot. <see cref="QueryStoreCollectorStatusV1.Sequence"/>
+    /// is incremented once per atomic publish and <see cref="QueryStoreCollectorStatusV1.LastPublishedAt"/>
+    /// is stamped by the same publish, so together they change exactly when the families and plans behind
+    /// them change -- including across a restart that rebuilt the store from scratch and restarted the
+    /// counter. Deliberately excluded: <see cref="QueryStoreCollectorStatusV1.State"/>, which moves to
+    /// <c>Collecting</c> and back on every cycle while the published content stands still, and would
+    /// throw the cache away for no reason.
+    /// </summary>
+    private readonly record struct QueryStoreGeneration(long Sequence, DateTimeOffset? LastPublishedAt)
+    {
+        public static QueryStoreGeneration Of(QueryStoreCollectorStatusV1 status) =>
+            new(status.Sequence, status.LastPublishedAt);
+    }
+
+    private Task<QueryStoreEvidence> GetQueryStoreEvidenceAsync(
+        QueryStoreGeneration generation, CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _cached) is { } hit && hit.Generation == generation)
+            return Task.FromResult(hit);
+
+        Task<QueryStoreEvidence> assembly;
+        lock (_assembly)
+        {
+            if (Volatile.Read(ref _cached) is { } filled && filled.Generation == generation)
+                return Task.FromResult(filled);
+
+            // Single-flight. A cold cache under concurrent requests assembles once and every caller
+            // waits on that one assembly, rather than each paying the full cost against the same
+            // store. The assembly itself runs uncancellable so that one caller giving up cannot
+            // cancel the work the others are waiting on; each caller abandons its own wait below,
+            // which also means a client that connects and disconnects repeatedly still leaves a
+            // populated cache behind instead of restarting the work every time. Only an assembly
+            // still in flight is shared: once one finishes, either it retained its result and the
+            // fast path above serves it, or it straddled a publish and must not be handed out again.
+            assembly = _inFlight is { } running &&
+                running.Generation == generation && !running.Task.IsCompleted
+                ? running.Task
+                : StartAssembly(generation);
+        }
+
+        return assembly.WaitAsync(cancellationToken);
+    }
+
+    private Task<QueryStoreEvidence> StartAssembly(QueryStoreGeneration generation)
+    {
+        // Off the lock deliberately. The connected source reads SQLite, whose async surface completes
+        // synchronously, so an inline assembly would hold this lock for the whole 400 ms.
+        var assembly = Task.Run(() => AssembleAsync(generation, CancellationToken.None));
+        _inFlight = (generation, assembly);
+        return assembly;
+    }
+
+    private async Task<QueryStoreEvidence> AssembleAsync(
+        QueryStoreGeneration generation, CancellationToken cancellationToken)
+    {
         var familyIds = await SelectTopFamilyIdsAsync(cancellationToken).ConfigureAwait(false);
         var families = new List<QueryFamilyDetailV1>(familyIds.Count);
         foreach (var familyId in familyIds)
@@ -73,17 +179,19 @@ public sealed class SourceBackedFindingsEvidenceProvider : IFindingsEvidenceProv
                 (plans.Skipped.Count > 3 ? "; …" : string.Empty);
         }
 
-        return new FindingsEvidenceBundle(
-            atlas.Target.TargetId,
-            atlas.Target.DisplayName,
-            generatedAt,
-            capabilities,
-            atlas,
-            live,
-            status,
-            families,
-            plans.Plans,
-            reason);
+        var evidence = new QueryStoreEvidence(generation, families, plans.Plans, reason);
+
+        // Families and plans are read one at a time, so a publish part-way through leaves an
+        // assembly that straddles two snapshots. That result is returned -- it is exactly what this
+        // provider has always returned, and the caller sees the status it was assembled against --
+        // but it is never retained, because it does not describe any single generation and would
+        // then be served as though it did.
+        var after = QueryStoreGeneration.Of(
+            await _queryStore.GetStatusAsync(cancellationToken).ConfigureAwait(false));
+        if (after == generation)
+            Volatile.Write(ref _cached, evidence);
+
+        return evidence;
     }
 
     private CapabilitiesSnapshotV1? SafeCapabilities()

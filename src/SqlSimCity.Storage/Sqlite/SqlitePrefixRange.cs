@@ -30,6 +30,14 @@ internal static class SqlitePrefixRange
     private const string ExactSql =
         "DELETE FROM protected_records WHERE substr(id, 1, $length) = $prefix;";
 
+    private const string RangeSizeSql =
+        "SELECT COUNT(*), COALESCE(SUM(length(envelope)), 0) FROM protected_records " +
+        "WHERE id >= $prefix AND id < $upperBound;";
+
+    private const string ExactSizeSql =
+        "SELECT COUNT(*), COALESCE(SUM(length(envelope)), 0) FROM protected_records " +
+        "WHERE substr(id, 1, $length) = $prefix;";
+
     /// <summary>
     /// Points <paramref name="command"/> at the narrowest delete that still matches exactly
     /// the ids starting with <paramref name="idPrefix"/>, and reports whether that was the
@@ -39,18 +47,38 @@ internal static class SqlitePrefixRange
     public static bool ConfigureDelete(
         SqliteCommand command,
         string idPrefix,
-        bool databaseEncodingIsUtf8)
+        bool databaseEncodingIsUtf8) =>
+        Configure(command, idPrefix, databaseEncodingIsUtf8, RangeSql, ExactSql);
+
+    /// <summary>
+    /// Points <paramref name="command"/> at the count and byte total for the same rows
+    /// <see cref="ConfigureDelete"/> would remove. It shares the predicate rather than restating
+    /// it, so a measured replacement cost cannot describe a different set of rows than the one
+    /// that was actually replaced.
+    /// </summary>
+    public static bool ConfigureSize(
+        SqliteCommand command,
+        string idPrefix,
+        bool databaseEncodingIsUtf8) =>
+        Configure(command, idPrefix, databaseEncodingIsUtf8, RangeSizeSql, ExactSizeSql);
+
+    private static bool Configure(
+        SqliteCommand command,
+        string idPrefix,
+        bool databaseEncodingIsUtf8,
+        string rangeSql,
+        string exactSql)
     {
         ArgumentNullException.ThrowIfNull(command);
         if (TryGetExclusiveUpperBound(idPrefix, databaseEncodingIsUtf8, out var upperBound))
         {
-            command.CommandText = RangeSql;
+            command.CommandText = rangeSql;
             command.Parameters.AddWithValue("$prefix", idPrefix);
             command.Parameters.AddWithValue("$upperBound", upperBound);
             return true;
         }
 
-        command.CommandText = ExactSql;
+        command.CommandText = exactSql;
         command.Parameters.AddWithValue("$length", idPrefix.Length);
         command.Parameters.AddWithValue("$prefix", idPrefix);
         return false;
