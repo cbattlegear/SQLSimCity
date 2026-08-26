@@ -223,7 +223,22 @@ function AtlasLevel({
   const sidebar = (
     <>
       <SidebarHeader
-        brand={<div className="sidebar-brand"><span className="sidebar-mark" aria-hidden="true" />SQLSimCity</div>}
+        brand={
+          <div className="sidebar-brand">
+            <span className="sidebar-mark" aria-hidden="true" />
+            <span className="sidebar-brand-name">SQLSimCity</span>
+            <a
+              className="sidebar-brand-link"
+              href="https://github.com/cbattlegear/SQLSimCity"
+              target="_blank"
+              rel="noreferrer noopener"
+              title="SQLSimCity on GitHub"
+            >
+              <span aria-hidden="true">↗</span>
+              <span className="visually-hidden">SQLSimCity on GitHub (opens in a new tab)</span>
+            </a>
+          </div>
+        }
         title={snapshot?.target.displayName ?? 'Server atlas'}
         subtitle={snapshot ? `${snapshot.target.platform} · ${snapshot.databases.length} databases` : 'Loading…'}
       />

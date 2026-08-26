@@ -49,6 +49,32 @@
   letter-spacing: -0.01em;
 }
 
+/*
+ * The source link sits with the wordmark rather than in a footer, because "what is this thing"
+ * and "where did it come from" are the same question and this is the only place the product
+ * names itself. `margin-right: auto` on the name keeps the link at the far edge of the rail
+ * instead of tucked against the wordmark, so it reads as a separate affordance.
+ */
+.sidebar-brand-name { margin-right: auto; }
+
+.sidebar-brand-link {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  color: #6f8698;
+  font-size: 0.72rem;
+  text-decoration: none;
+}
+
+.sidebar-brand-link:hover,
+.sidebar-brand-link:focus-visible {
+  color: #8be7ce;
+  background: #0f2620;
+}
+
 .sidebar-brand .brand-mark,
 .sidebar-brand .sidebar-mark {
   width: 20px;
@@ -331,14 +357,23 @@
  * The place card sits above the address list rather than replacing it, so the thing you selected and
  * the list you selected it from stay on screen together.
  *
- * The 46vh cap lives on the wrapper rather than the card inside it, so the wrapper can also *shrink*
- * below that cap. A fixed 46vh here is taller than the whole 42%-viewport bottom sheet at <=860px,
- * which left nothing for the address list to occupy.
+ * It floors at `min(content, cap)` rather than shrinking freely, which is the same arrangement
+ * `.sidebar-drawer` uses and for the same reason. With `min-height: 0` the card was the only section
+ * that could give way, so it gave way entirely: shrink is distributed in proportion to flex-basis,
+ * and the address list's basis is its whole scroll height, so the list kept its space and the card
+ * lost nearly all of its own. Measured at 1440x900 with both drawers open, the card held 72px of
+ * 472px of content -- title, kind and nothing else -- with 414px of the selected object's measured
+ * evidence reachable only by scrolling a 72px window. At 1280x720 it was 47px.
+ *
+ * The cap is 34vh rather than 46vh because the card no longer shrinks. 46vh floors the card at 414px
+ * in a 900px rail, which together with the drawers' own 46vh budget overflows a column that is
+ * `overflow: hidden` -- 66px of it unreachable at 1440x900, 121px at 1280x720, which is the #63
+ * defect rebuilt one section over. 34vh floors it at 306px, which holds the title and the whole
+ * six-row evidence list at 1440x900, and leaves the rail whole.
  */
 .sidebar-place-card {
   flex: 0 1 auto;
-  min-height: 0;
-  max-height: 46vh;
+  max-height: 34vh;
   display: flex;
   flex-direction: column;
   padding: 12px 12px 0;
@@ -1195,6 +1230,31 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
 /* Only one drawer open: it may spend the budget less the other's collapsed summary (34.5px). */
 .sidebar-drawers:not(:has(> .sidebar-drawer[open] ~ .sidebar-drawer[open])) {
   --sidebar-drawer-cap: calc(var(--sidebar-drawer-budget) - 2.5rem);
+}
+
+/*
+ * An open place card takes its share of the column from the drawers, not from the address list.
+ *
+ * The card, the list and the drawers are three claims on one rail. The card now floors instead of
+ * shrinking (see `.sidebar-place-card`), so something else has to give, and the drawers are the
+ * right thing: "Legend & evidence" is reference material, while the card is the object the reader
+ * just asked for by name. Measured at 1440x900 with both drawers open, taking the card's floor out
+ * of the list instead left the list at 78px, and at 1280x720 it left it at 0px with 6px of the rail
+ * unreachable -- a column that does not overflow and is still useless. Yielding here instead holds
+ * the list at 231px and 141px.
+ *
+ * A modifier the markup sets rather than `.sidebar-place-card ~ .sidebar-drawers`, which would do
+ * the same job in CSS alone. That selector ends in `.sidebar-drawers`, and `ownRule()` in
+ * `mobileLayout.test.ts` matches a selector that merely *ends* in the one asked for and returns the
+ * last such rule -- so it silently retargeted every existing assertion about the base wrapper at
+ * this override. Weakening the helper to avoid that broke the descendant-scoped rules it is also
+ * there to find (`.sidebar-brand .sidebar-mark`). A class the component owns is cheaper than either.
+ *
+ * The drawers keep flooring at `min(content, cap)`, so each summary stays inside its share and
+ * clickable: measured 72px and 58px against a 35px summary.
+ */
+.sidebar-drawers.is-yielding {
+  --sidebar-drawer-budget: 16vh;
 }
 
 /*

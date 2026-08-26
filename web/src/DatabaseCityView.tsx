@@ -634,7 +634,22 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
   const sidebar = (
     <>
       <SidebarHeader
-        brand={<div className="sidebar-brand"><span className="sidebar-mark" aria-hidden="true" />SQLSimCity</div>}
+        brand={
+          <div className="sidebar-brand">
+            <span className="sidebar-mark" aria-hidden="true" />
+            <span className="sidebar-brand-name">SQLSimCity</span>
+            <a
+              className="sidebar-brand-link"
+              href="https://github.com/cbattlegear/SQLSimCity"
+              target="_blank"
+              rel="noreferrer noopener"
+              title="SQLSimCity on GitHub"
+            >
+              <span aria-hidden="true">↗</span>
+              <span className="visually-hidden">SQLSimCity on GitHub (opens in a new tab)</span>
+            </a>
+          </div>
+        }
         title={sidebarMode.title}
         subtitle={sidebarMode.subtitle}
         onBack={sidebarMode.clearsRoute ? clearRoute : onBack}
@@ -689,7 +704,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
                 * It has to be a real element: everything between here and `.map-sidebar` is a
                 * fragment, so without it both drawers are direct flex children of the rail.
                 */}
-              <div className="sidebar-drawers">
+              <div className={`sidebar-drawers${placeCard ? ' is-yielding' : ''}`}>
                 {planFinder}
                 {page && <LegendDrawer
                   page={page}
