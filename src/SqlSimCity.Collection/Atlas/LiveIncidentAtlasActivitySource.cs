@@ -62,6 +62,12 @@ public sealed class LiveIncidentAtlasActivitySource(
             request.Availability == SampleAvailability.Available &&
             string.Equals(request.DatabaseName, databaseName, StringComparison.OrdinalIgnoreCase)).ToArray();
         var activeSessions = requests.Select(request => request.SessionId).Distinct().Count();
+        // Live sampling deliberately asks for idle sessions (@IncludeIdleSessions = true), so this
+        // list mixes sessions that are running something with sessions that are merely connected.
+        // Only the former are running requests. A row's request status is passed through from
+        // sys.dm_exec_requests untouched, and that column is never NULL for a request that exists,
+        // so a NULL status is positive evidence of "no request" rather than an unreported state --
+        // which is what keeps an idle connection pool out of a concurrency figure (issue #79).
         var runningRequests = requests.Count(request => request.RequestStatus is not null);
         var blockedSessions = requests.Where(request =>
                 request.Blocking.BlockingSessionId is not (null or 0 or -5))

@@ -80,6 +80,11 @@ export interface LiveRequest {
   hostName: string | null
   programName: string | null
   sessionStatus: string | null
+  /**
+   * `sys.dm_exec_requests.status`, or null when the row is an idle session holding no request.
+   * Sampling includes idle sessions on purpose, so null here means "no request" rather than "a
+   * request in some unreported state" — do not count these rows as running requests (issue #79).
+   */
   requestStatus: string | null
   command: string | null
   waitType: string | null

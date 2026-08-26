@@ -25,6 +25,11 @@
 --   real, active request_id 0, which is an ordinary (not sentinel) value for a session's first or
 --   only concurrently executing request. The application layer must never coerce a NULL
 --   request_id into 0; see LiveIncidentCollector.MapActiveRequest.
+--   request_status is likewise NULL for an idle session, and sys.dm_exec_requests.status is never
+--   NULL for a request that exists, so a NULL request_status is positive evidence that the session
+--   has no request rather than a request whose state went unreported. The application layer must
+--   not substitute a synthetic status such as 'idle' for it: a consumer that counts rows with a
+--   non-null request_status as running requests would then count idle sessions as concurrency.
 --   database_id/database_name use the active request database when present and the session's
 --   current database for an idle row, allowing a per-database atlas to count idle sessions without
 --   assigning them to database zero or treating them as unknown.

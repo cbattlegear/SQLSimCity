@@ -157,6 +157,12 @@ public sealed record BlockingReferenceV1(long? BlockingSessionId, BlockingSentin
 /// <see cref="Availability"/>/<see cref="AvailabilityReason"/> record when a previously-seen
 /// request has disappeared between polling cycles (it completed or was killed) rather than
 /// silently omitting the row -- see requirement 6's short-lived-query disclosure.
+/// <para>
+/// Sampling includes idle sessions on purpose, so a row here is not necessarily a request. A row
+/// with a null <see cref="RequestStatus"/> is an idle session that holds no request at all, and is
+/// never a request whose state went unreported; see that member for why the distinction has to
+/// survive.
+/// </para>
 /// </summary>
 public sealed record LiveRequestV1(
     string RequestId,
@@ -165,6 +171,15 @@ public sealed record LiveRequestV1(
     string? HostName,
     string? ProgramName,
     string? SessionStatus,
+    /// <summary>
+    /// <c>sys.dm_exec_requests.status</c>, passed through verbatim, or null when this row is an idle
+    /// session with no request. That column is never null for a request that exists, so null here is
+    /// positive evidence of "no request" rather than "a request in some unreported state" -- which is
+    /// what lets a consumer count running requests without counting idle connections. Never
+    /// substitute a synthetic value such as "idle": doing so made every idle pooled connection read
+    /// as a running request in atlas activity (issue #79). Idleness remains readable from
+    /// <see cref="RequestId"/> (<c>req:&lt;session&gt;:idle</c>) and <see cref="SessionStatus"/>.
+    /// </summary>
     string? RequestStatus,
     string? Command,
     string? WaitType,

@@ -325,7 +325,11 @@ public class LiveIncidentCollectorTests
         var realZero = Assert.Single(snapshot.Requests, r => r.SessionId == 61);
 
         Assert.Equal("req:60:idle", idle.RequestId);
-        Assert.Equal("idle", idle.RequestStatus);
+        // An idle session holds no request, so it reports no request status. The row stays
+        // identifiable as idle through RequestId and SessionStatus without inventing a state the
+        // DMV never reported (issue #79).
+        Assert.Null(idle.RequestStatus);
+        Assert.Equal("sleeping", idle.SessionStatus);
         Assert.Equal("req:61:0", realZero.RequestId);
         Assert.Equal("running", realZero.RequestStatus);
         Assert.NotEqual(idle.RequestId, realZero.RequestId);

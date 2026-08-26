@@ -805,6 +805,57 @@ describe('regression: server.database_discovery on Azure SQL DB is nuanced, not 
     });
   });
 
+  // Issue #79. Sampling asks for idle sessions on purpose, so this probe returns rows that are not
+  // requests at all. request_status has to arrive NULL for them and stay NULL, because a consumer
+  // counting rows with a non-null status as running requests would otherwise report a mostly-idle
+  // connection pool as concurrency.
+  describe('regression: an idle session reports no request status', () => {
+    test('request_status is projected straight from the requests DMV, never coalesced to a literal', () => {
+      const source = stripSqlComments(readProbeSource(probeById('sessions.active_requests')));
+      assert.match(
+        source,
+        /\br\.status\s+AS\s+request_status/i,
+        'request_status must come directly from sys.dm_exec_requests.status so it is NULL for an ' +
+          'idle session that has no request row',
+      );
+      assert.doesNotMatch(
+        source,
+        /(?:COALESCE|ISNULL)\s*\([^)]*\br\.status\b[^)]*\)\s+AS\s+request_status/i,
+        'request_status must not be defaulted to a literal: substituting a synthetic status makes ' +
+          'an idle session indistinguishable from a request in some state (issue #79)',
+      );
+      assert.doesNotMatch(
+        source,
+        /'idle'\s+AS\s+request_status/i,
+        "the probe must never emit a synthetic 'idle' request status",
+      );
+    });
+
+    test('the idle session row is still kept by the WHERE clause when idle sessions are requested', () => {
+      const source = stripSqlComments(readProbeSource(probeById('sessions.active_requests')));
+      assert.match(
+        source,
+        /@IncludeIdleSessions\s*=\s*1\s+OR\s+r\.session_id\s+IS\s+NULL|@IncludeIdleSessions\s*=\s*1\s+OR\s+r\.session_id\s+IS\s+NOT\s+NULL/i,
+        'idle sessions must be included only when asked for, via the LEFT JOIN miss',
+      );
+    });
+
+    test('manifest result contract states that an idle row carries a NULL request_status', () => {
+      const probe = probeById('sessions.active_requests');
+      assert.match(
+        probe.resultContract,
+        /NULL\s+request_status/i,
+        'the published result contract must say an idle row has a NULL request_status, so a ' +
+          'consumer knows null means "no request" rather than "state unknown"',
+      );
+      assert.match(
+        probe.resultContract,
+        /synthetic status|must not be replaced/i,
+        'the result contract must forbid substituting a synthetic status for a NULL request_status',
+      );
+    });
+  });
+
   test('only the documented, platform-limited probes are flagged unsupported on Azure SQL Database', () => {
     // Azure-unsupported is legitimate only for probes that call a DMV/catalog view Microsoft's own
     // documentation does not list as available on Azure SQL Database (sys.master_files,

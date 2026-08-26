@@ -12,6 +12,8 @@ public sealed class LiveIncidentAtlasActivitySourceTests
     {
         var response = Response(
             [
+                // An idle session: no request, so no request status. It is a live session and
+                // counts toward ActiveSessions, but contributes no running request (issue #79).
                 Request(1, "AppDb", requestStatus: null, blocker: null),
                 Request(2, "AppDb", requestStatus: "running", blocker: 9),
                 Request(3, "AppDb", requestStatus: "suspended", blocker: -5),

@@ -540,7 +540,7 @@
         }
       ],
       "resultSets": 1,
-      "resultContract": "Zero or more rows, one per (session_id, request_id). Idle rows have NULL request_id and use the session's current database_id/name; active rows use the request database. With @IncludeSqlText=1 current_statement_text is the offset-resolved executing statement and batch_text is the submitted batch; with 0 both are NULL and sys.dm_exec_sql_text is not invoked. No plan XML is fetched.",
+      "resultContract": "Zero or more rows, one per (session_id, request_id). Idle rows have NULL request_id and NULL request_status, and use the session's current database_id/name; active rows use the request database. sys.dm_exec_requests.status is never NULL for a request that exists, so a NULL request_status means the session has no request and must not be replaced with a synthetic status. With @IncludeSqlText=1 current_statement_text is the offset-resolved executing statement and batch_text is the submitted batch; with 0 both are NULL and sys.dm_exec_sql_text is not invoked. No plan XML is fetched.",
       "relativeCost": "low"
     },
     {

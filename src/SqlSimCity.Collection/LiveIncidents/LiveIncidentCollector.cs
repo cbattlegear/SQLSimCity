@@ -292,7 +292,16 @@ public sealed class LiveIncidentCollector : ILiveIncidentCollector
         HostName: row.HostName,
         ProgramName: row.ProgramName,
         SessionStatus: row.SessionStatus,
-        RequestStatus: row.RequestId is null ? "idle" : row.RequestStatus,
+        // Passed through verbatim, never synthesized. An idle session arrives from the probe's LEFT
+        // JOIN with every sys.dm_exec_requests column NULL, and sys.dm_exec_requests.status is never
+        // NULL for a request that exists -- so a NULL here means "this session has no request", not
+        // "a request whose state went unreported". Substituting a made-up status such as "idle" made
+        // an idle session read as a request in some state, and atlas activity counted every row with
+        // a non-null status as a running request, so a mostly-idle connection pool inflated the
+        // concurrency figure one-for-one (issue #79). Idleness stays fully recoverable without
+        // inventing anything: RequestId is req:<session>:idle above, and SessionStatus carries the
+        // session's own DMV status.
+        RequestStatus: row.RequestStatus,
         Command: row.Command,
         WaitType: row.WaitType,
         WaitTimeMs: row.WaitTimeMs,
