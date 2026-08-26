@@ -247,6 +247,25 @@ Wait for the release to appear before merging the next one. If several pull requ
 class the collapse is harmless — the version lands in the right place either way — but confirm that
 before relying on it, rather than after.
 
+#### Merge the release-bearing pull request last
+
+Ordering makes the wait unnecessary, which is worth having when the wait is the part that gets
+skipped. The version job reads labels off the merged pull request for the head SHA of the run that
+*completed*, and it tests `release:skip` first — that branch calls `no_release` and wins outright
+over any bump. So the two collapse cases are not symmetric.
+
+Merge a `release:skip` before a bump and the collapse costs nothing: the skip run is the one
+cancelled, and it was never going to cut anything. The bump's run then reaches the release job and
+tags a commit that already contains the skipped work.
+
+Merge them the other way round and the collapse is worse than #85/#86. There the bump run is
+cancelled and the *skip* run reaches the release job, which cuts **nothing at all** — no tag, no
+release, and the bump's change ships silently inside whatever release comes along later. #85/#86 at
+least produced a version, merely understated.
+
+So when pull requests are ready together, merge every `release:skip` first and the release-bearing
+one last. Between two bumps there is no safe order, only the wait.
+
 ## Scratch files
 
 One-off probe pages and ad-hoc measurement scaffolding do not get committed. Delete them and
