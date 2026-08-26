@@ -274,3 +274,49 @@ describe('searchAddressBook', () => {
     expect(groupOf('', 'facility').map(entry => entry.targetId)).toEqual([...FACILITY_ORDER])
   })
 })
+
+/*
+ * Where the ordering lives.
+ *
+ * The order within a group never depends on the search term, so it is established once when the
+ * book is built and carried through by `filter`, which is stable. These two tests pin the halves of
+ * that contract from opposite sides: the book comes out ordered, and the search does not re-order.
+ * Together they are what stops the comparator being moved back into the typing path.
+ */
+describe('where the address book is ordered', () => {
+  // Deliberately not in rank order, so an implementation that returns the input untouched fails.
+  const unsorted = [
+    object('object:dbo:1', 'schema:dbo', 'Small', 0, 0, '10'),
+    object('object:dbo:2', 'schema:dbo', 'Largest', 0, 1, '9000'),
+    object('object:dbo:3', 'schema:dbo', 'Middling', 0, 2, '500'),
+  ]
+  const unsortedFamilies = [
+    family('family:cheap', '0x111111', [], '10'),
+    family('family:dear', '0x222222', [], '99000'),
+  ]
+
+  it('hands back a book that is already in order, so searching never has to sort', () => {
+    const plan = planCity(unsorted, {
+      seed: 'db:order',
+      totalObjects: '3',
+      schemas: [{ schemaId: 'schema:dbo', name: 'dbo', neighborhoodOrdinal: 0, objectCount: '3', evidence }],
+    })
+    const built = buildAddressBook(unsorted, unsortedFamilies, facilities, plan)
+
+    expect(built.filter(entry => entry.kind === 'table').map(entry => entry.name))
+      .toEqual(['dbo.Largest', 'dbo.Middling', 'dbo.Small'])
+    expect(built.filter(entry => entry.kind === 'query').map(entry => entry.targetId))
+      .toEqual(['family:dear', 'family:cheap'])
+    expect(built.filter(entry => entry.kind === 'facility').map(entry => entry.targetId))
+      .toEqual([...FACILITY_ORDER])
+  })
+
+  it('preserves the order it was given rather than sorting on every keystroke', () => {
+    const plan = samplePlan()
+    // Reversed on the way in. A search that sorts would put Customer back on top; one that only
+    // filters must hand back exactly the order it received.
+    const reversed = [...buildAddressBook(objects, families, facilities, plan)].reverse()
+    const tables = searchAddressBook(reversed, 'dbo').find(group => group.kind === 'table')?.entries ?? []
+    expect(tables.map(entry => entry.name)).toEqual(['dbo.Orders', 'dbo.Customer'])
+  })
+})

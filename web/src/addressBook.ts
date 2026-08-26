@@ -153,6 +153,16 @@ function facilityEntry(facility: Facility, plan: CityPlan, index: number): Addre
   }
 }
 
+/**
+ * Orders one kind's entries: measurement first, then name.
+ *
+ * Kept next to `buildAddressBook`, which applies it once, rather than inside the search — see the
+ * note on `searchAddressBook` for why the order is established at build time.
+ */
+function byRankThenName(left: AddressEntry, right: AddressEntry): number {
+  return right.rank - left.rank || left.name.localeCompare(right.name)
+}
+
 export function buildAddressBook(
   objects: readonly DatabaseCityObject[],
   families: readonly DatabaseCityQueryFamily[],
@@ -160,10 +170,20 @@ export function buildAddressBook(
   plan: CityPlan,
 ): AddressEntry[] {
   const objectNames = new Map(objects.map(object => [object.objectId, `${object.schemaName}.${object.name}`]))
+  /*
+   * Sorted here, once, rather than on every keystroke.
+   *
+   * The order within a group never depends on the search term, so establishing it when the book is
+   * built and letting `filter` — which is stable — carry it through is exactly equivalent to sorting
+   * the survivors, and it takes the comparator out of the typing path. Each kind is sorted on its
+   * own because the three ranks are three different quantities: reserved pages, CPU microseconds and
+   * a fixed landmark order are not comparable with one another, and only ever get compared with
+   * their own kind.
+   */
   return [
-    ...families.map(family => queryEntry(family, objectNames)),
-    ...objects.map(object => objectEntry(object, plan)),
-    ...facilities.map((facility, index) => facilityEntry(facility, plan, index)),
+    ...families.map(family => queryEntry(family, objectNames)).sort(byRankThenName),
+    ...objects.map(object => objectEntry(object, plan)).sort(byRankThenName),
+    ...facilities.map((facility, index) => facilityEntry(facility, plan, index)).sort(byRankThenName),
   ]
 }
 
@@ -173,11 +193,17 @@ export function buildAddressBook(
  * Matching is a simple case-insensitive substring over each entry's own haystack — every token in
  * the term must appear somewhere, so "orders cpu" narrows rather than widens. Empty groups are
  * dropped so a search never shows a heading with nothing under it.
+ *
+ * The entries arrive already ordered from `buildAddressBook`, and `filter` preserves relative order,
+ * so nothing is sorted here. Measured over a 4,200-object city the sort was 93% of this function's
+ * cost — and this whole function was 1.4 ms of a 635 ms keystroke, so removing it is a tidiness win
+ * and not a fix for anything a user can feel. What that keystroke actually costs is re-rendering
+ * the 4,018 entries this returns; see `tools/measure-browser`.
  */
 export function searchAddressBook(entries: readonly AddressEntry[], term: string): AddressGroup[] {
   const tokens = term.toLowerCase().split(/\s+/).filter(token => token !== '')
   const matched = tokens.length === 0
-    ? [...entries]
+    ? entries
     : entries.filter(entry => tokens.every(token => entry.searchText.includes(token)))
 
   const order: AddressKind[] = ['query', 'table', 'facility']
@@ -185,9 +211,7 @@ export function searchAddressBook(entries: readonly AddressEntry[], term: string
     .map(kind => ({
       kind,
       label: GROUP_LABELS[kind],
-      entries: matched
-        .filter(entry => entry.kind === kind)
-        .sort((left, right) => right.rank - left.rank || left.name.localeCompare(right.name)),
+      entries: matched.filter(entry => entry.kind === kind),
     }))
     .filter(group => group.entries.length > 0)
 }

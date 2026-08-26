@@ -1,0 +1,14 @@
+{
+  "name": "sqlsimcity-measure-browser",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Browser measurement workbench: frame cost, draw calls and interaction latency for a large city. Not part of the shipped app and not run in CI.",
+  "scripts": {
+    "measure": "node measure.js",
+    "install-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "^1.58.0"
+  }
+}

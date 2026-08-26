@@ -243,6 +243,24 @@ export function createDatabaseCityScene(
   // casts nothing.
   renderer.shadowMap.enabled = true
   renderer.shadowMap.type = THREE.PCFSoftShadowMap
+  /*
+   * The shadow map is regenerated when something that casts into it changes, not every frame.
+   *
+   * A directional sun's shadow map is a function of the casters and the light, and of neither the
+   * camera nor the canvas. Left on `autoUpdate`, three.js redraws all 948 casters into a 2048²
+   * depth target on every frame — and a damped orbit is dozens of frames in a row in which nothing
+   * casting has moved. Measured over a 4,200-object city that pass is 7.6 ms of a 138 ms frame and
+   * 948 of 22,406 draw calls; see `tools/measure-browser`.
+   *
+   * The danger in this switch is a missed invalidation, which shows as shadows that quietly belong
+   * to a city that is no longer on screen — worse than the cost it saves. So the default is
+   * inverted: `requestRender()` invalidates unless a caller explicitly says the camera alone moved.
+   * Every scene mutation already funnels through `requestRender()`, so a new one is covered by
+   * construction, and the failure mode of forgetting is an extra shadow pass — exactly the
+   * behaviour this replaces — rather than a stale one.
+   */
+  renderer.shadowMap.autoUpdate = false
+  renderer.shadowMap.needsUpdate = true
 
   const reducedMotion =
     typeof window.matchMedia === 'function' &&
@@ -941,7 +959,8 @@ export function createDatabaseCityScene(
     // lens's ceiling — which is exactly what pinned map mode at a fixed, far-too-close zoom.
     applyZoomRange()
     controls.update()
-    requestRender()
+    // Only the camera and the lens moved; the sun and every caster stayed put.
+    requestCameraRender()
   }
 
   // One group per layer keeps toggling a layer O(1) and avoids rebuilding the scene graph.
@@ -1164,13 +1183,32 @@ export function createDatabaseCityScene(
   }
 
   // Rendering is on demand; a frame loop runs only while damping is still settling the camera.
-  const requestRender = () => {
+  const scheduleFrame = () => {
     if (disposed || renderRequested) return
     renderRequested = true
     requestAnimationFrame(() => {
       renderRequested = false
       if (!disposed) draw()
     })
+  }
+
+  const requestRender = () => {
+    // Anything that asks for a frame through this path may have changed what casts, so the shadow
+    // map is marked stale. Camera-only movement uses `requestCameraRender()` and skips it.
+    renderer.shadowMap.needsUpdate = true
+    scheduleFrame()
+  }
+
+  /**
+   * A frame in which only the camera moved.
+   *
+   * A directional light's shadow map is drawn from the light, so panning, orbiting, zooming,
+   * framing and resizing cannot change a single texel of it. These are the only call sites allowed
+   * to skip invalidation, and they are allowed to because the sun did not move and neither did
+   * anything under it.
+   */
+  const requestCameraRender = () => {
+    scheduleFrame()
   }
 
   const runDampingLoop = () => {
@@ -1187,7 +1225,7 @@ export function createDatabaseCityScene(
   controls.addEventListener('change', () => {
     options.onCameraChange?.()
     if (controls.enableDamping) runDampingLoop()
-    else requestRender()
+    else requestCameraRender()
   })
 
   /*
@@ -2265,7 +2303,8 @@ export function createDatabaseCityScene(
     camera.position.copy(controls.target).addScaledVector(direction, distance)
     setDepthRange(distance)
     controls.update()
-    requestRender()
+    // Framing moves the camera only. Callers that also rebuilt the scene ask for their own frame.
+    requestCameraRender()
   }
 
   const cityBox = () => {
@@ -2368,7 +2407,9 @@ export function createDatabaseCityScene(
   // A narrower viewport needs more distance to hold the same city, so the far stop moves with it.
   const resize = new ResizeObserver(() => {
     applyZoomRange()
-    requestRender()
+    // The shadow map is drawn from the sun into its own 2048² target, so the canvas resizing
+    // cannot change a texel of it.
+    requestCameraRender()
   })
   resize.observe(canvas)
   /*
@@ -2532,7 +2573,7 @@ export function createDatabaseCityScene(
       controls.target.set(lot.x, 0, lot.z)
       camera.position.copy(controls.target).add(offset)
       controls.update()
-      requestRender()
+      requestCameraRender()
     },
     nudge(action) {
       const forward = new THREE.Vector3()
@@ -2565,7 +2606,7 @@ export function createDatabaseCityScene(
           )
           camera.position.copy(controls.target).add(offset.setLength(length))
           controls.update()
-          requestRender()
+          requestCameraRender()
           return
         }
         case 'rotateLeft':
@@ -2574,14 +2615,15 @@ export function createDatabaseCityScene(
           offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), (action === 'rotateLeft' ? 1 : -1) * (Math.PI / 12))
           camera.position.copy(controls.target).add(offset)
           controls.update()
-          requestRender()
+          requestCameraRender()
           return
         }
       }
       camera.position.add(move)
       controls.target.add(move)
       controls.update()
-      requestRender()
+      // Every arm of `nudge` moves the camera and nothing else.
+      requestCameraRender()
     },
     heading() {
       const forward = new THREE.Vector3()
