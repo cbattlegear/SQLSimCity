@@ -728,7 +728,27 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
 .hud-note.is-error { color: #f2b3ad; border-color: #7a3b34; }
 
 .hud-layers { margin: 0; padding: 9px 11px; display: grid; gap: 4px; }
-.hud-layers legend { padding: 0 4px; color: #93a8ba; font: .64rem ui-monospace, Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+/*
+ * A `role="group"` labelled by this heading, not a `fieldset`/`legend`.
+ *
+ * A `legend` is a *rendered legend*: the browser lifts it out of flow into the block-start border,
+ * centred on the border line, and nothing in CSS puts it back. Here that border is also the top edge
+ * of a floating panel, so the upper half of "LAYERS" was drawn above the panel against the map and
+ * read as clipped. Verified rather than assumed: neither `padding-top` on the box nor `margin-top`
+ * on the legend moved it, and `getBoundingClientRect` reported no offset at all because the fieldset
+ * box is measured from the legend's own top -- the geometry looked correct while the pixels did not,
+ * which is why this was settled with a screenshot.
+ *
+ * `aria-labelledby` points at the visible text, so the group's accessible name is the same string
+ * the reader sees rather than a second copy that can drift from it.
+ */
+.hud-layers-title {
+  padding: 0 0 2px;
+  color: #93a8ba;
+  font: .64rem ui-monospace, Consolas, monospace;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
 .hud-layers label { display: flex; gap: 7px; align-items: center; cursor: pointer; }
 .hud-layers input { accent-color: #72f4c4; }
 

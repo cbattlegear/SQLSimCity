@@ -408,6 +408,32 @@ describe('the sidebar column scrolls its own overflow', () => {
   })
 
   /**
+   * The layers panel names itself with a heading it owns, not with a `<legend>`.
+   *
+   * A `legend` is a *rendered legend*: the browser lifts it out of flow into the block-start border,
+   * centred on the border line. That border is also the top edge of a floating panel, so the upper
+   * half of "LAYERS" was drawn above the panel against the map and read as clipped. Nothing in CSS
+   * puts it back -- `padding-top` on the box and `margin-top` on the legend were both measured and
+   * both moved it not at all -- so the fix is to stop using the element whose whole purpose is to sit
+   * in the border.
+   *
+   * Worth knowing if this is ever revisited: `getBoundingClientRect` reported the legend flush with
+   * the fieldset, because a fieldset's box is measured from its rendered legend's top. The geometry
+   * looked correct while the pixels did not, and only a screenshot settled it.
+   */
+  it('gives the layers panel a heading rather than a legend in its border', () => {
+    expect(city, 'the layers panel is back to a fieldset/legend').not.toMatch(/<legend>/)
+    expect(city, 'the layers panel is no longer a labelled group')
+      .toMatch(/className="hud-layers" role="group" aria-labelledby=/)
+    // The accessible name has to be the visible string, not a second copy that can drift from it.
+    expect(city, 'the heading the group points at is not rendered')
+      .toMatch(/className="hud-layers-title" id=\{layersTitleId\}>Layers</)
+    expect(desktopRule('.hud-layers-title'), '.hud-layers-title has no rule at all').not.toBeNull()
+    // And the old rule is gone, or it would style an element nobody renders.
+    expect(css, '.hud-layers legend still has a rule').not.toMatch(/\.hud-layers legend/)
+  })
+
+  /**
    * The place card gets the same floor the drawer has, and for the same reason.
    *
    * With `min-height: 0` the card was the only section on the rail that could give way, so it gave

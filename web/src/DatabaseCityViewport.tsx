@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import type { DatabaseCityObject } from './databaseCityContracts'
 import {
   createDatabaseCityScene,
@@ -124,6 +124,7 @@ export function DatabaseCityViewport({
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const sceneRef = useRef<DatabaseCitySceneController | null>(null)
+  const layersTitleId = useId()
   const [unavailable, setUnavailable] = useState(false)
   const [heading, setHeading] = useState(0)
   const [hoveredRoadId, setHoveredRoadId] = useState<string | null>(null)
@@ -339,15 +340,15 @@ export function DatabaseCityViewport({
       label: 'Layers',
       glyph: '≣',
       content: (
-        <fieldset className="hud-layers">
-          <legend>Layers</legend>
+        <div className="hud-layers" role="group" aria-labelledby={layersTitleId}>
+          <span className="hud-layers-title" id={layersTitleId}>Layers</span>
           {LAYER_LABELS.map(([key, label, hint]) => (
             <label key={key} title={hint}>
               <input type="checkbox" checked={layers[key]} onChange={() => toggle(key)} />
               {label}
             </label>
           ))}
-        </fieldset>
+        </div>
       ),
     },
     ...(incidents
