@@ -1,6 +1,7 @@
 using SqlSimCity.Collection.Probes;
 using SqlSimCity.Collection.QueryStore;
 using SqlSimCity.Contracts.V1;
+using SqlSimCity.Domain;
 using SqlSimCity.Storage;
 
 namespace SqlSimCity.Collection.Tests.QueryStore;
@@ -120,10 +121,7 @@ public sealed class ConnectedQueryStoreReadOutcomeTests
     [Fact]
     public async Task ASourceThatCannotHydrateReadsAsUnavailable()
     {
-        var source = new ConnectedQueryStoreHistorySource(
-            new ProtectedQueryStoreRepository(new MemoryStore()), new EmptyPlanSource(),
-            new SecureShowplanParser(), new QueryStoreCollectionStatusTracker(), TimeProvider.System,
-            allowRawPayloadHydration: false);
+        var source = HydrationDisabledSource();
 
         var read = await source.ReadPlanAsync("db:42", default);
 
@@ -131,9 +129,22 @@ public sealed class ConnectedQueryStoreReadOutcomeTests
         Assert.Equal(DataStatus.Disabled, read.Status);
     }
 
-    private static ConnectedQueryStoreHistorySource Source(IQueryStoreIncrementalSource incremental) =>
-        new(new ProtectedQueryStoreRepository(new MemoryStore()), incremental,
+    // Bound through the interface on purpose, and CA1859 waived for exactly that reason. Every
+    // consumer holds an IQueryStoreHistorySource, and the interface supplies a default that maps a
+    // null to Absent -- so a test written against the concrete type would stop compiling if the
+    // source stopped distinguishing, rather than fail an assertion that says it no longer does.
+#pragma warning disable CA1859
+    private static IQueryStoreHistorySource Source(IQueryStoreIncrementalSource incremental) =>
+        new ConnectedQueryStoreHistorySource(
+            new ProtectedQueryStoreRepository(new MemoryStore()), incremental,
             new SecureShowplanParser(), new QueryStoreCollectionStatusTracker(), TimeProvider.System);
+
+    private static IQueryStoreHistorySource HydrationDisabledSource() =>
+        new ConnectedQueryStoreHistorySource(
+            new ProtectedQueryStoreRepository(new MemoryStore()), new EmptyPlanSource(),
+            new SecureShowplanParser(), new QueryStoreCollectionStatusTracker(), TimeProvider.System,
+            allowRawPayloadHydration: false);
+#pragma warning restore CA1859
 
     private abstract class PlanSourceBase : IQueryStoreIncrementalSource
     {
