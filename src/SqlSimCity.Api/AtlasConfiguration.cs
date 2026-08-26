@@ -71,6 +71,7 @@ public static class AtlasConfiguration
             ? new[] { parsed.InitialDatabase }
             : configuredDatabases;
 
+        var refreshInterval = TimeSpan.FromSeconds(section.GetValue<int?>("RefreshIntervalSeconds") ?? 60);
         var options = new AtlasCollectionOptions
         {
             TargetId = section.GetValue<string>("TargetId") ?? "primary",
@@ -78,12 +79,21 @@ public static class AtlasConfiguration
             KnownDatabases = knownDatabases,
             DatabaseConcurrency = section.GetValue<int?>("DatabaseConcurrency") ?? 4,
             QueryStoreWindow = TimeSpan.FromMinutes(section.GetValue<int?>("QueryStoreWindowMinutes") ?? 1_440),
-            RefreshInterval = TimeSpan.FromSeconds(section.GetValue<int?>("RefreshIntervalSeconds") ?? 60),
+            RefreshInterval = refreshInterval,
+
+            // A cadence cannot be faster than the cycle that schedules it, so an atlas already
+            // configured to refresh more slowly than the default keeps its own interval rather
+            // than being refused at startup over a setting it never asked for.
+            QueryStoreRefreshInterval = section.GetValue<int?>("QueryStoreRefreshIntervalSeconds") is { } seconds
+                ? TimeSpan.FromSeconds(seconds)
+                : Max(TimeSpan.FromSeconds(900), refreshInterval),
             StaleAfter = TimeSpan.FromSeconds(section.GetValue<int?>("StaleAfterSeconds") ?? 180),
         };
         options.Validate();
         return options;
     }
+
+    private static TimeSpan Max(TimeSpan left, TimeSpan right) => left > right ? left : right;
 
     public static ConnectionProfile BuildProfile(
         IConfiguration configuration,

@@ -52,10 +52,10 @@ public sealed class AtlasCollectorTests
         Assert.Equal("9007199254740993", exact.Allocated.Bytes);
         Assert.Equal("27021597764222979", exact.QueryStore.TotalDurationMicroseconds);
         Assert.Equal("9007199254740993", exact.QueryStore.ExecutionCount);
-        Assert.All(executor.Selections, selection =>
-            Assert.Equal("querystore.database_workload_summary_2022", selection.QueryStoreWorkloadProbeId));
-        Assert.All(executor.Selections, selection =>
-            Assert.Equal("io.file_io_stats_current_db", selection.FileIoProbeId));
+        Assert.All(executor.Selections, request =>
+            Assert.Equal("querystore.database_workload_summary_2022", request.Selection.QueryStoreWorkloadProbeId));
+        Assert.All(executor.Selections, request =>
+            Assert.Equal("io.file_io_stats_current_db", request.Selection.FileIoProbeId));
     }
 
     [Fact]
@@ -76,8 +76,8 @@ public sealed class AtlasCollectorTests
 
         Assert.Equal(["sales", "warehouse"], result.Snapshot.Databases.Select(database => database.Name));
         Assert.Equal(0, executor.DiscoveryCalls);
-        Assert.All(executor.Selections, selection =>
-            Assert.Equal("io.file_io_stats_current_db", selection.FileIoProbeId));
+        Assert.All(executor.Selections, request =>
+            Assert.Equal("io.file_io_stats_current_db", request.Selection.FileIoProbeId));
         Assert.All(result.Snapshot.Databases, database =>
             Assert.StartsWith("primary/database/", database.DatabaseId, StringComparison.Ordinal));
     }
@@ -441,6 +441,208 @@ public sealed class AtlasCollectorTests
         Assert.Equal("7", result.ExceptionExecutionCount);
     }
 
+    [Fact]
+    public void RejectsAQueryStoreCadenceFasterThanTheCycleThatSchedulesItOrLongerThanADay()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new AtlasCollectionOptions
+        {
+            RefreshInterval = TimeSpan.FromMinutes(5),
+            QueryStoreRefreshInterval = TimeSpan.FromMinutes(1),
+            StaleAfter = TimeSpan.FromMinutes(5),
+        }.Validate());
+        Assert.Throws<ArgumentOutOfRangeException>(() => new AtlasCollectionOptions
+        {
+            QueryStoreRefreshInterval = TimeSpan.FromDays(1) + TimeSpan.FromSeconds(1),
+        }.Validate());
+        new AtlasCollectionOptions { QueryStoreRefreshInterval = TimeSpan.FromMinutes(15) }.Validate();
+    }
+
+    [Theory]
+    [InlineData("ON", false)]
+    [InlineData("READ_ONLY", false)]
+    [InlineData("OFF", true)]
+    public void OnlyAReadableQueryStoreDefersInsteadOfReportingItsOwnCondition(string state, bool describesTheState)
+    {
+        var options = AtlasComponentOutcome.Success(new AtlasQueryStoreOptionsResult(state, 0), 1, "Options available.");
+
+        var deferred = SqlClientAtlasProbeExecutor.WorkloadOutcomeWithoutProbe(null, options);
+        var probed = SqlClientAtlasProbeExecutor.WorkloadOutcomeWithoutProbe(
+            "querystore.database_workload_summary_2022", options);
+
+        Assert.NotNull(deferred);
+        Assert.Equal(!describesTheState, deferred.IsDeferred);
+        // A probe id only ever reaches a round trip through this null, so the gate is the whole story.
+        Assert.Equal(describesTheState, probed is not null);
+    }
+
+    [Fact]
+    public void DeniedQueryStoreOptionsOutrankTheCadenceSoNoRetainedValueCanBeSubstituted()
+    {
+        var denied = AtlasComponentOutcome.Failure<AtlasQueryStoreOptionsResult>(
+            DataStatus.PermissionDenied, "Query Store options permission denied.");
+
+        var outcome = SqlClientAtlasProbeExecutor.WorkloadOutcomeWithoutProbe(null, denied);
+
+        Assert.NotNull(outcome);
+        Assert.False(outcome.IsDeferred);
+        Assert.Equal(DataStatus.PermissionDenied, outcome.Status);
+    }
+
+    [Fact]
+    public async Task QueryStoreIsNotProbedAgainUntilItsOwnIntervalElapsesAndItsEarlierValuesStand()
+    {
+        var clock = new ManualTimeProvider(ParseDate("2026-08-17T13:00:00Z"));
+        var executions = "10";
+        var windowEnd = ParseDate("2026-08-17T13:00:00Z");
+        var executor = new FakeExecutor
+        {
+            Databases = [new AtlasDatabaseIdentity("db", "ONLINE", 160, true)],
+            Result = name => DatabaseResult(name) with
+            {
+                QueryStoreWorkload = AtlasComponentOutcome.Success(
+                    new AtlasQueryStoreWorkloadResult(
+                        executions, "2000", "1000", "40", windowEnd - TimeSpan.FromHours(24), windowEnd),
+                    7,
+                    "Workload available."),
+            },
+        };
+        var collector = Collector(executor, CadenceOptions(), clock);
+
+        var first = await collector.CollectAsync(1, CancellationToken.None);
+        executions = "999";
+        windowEnd = ParseDate("2026-08-17T13:14:00Z");
+        clock.Advance(TimeSpan.FromMinutes(14));
+        var second = await collector.CollectAsync(2, CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(1));
+        var third = await collector.CollectAsync(3, CancellationToken.None);
+
+        Assert.Equal("querystore.database_workload_summary_2022", executor.Selections[0].Selection.QueryStoreWorkloadProbeId);
+        Assert.Null(executor.Selections[1].Selection.QueryStoreWorkloadProbeId);
+        Assert.Equal("querystore.database_workload_summary_2022", executor.Selections[2].Selection.QueryStoreWorkloadProbeId);
+        Assert.Equal("10", first.Snapshot.Databases[0].QueryStore.ExecutionCount);
+        Assert.Equal("10", second.Snapshot.Databases[0].QueryStore.ExecutionCount);
+        Assert.Equal("999", third.Snapshot.Databases[0].QueryStore.ExecutionCount);
+        // The retained cycle read no Query Store rows at all, which is the saving being claimed.
+        Assert.Equal(first.Status.RowCount - 7, second.Status.RowCount);
+        Assert.Equal(first.Status.RowCount, third.Status.RowCount);
+        Assert.Equal(0, second.Status.FailureCount);
+        Assert.Equal(0, second.Status.SkipCount);
+        Assert.Equal(AtlasCollectorState.Ready, second.Status.State);
+    }
+
+    [Fact]
+    public async Task RetainedQueryStoreEvidenceKeepsItsOriginalObservationAndWindowInsteadOfBeingRestamped()
+    {
+        var clock = new ManualTimeProvider(ParseDate("2026-08-17T13:00:00Z"));
+        var probedAt = ParseDate("2026-08-17T13:00:00Z");
+        var executor = new FakeExecutor
+        {
+            Databases = [new AtlasDatabaseIdentity("db", "ONLINE", 160, true)],
+            Result = name => DatabaseResult(name) with
+            {
+                QueryStoreWorkload = AtlasComponentOutcome.Success(
+                    new AtlasQueryStoreWorkloadResult(
+                        "10", "2000", "1000", "40", probedAt - TimeSpan.FromHours(24), probedAt),
+                    7,
+                    "Workload available."),
+                SourceTimestamp = probedAt,
+            },
+        };
+        var collector = Collector(executor, CadenceOptions(), clock);
+
+        var first = await collector.CollectAsync(1, CancellationToken.None);
+        probedAt = ParseDate("2026-08-17T13:14:00Z");
+        clock.Advance(TimeSpan.FromMinutes(14));
+        var second = await collector.CollectAsync(2, CancellationToken.None);
+
+        var original = first.Snapshot.Databases[0].QueryStore;
+        var retained = second.Snapshot.Databases[0].QueryStore;
+        Assert.Equal(ParseDate("2026-08-17T13:00:00Z"), original.Evidence.ObservedAt);
+        Assert.Equal(original.Evidence.ObservedAt, retained.Evidence.ObservedAt);
+        Assert.Equal(original.WindowStart, retained.WindowStart);
+        Assert.Equal(original.WindowEnd, retained.WindowEnd);
+        // Neither this cycle's collection time nor its source timestamp may become the observation.
+        Assert.NotEqual(second.Snapshot.GeneratedAt, retained.Evidence.ObservedAt);
+        Assert.NotEqual(ParseDate("2026-08-17T13:14:00Z"), retained.Evidence.ObservedAt);
+        Assert.Equal(original.Evidence.FreshUntil, retained.Evidence.FreshUntil);
+        Assert.Equal(ParseDate("2026-08-17T13:03:00Z"), retained.Evidence.FreshUntil);
+        Assert.Contains("unchanged from an earlier Query Store collection", retained.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain("unchanged from an earlier", original.Reason, StringComparison.Ordinal);
+        // The live sample beside it is still this cycle's, so only the deferred component ages.
+        Assert.Equal(second.Snapshot.GeneratedAt, ParseDate("2026-08-17T13:14:00Z"));
+    }
+
+    [Fact]
+    public async Task AQueryStoreThatBecomesUnreadableIsReportedAsItselfRatherThanAsTheRetainedSuccess()
+    {
+        var clock = new ManualTimeProvider(ParseDate("2026-08-17T13:00:00Z"));
+        var denied = false;
+        var executor = new FakeExecutor
+        {
+            Databases = [new AtlasDatabaseIdentity("db", "ONLINE", 160, true)],
+            Result = name => denied
+                ? DatabaseResult(name) with
+                {
+                    QueryStoreOptions = AtlasComponentOutcome.Failure<AtlasQueryStoreOptionsResult>(
+                        DataStatus.PermissionDenied, "Query Store options permission denied."),
+                    QueryStoreWorkload = AtlasComponentOutcome.Skipped<AtlasQueryStoreWorkloadResult>(
+                        DataStatus.PermissionDenied, "Workload depends on options."),
+                }
+                : DatabaseResult(name),
+        };
+        var collector = Collector(executor, CadenceOptions(), clock);
+
+        await collector.CollectAsync(1, CancellationToken.None);
+        denied = true;
+        clock.Advance(TimeSpan.FromMinutes(1));
+        var second = await collector.CollectAsync(2, CancellationToken.None);
+        denied = false;
+        clock.Advance(TimeSpan.FromMinutes(1));
+        var third = await collector.CollectAsync(3, CancellationToken.None);
+
+        var deniedQueryStore = second.Snapshot.Databases[0].QueryStore;
+        Assert.Equal(QueryStoreCapability.PermissionDenied, deniedQueryStore.Capability);
+        Assert.Null(deniedQueryStore.ExecutionCount);
+        Assert.Null(deniedQueryStore.WindowEnd);
+        // The denial discarded the retained value, so the next cycle probes rather than reusing it.
+        Assert.Equal("querystore.database_workload_summary_2022", executor.Selections[2].Selection.QueryStoreWorkloadProbeId);
+        Assert.Equal("9007199254740993", third.Snapshot.Databases[0].QueryStore.ExecutionCount);
+    }
+
+    [Fact]
+    public async Task ADatabaseThatDisappearsAndReturnsIsProbedAgainInsteadOfResurrectingItsRetainedValue()
+    {
+        var clock = new ManualTimeProvider(ParseDate("2026-08-17T13:00:00Z"));
+        var both = new[]
+        {
+            new AtlasDatabaseIdentity("db-a", "ONLINE", 160, true),
+            new AtlasDatabaseIdentity("db-b", "ONLINE", 160, true),
+        };
+        var executor = new FakeExecutor { Databases = both };
+        var collector = Collector(executor, CadenceOptions(), clock);
+
+        await collector.CollectAsync(1, CancellationToken.None);
+        executor.Databases = [both[0]];
+        clock.Advance(TimeSpan.FromMinutes(1));
+        await collector.CollectAsync(2, CancellationToken.None);
+        executor.Databases = both;
+        clock.Advance(TimeSpan.FromMinutes(1));
+        await collector.CollectAsync(3, CancellationToken.None);
+
+        var third = executor.Selections.Skip(3).ToArray();
+        Assert.Null(third.Single(request => request.Database == "db-a").Selection.QueryStoreWorkloadProbeId);
+        Assert.Equal(
+            "querystore.database_workload_summary_2022",
+            third.Single(request => request.Database == "db-b").Selection.QueryStoreWorkloadProbeId);
+    }
+
+    private static AtlasCollectionOptions CadenceOptions() => new()
+    {
+        RefreshInterval = TimeSpan.FromMinutes(1),
+        QueryStoreRefreshInterval = TimeSpan.FromMinutes(15),
+        StaleAfter = TimeSpan.FromMinutes(3),
+    };
+
     private static AtlasCollector Collector(
         FakeExecutor executor,
         AtlasCollectionOptions? options = null,
@@ -509,7 +711,7 @@ public sealed class AtlasCollectorTests
         public TaskCompletionSource? Entered { get; set; }
         public int DiscoveryCalls { get; private set; }
         public int MaximumActive { get; private set; }
-        public List<AtlasProbeSelection> Selections { get; } = [];
+        public List<ProbeRequest> Selections { get; } = [];
 
         public Task<AtlasTargetIdentity> GetTargetIdentityAsync(CancellationToken cancellationToken) =>
             IdentityFailure is null
@@ -529,7 +731,7 @@ public sealed class AtlasCollectorTests
             DateTimeOffset queryStoreWindowEnd,
             CancellationToken cancellationToken)
         {
-            lock (Selections) Selections.Add(selection);
+            lock (Selections) Selections.Add(new ProbeRequest(databaseName, selection));
             var active = Interlocked.Increment(ref _active);
             MaximumActive = Math.Max(MaximumActive, active);
             try
@@ -537,7 +739,14 @@ public sealed class AtlasCollectorTests
                 Entered?.TrySetResult();
                 if (Block is not null) await Block.WaitAsync(cancellationToken);
                 if (Delay > TimeSpan.Zero) await Task.Delay(Delay, cancellationToken);
-                return Result(databaseName);
+                var result = Result(databaseName);
+
+                // The real executor decides what an ungated workload probe returns, so the fake
+                // defers to it rather than inventing a second answer that could drift from it.
+                return selection.QueryStoreWorkloadProbeId is null &&
+                       SqlClientAtlasProbeExecutor.WorkloadOutcomeWithoutProbe(null, result.QueryStoreOptions) is { } unprobed
+                    ? result with { QueryStoreWorkload = unprobed }
+                    : result;
             }
             finally
             {
@@ -545,4 +754,6 @@ public sealed class AtlasCollectorTests
             }
         }
     }
+
+    private sealed record ProbeRequest(string Database, AtlasProbeSelection Selection);
 }

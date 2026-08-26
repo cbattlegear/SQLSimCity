@@ -202,6 +202,59 @@ public sealed class ConnectionStringConfigurationTests
     }
 
     [Fact]
+    public void TheQueryStoreCadenceIsConfiguredSeparatelyFromTheAtlasCycleAndDefaultsToFifteenMinutes()
+    {
+        var defaults = Configure(new Dictionary<string, string?>
+        {
+            [AtlasConfiguration.ConnectionStringKey] = OnPremises,
+        });
+        var configured = Configure(new Dictionary<string, string?>
+        {
+            [AtlasConfiguration.ConnectionStringKey] = OnPremises,
+            ["Atlas:QueryStoreRefreshIntervalSeconds"] = "300",
+        });
+
+        Assert.Equal(
+            TimeSpan.FromMinutes(15),
+            AtlasConfiguration.BuildCollectionOptions(defaults).QueryStoreRefreshInterval);
+        Assert.Equal(
+            TimeSpan.FromMinutes(5),
+            AtlasConfiguration.BuildCollectionOptions(configured).QueryStoreRefreshInterval);
+        Assert.Equal(
+            TimeSpan.FromSeconds(60),
+            AtlasConfiguration.BuildCollectionOptions(defaults).RefreshInterval);
+    }
+
+    [Fact]
+    public void AnAtlasAlreadySlowerThanTheQueryStoreDefaultKeepsItsOwnCadenceInsteadOfFailingToStart()
+    {
+        var configuration = Configure(new Dictionary<string, string?>
+        {
+            [AtlasConfiguration.ConnectionStringKey] = OnPremises,
+            ["Atlas:RefreshIntervalSeconds"] = "1800",
+            ["Atlas:StaleAfterSeconds"] = "1800",
+        });
+
+        var options = AtlasConfiguration.BuildCollectionOptions(configuration);
+
+        Assert.Equal(TimeSpan.FromMinutes(30), options.QueryStoreRefreshInterval);
+    }
+
+    [Fact]
+    public void AQueryStoreCadenceFasterThanTheAtlasCycleIsRefusedRatherThanQuietlyIgnored()
+    {
+        var configuration = Configure(new Dictionary<string, string?>
+        {
+            [AtlasConfiguration.ConnectionStringKey] = OnPremises,
+            ["Atlas:RefreshIntervalSeconds"] = "1800",
+            ["Atlas:StaleAfterSeconds"] = "1800",
+            ["Atlas:QueryStoreRefreshIntervalSeconds"] = "900",
+        });
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => AtlasConfiguration.BuildCollectionOptions(configuration));
+    }
+
+    [Fact]
     public async Task AtlasServesTheConnectionStringPasswordInlineInsteadOfFromTheSecretsDirectory()
     {
         var configuration = Configure(new Dictionary<string, string?>

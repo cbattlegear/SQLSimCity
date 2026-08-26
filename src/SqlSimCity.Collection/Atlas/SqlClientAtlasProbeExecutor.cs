@@ -95,22 +95,16 @@ public sealed class SqlClientAtlasProbeExecutor : IAtlasProbeExecutor
             options = await CaptureComponentAsync(
                 () => ReadQueryStoreOptionsAsync(databaseName, selection.QueryStoreOptionsProbeId, cancellationToken),
                 cancellationToken).ConfigureAwait(false);
-            if (options.Value is not { } queryStoreOptions)
+            if (WorkloadOutcomeWithoutProbe(selection.QueryStoreWorkloadProbeId, options) is { } unprobed)
             {
-                workload = AtlasComponentOutcome.Skipped<AtlasQueryStoreWorkloadResult>(
-                    options.Status, "Query Store workload was not probed because options were unavailable.");
-            }
-            else if (!IsQueryStoreReadable(queryStoreOptions.ActualState))
-            {
-                workload = AtlasComponentOutcome.Skipped<AtlasQueryStoreWorkloadResult>(
-                    DataStatus.Disabled, $"Query Store workload was not probed while state was {queryStoreOptions.ActualState}.");
+                workload = unprobed;
             }
             else
             {
                 workload = await CaptureComponentAsync(async () =>
                 {
                     var resolved = await ResolveWorkloadProbeAsync(
-                        databaseName, selection.QueryStoreWorkloadProbeId, cancellationToken).ConfigureAwait(false);
+                        databaseName, selection.QueryStoreWorkloadProbeId!, cancellationToken).ConfigureAwait(false);
                     var summary = await ReadQueryStoreWorkloadAsync(
                         databaseName, resolved.ProbeId, queryStoreWindowStart, queryStoreWindowEnd, cancellationToken)
                         .ConfigureAwait(false);
@@ -188,6 +182,29 @@ public sealed class SqlClientAtlasProbeExecutor : IAtlasProbeExecutor
             };
         }, cancellationToken).ConfigureAwait(false);
         return new ComponentValue<AtlasQueryStoreOptionsResult>(value, 1);
+    }
+
+    /// <summary>
+    /// The complete set of reasons the Query Store workload is not probed, in precedence order, or
+    /// <c>null</c> when it is. Returning <c>null</c> is the only path that reaches a round trip, so
+    /// a deferred cycle costs the target nothing at all -- not the summary and not the plan-metadata
+    /// capability check in front of it. A deferral is deliberately last: an unavailable, denied, or
+    /// unreadable Query Store describes the database as it is now and outranks the cadence.
+    /// </summary>
+    internal static AtlasComponentOutcome<AtlasQueryStoreWorkloadResult>? WorkloadOutcomeWithoutProbe(
+        string? workloadProbeId,
+        AtlasComponentOutcome<AtlasQueryStoreOptionsResult> options)
+    {
+        if (options.Value is not { } queryStoreOptions)
+            return AtlasComponentOutcome.Skipped<AtlasQueryStoreWorkloadResult>(
+                options.Status, "Query Store workload was not probed because options were unavailable.");
+        if (!IsQueryStoreReadable(queryStoreOptions.ActualState))
+            return AtlasComponentOutcome.Skipped<AtlasQueryStoreWorkloadResult>(
+                DataStatus.Disabled, $"Query Store workload was not probed while state was {queryStoreOptions.ActualState}.");
+        if (workloadProbeId is null)
+            return AtlasComponentOutcome.Deferred<AtlasQueryStoreWorkloadResult>(
+                "Query Store workload was not probed because its own refresh interval had not elapsed.");
+        return null;
     }
 
     private async Task<(string ProbeId, int Rows)> ResolveWorkloadProbeAsync(

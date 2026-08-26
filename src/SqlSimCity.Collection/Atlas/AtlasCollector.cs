@@ -16,6 +16,9 @@ public sealed class AtlasCollector
     private readonly TimeProvider _timeProvider;
     private readonly object _ioGate = new();
     private Dictionary<string, PreviousIoSample> _previousIo = [];
+    private readonly object _queryStoreGate = new();
+    private readonly Dictionary<string, RetainedQueryStore> _retainedQueryStore =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public AtlasCollector(
         IAtlasProbeExecutor executor,
@@ -53,9 +56,19 @@ public sealed class AtlasCollector
         }
 
         var selection = SelectProbes(target);
+        var queryStoreDue = TakeQueryStoreDue(databases, collectedAt);
         using var concurrency = new SemaphoreSlim(_options.DatabaseConcurrency);
         var tasks = databases.Select((database, index) =>
-            CollectOneBoundedAsync(database, index, target, selection, collectedAt, concurrency, cancellationToken)).ToArray();
+            CollectOneBoundedAsync(
+                database,
+                index,
+                target,
+                queryStoreDue.Contains(database.Name)
+                    ? selection
+                    : selection with { QueryStoreWorkloadProbeId = null },
+                collectedAt,
+                concurrency,
+                cancellationToken)).ToArray();
         var results = await Task.WhenAll(tasks).ConfigureAwait(false);
         Array.Sort(results, static (left, right) => left.Index.CompareTo(right.Index));
 
@@ -135,23 +148,27 @@ public sealed class AtlasCollector
                 collectedAt - _options.QueryStoreWindow,
                 collectedAt,
                 cancellationToken).ConfigureAwait(false);
+            var queryStore = ResolveQueryStore(discovered.Name, result.QueryStoreWorkload, collectedAt);
+            result = result with { QueryStoreWorkload = queryStore.Workload };
             var identity = result.Identity;
             var databaseId = StableDatabaseId(identity);
             var activity = await _activity.GetActivityAsync(
                 databaseId, identity.Name, collectedAt, cancellationToken).ConfigureAwait(false);
             return new IndexedResult(
                 index,
-                Project(databaseId, result, target, activity, collectedAt),
+                Project(databaseId, result, target, activity, collectedAt, queryStore.CollectedAt, queryStore.WasRetained),
                 result.FailureCount,
                 result.SkipCount,
                 result.RowCount);
         }
         catch (ProbeNotProbedException ex)
         {
+            ForgetQueryStore(discovered.Name);
             return new IndexedResult(index, Unavailable(discovered, collectedAt, ex.Reason, DataStatus.Unsupported), 0, 1, 0);
         }
         catch (ProbeExecutionException ex)
         {
+            ForgetQueryStore(discovered.Name);
             var status = ex switch
             {
                 ProbePermissionDeniedException => DataStatus.PermissionDenied,
@@ -162,6 +179,7 @@ public sealed class AtlasCollector
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            ForgetQueryStore(discovered.Name);
             return new IndexedResult(index, Unavailable(discovered, collectedAt,
                 "The database probe timed out.", DataStatus.Unknown), 1, 0, 0);
         }
@@ -171,12 +189,96 @@ public sealed class AtlasCollector
         }
     }
 
+    /// <summary>
+    /// The databases whose Query Store workload is collected this cycle: those never collected and
+    /// those whose retained result has reached <see cref="AtlasCollectionOptions.QueryStoreRefreshInterval"/>.
+    /// A database that is no longer discovered loses its retained result here, so if it comes back
+    /// it is probed afresh rather than reported from a value collected before it went away.
+    /// </summary>
+    private HashSet<string> TakeQueryStoreDue(
+        IReadOnlyList<AtlasDatabaseIdentity> databases,
+        DateTimeOffset collectedAt)
+    {
+        var visible = new HashSet<string>(databases.Select(database => database.Name), StringComparer.OrdinalIgnoreCase);
+        var due = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        lock (_queryStoreGate)
+        {
+            foreach (var gone in _retainedQueryStore.Keys.Where(name => !visible.Contains(name)).ToArray())
+                _retainedQueryStore.Remove(gone);
+            foreach (var name in visible)
+            {
+                if (!_retainedQueryStore.TryGetValue(name, out var retained))
+                {
+                    due.Add(name);
+                    continue;
+                }
+
+                var age = collectedAt - retained.CollectedAt;
+                if (age < TimeSpan.Zero || age >= _options.QueryStoreRefreshInterval)
+                    due.Add(name);
+            }
+        }
+        return due;
+    }
+
+    /// <summary>
+    /// Reports the workload for this cycle together with the time it was actually collected, which
+    /// is what its evidence is dated from. A retained result is only ever substituted for the
+    /// deferral marker, so an unavailable, denied, disabled, or failed Query Store is reported as
+    /// itself and drops the retained value instead of being masked by an older success.
+    /// </summary>
+    private ResolvedQueryStore ResolveQueryStore(
+        string databaseName,
+        AtlasComponentOutcome<AtlasQueryStoreWorkloadResult> workload,
+        DateTimeOffset collectedAt)
+    {
+        lock (_queryStoreGate)
+        {
+            if (workload.IsDeferred)
+                return _retainedQueryStore.TryGetValue(databaseName, out var retained)
+                    ? new ResolvedQueryStore(retained.Workload, retained.CollectedAt, true)
+
+                    // Nothing was retained to report, so the deferral has nothing to stand on.
+                    // TakeQueryStoreDue only withholds the probe from a database that has one, so
+                    // this says the component is unknown rather than inventing an empty history.
+                    : new ResolvedQueryStore(
+                        AtlasComponentOutcome.Skipped<AtlasQueryStoreWorkloadResult>(
+                            DataStatus.Unknown,
+                            "Query Store workload was deferred but no earlier collection was retained."),
+                        collectedAt,
+                        false);
+
+            if (workload.IsSuccess)
+            {
+                _retainedQueryStore[databaseName] = new RetainedQueryStore(collectedAt, workload with
+                {
+                    RowCount = 0,
+                    Reason = "Query Store workload retained from an earlier collection; no rows were read.",
+                });
+            }
+            else
+            {
+                _retainedQueryStore.Remove(databaseName);
+            }
+
+            return new ResolvedQueryStore(workload, collectedAt, false);
+        }
+    }
+
+    private void ForgetQueryStore(string databaseName)
+    {
+        lock (_queryStoreGate)
+            _retainedQueryStore.Remove(databaseName);
+    }
+
     private DatabaseAtlasItemV1 Project(
         string databaseId,
         AtlasDatabaseProbeResult result,
         AtlasTargetIdentity target,
         LiveActivityV1 activity,
-        DateTimeOffset collectedAt)
+        DateTimeOffset collectedAt,
+        DateTimeOffset queryStoreCollectedAt,
+        bool queryStoreRetained)
     {
         var source = result.SourceTimestamp;
         var spaceEvidence = ComponentEvidence(
@@ -192,7 +294,9 @@ public sealed class AtlasCollector
             : unknownSpace;
         var queryStore = SystemDatabases.IsSystemDatabase(result.Identity.Name)
             ? ExcludedQueryStore(result.Identity.Name, collectedAt, source)
-            : ProjectQueryStore(result.QueryStoreOptions, result.QueryStoreWorkload, collectedAt, source);
+            : ProjectQueryStore(
+                result.QueryStoreOptions, result.QueryStoreWorkload, collectedAt, queryStoreCollectedAt,
+                queryStoreRetained, source);
         return new DatabaseAtlasItemV1(
             databaseId,
             result.Identity.Name,
@@ -233,6 +337,8 @@ public sealed class AtlasCollector
         AtlasComponentOutcome<AtlasQueryStoreOptionsResult> optionsOutcome,
         AtlasComponentOutcome<AtlasQueryStoreWorkloadResult> workloadOutcome,
         DateTimeOffset collectedAt,
+        DateTimeOffset queryStoreCollectedAt,
+        bool queryStoreRetained,
         DateTimeOffset source)
     {
         if (optionsOutcome.Value is not { } options)
@@ -273,9 +379,18 @@ public sealed class AtlasCollector
             status = workloadOutcome.Status;
             reason = $"{reason} Workload history failed: {workloadOutcome.Reason}";
         }
+        else if (queryStoreRetained && value is not null)
+        {
+            reason = $"{reason} Workload history is unchanged from an earlier Query Store collection " +
+                     "on its own refresh interval; its window and observation time are those of that collection.";
+        }
+
+        // The window end is the observation, and it stays the one the aggregate was actually taken
+        // over. A retained result is dated from the cycle that collected it, never from this one:
+        // restamping it would report evidence as fresher than it is.
         var evidence = new EvidenceV1(
             EvidenceSource.QueryStoreAggregate, status, value?.WindowEnd ?? source,
-            collectedAt + _options.StaleAfter, reason);
+            queryStoreCollectedAt + _options.StaleAfter, reason);
         var count = capability == QueryStoreCapability.Available ? value?.ExecutionCount : null;
         return new QueryStoreHistoryV1(
             count,
@@ -466,6 +581,13 @@ public sealed class AtlasCollector
         int SkipCount,
         int RowCount);
     private sealed record FileCounters(BigInteger BytesRead, BigInteger BytesWritten);
+    private sealed record RetainedQueryStore(
+        DateTimeOffset CollectedAt,
+        AtlasComponentOutcome<AtlasQueryStoreWorkloadResult> Workload);
+    private sealed record ResolvedQueryStore(
+        AtlasComponentOutcome<AtlasQueryStoreWorkloadResult> Workload,
+        DateTimeOffset CollectedAt,
+        bool WasRetained);
     private sealed record PreviousIoSample(
         IReadOnlyDictionary<int, FileCounters> Files,
         long SampleMilliseconds,
