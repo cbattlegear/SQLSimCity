@@ -204,5 +204,10 @@ intent is recorded rather than inferred.
 
 ## Scratch files
 
-Probe pages and measurement scaffolding do not get committed. Delete them and confirm
-`git status` is clean before opening a pull request.
+One-off probe pages and ad-hoc measurement scaffolding do not get committed. Delete them and
+confirm `git status` is clean before opening a pull request.
+
+That is about throwaway scratch, not about tooling. `tools/measure/` is the opposite case: a
+deliberate, documented workbench for measuring what a probe costs the instance it runs
+against, kept precisely so the next measurement is reproducible rather than reinvented. Add
+to it rather than growing a private copy beside it.

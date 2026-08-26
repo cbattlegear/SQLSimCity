@@ -1,0 +1,30 @@
+# SQL Server for measuring what SQLSimCity asks of a monitored instance.
+#
+# Loopback-only and ephemeral. The password is a local test credential for a
+# container that is thrown away after a measurement run; it is never a
+# deployment secret. Override it with SQLSIMCITY_MEASURE_SA_PASSWORD.
+services:
+  sql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlsimcity-measure-sql
+    ports:
+      # Loopback only. Nothing here should be reachable off the machine.
+      - "127.0.0.1:11433:1433"
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${SQLSIMCITY_MEASURE_SA_PASSWORD:-Measure!Local1}"
+      MSSQL_PID: Developer
+    # A large seeded Query Store needs more than the 2 GB default floor to
+    # aggregate without spilling, which would measure the container rather
+    # than the probe.
+    mem_limit: 6g
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa
+          -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" -b -o /dev/null
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 20s
