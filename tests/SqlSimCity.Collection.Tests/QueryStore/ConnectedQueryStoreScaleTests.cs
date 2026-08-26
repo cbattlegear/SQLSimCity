@@ -206,19 +206,38 @@ public sealed class ConnectedQueryStoreScaleTests
         public Task<bool> DeleteAsync(
             ProtectedRecordId id, CancellationToken cancellationToken = default) =>
             Task.FromResult(_records.Remove(id.Value));
-        public Task ReplaceSetAsync(
+        public Task<ProtectedSetReplacement> ReplaceSetAsync(
             string idPrefix, IEnumerable<ProtectedRecordWrite> records,
             CancellationToken cancellationToken = default)
         {
+            var deleted = 0;
+            var deletedBytes = 0L;
             foreach (var key in _records.Keys.Where(key =>
                          key.StartsWith(idPrefix, StringComparison.Ordinal)).ToArray())
+            {
+                deletedBytes += _records[key].Payload.Length;
                 _records.Remove(key);
+                deleted++;
+            }
+            var written = 0;
+            var bytes = 0L;
             foreach (var record in records)
+            {
                 _records[record.Id.Value] = new(
                     record.Id, record.RecordKind, record.CapturedAt,
                     record.Resolution, record.Payload.ToArray());
-            return Task.CompletedTask;
+                written++;
+                bytes += record.Payload.Length;
+            }
+            return Task.FromResult(
+                new ProtectedSetReplacement(deleted, deletedBytes, written, bytes, bytes, TimeSpan.Zero));
         }
+        public Task<IReadOnlyList<ProtectedRecordId>> ListOldestAsync(
+            IReadOnlyCollection<string> recordKinds, int limit,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(InMemoryUsage.ListOldest(_records, recordKinds, limit));
+        public Task<ProtectedStorageUsage> MeasureUsageAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(InMemoryUsage.Measure(_records.Values));
         public Task<int> PruneExpiredAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(0);
     }

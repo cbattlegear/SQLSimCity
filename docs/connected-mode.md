@@ -238,6 +238,22 @@ generations, and a final publication pointer.
 Raw SQL and Showplan XML are fetched only on demand and stored as 7-day detail. Normalized
 facts and hourly history are retained for 90 days by default.
 
+Those on-demand payloads are a cache, and `QueryStoreHistory__PlanCacheQuotaBytes` bounds it —
+2 GiB by default, which is roughly 45,000 distinct plans at the ~45 KB one hydrated plan cost when
+this was measured. Past the quota, the oldest entries are evicted whole and re-read from the
+server the next time they are asked for; nothing else in the store is touched. Set it to `0` for
+no bound, in which case seven-day retention is the only one — and retention prunes at most 500
+records per collection cycle, which a crawl outruns comfortably.
+
+Both figures an operator needs are logged. Every publish reports the families, records, bytes and
+storage write-lock hold it cost (`QueryStorePublishCost`); every few cycles the store reports its
+record count, stored bytes, on-disk bytes and how much of that is the plan cache
+(`ProtectedStorageUsage`), and warns when the expired-record backlog is beyond what one prune per
+cycle can clear (`ProtectedStoragePruneBacklog`). A publish rewrites the whole generation rather
+than the part that changed, so the publish figure is the write churn per cycle, not a delta; and
+the previous generation stays on disk until its slot is reused, so retained snapshot bytes are
+about twice one publish.
+
 The first cycle for a database has no watermark to resume from, so it looks back
 `QueryStoreHistory__InitialLookbackDays` (90 by default) rather than to the server's oldest
 retained interval. A source retaining more than that would otherwise be read in full on first

@@ -13,6 +13,26 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     private static readonly ProtectedRecordId CurrentPointerId = new("qs:current-snapshot-pointer");
     private const int IndexPageSize = 200;
 
+    internal const string RawQueryTextKind = "query-store-query-text";
+    internal const string RawShowplanKind = "query-store-showplan";
+    internal const string NormalizedPlanKind = "query-store-normalized-plan";
+    internal const string NormalizedPlanChunkKind = "query-store-normalized-plan-chunk";
+
+    /// <summary>
+    /// The record kinds written only when something is hydrated on demand -- the plan cache.
+    /// Background collection never writes them: raw query text and Showplan XML land here when a
+    /// request asks for a family or a plan, and the normalized plan is derived from that XML.
+    /// Named here, at the one place they are minted, so a size measurement of the cache cannot
+    /// drift from what the cache actually is.
+    ///
+    /// Text descriptors are deliberately excluded. They are small, they are written on the same
+    /// request path, and a <c>Missing</c> or <c>Restricted</c> descriptor is the record of *why*
+    /// there is no text -- discarding it to reclaim space would cause the source to be asked
+    /// again for something it already refused.
+    /// </summary>
+    public static readonly IReadOnlyList<string> PlanCacheRecordKinds =
+        [RawQueryTextKind, RawShowplanKind, NormalizedPlanKind, NormalizedPlanChunkKind];
+
     private readonly IProtectedRecordReadSession? _session;
 
     private ProtectedQueryStoreRepository(
@@ -63,13 +83,13 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     public Task StoreQueryTextAsync(
         string databaseId, string queryTextId, DateTimeOffset capturedAt, string queryText,
         CancellationToken cancellationToken = default) =>
-        PutUtf8Async(Id("query-text", databaseId, queryTextId), "query-store-query-text",
+        PutUtf8Async(Id("query-text", databaseId, queryTextId), RawQueryTextKind,
             capturedAt, queryText, StorageResolution.Detail, cancellationToken);
 
     public Task StorePlanXmlAsync(
         string databaseId, string planId, DateTimeOffset capturedAt, string showplanXml,
         CancellationToken cancellationToken = default) =>
-        PutUtf8Async(Id("showplan", databaseId, planId), "query-store-showplan",
+        PutUtf8Async(Id("showplan", databaseId, planId), RawShowplanKind,
             capturedAt, showplanXml, StorageResolution.Detail, cancellationToken);
 
     public async Task StoreNormalizedPlanAsync(
@@ -136,17 +156,106 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
         PutJsonAsync(Id("fact", databaseId, factId), "query-store-normalized-fact",
             capturedAt, resolution, value, cancellationToken);
 
-    public async Task PublishSnapshotAsync(
+    /// <summary>
+    /// Evicts the oldest plan-cache entries until the cache is within <paramref name="quotaBytes"/>,
+    /// and no further. Nothing evicted here is a system of record: raw Showplan XML, raw query text
+    /// and the normalized plan derived from that XML are all re-read from the source on the next
+    /// request for them. Snapshot records are structurally out of reach because only
+    /// <see cref="PlanCacheRecordKinds"/> is ever considered.
+    ///
+    /// Eviction is by whole entry, not by record. A normalized plan larger than one record is a
+    /// manifest plus N chunks, and dropping a chunk while its manifest survives turns a cache miss
+    /// -- which re-hydrates -- into an <see cref="InvalidDataException"/> on read. So a plan id
+    /// seen in the oldest batch takes its whole prefix with it, via an empty replacement set, which
+    /// is atomic. Single-record kinds are deleted directly.
+    ///
+    /// <paramref name="usage"/> is passed in rather than measured here: measuring walks every
+    /// retained record, and the caller has just done it.
+    /// </summary>
+    public async Task<QueryStorePlanCacheEviction> EnforcePlanCacheQuotaAsync(
+        ProtectedStorageUsage usage,
+        long quotaBytes,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(usage);
+        if (quotaBytes <= 0) return QueryStorePlanCacheEviction.None;
+        var retained = usage.StoredBytesForKinds(PlanCacheRecordKinds);
+        if (retained <= quotaBytes) return new QueryStorePlanCacheEviction(retained, retained, 0, 0);
+
+        var remaining = retained;
+        var evictedEntries = 0;
+        var evictedRecords = 0;
+        // Bounded so one pass cannot hold the collection loop indefinitely against a store far
+        // over quota. The cache is measured again next cycle, so anything left is reclaimed then
+        // rather than never.
+        for (var pass = 0; pass < EvictionPasses && remaining > quotaBytes; pass++)
+        {
+            var oldest = await store.ListOldestAsync(
+                PlanCacheRecordKinds, EvictionBatchSize, cancellationToken).ConfigureAwait(false);
+            if (oldest.Count == 0) break;
+            var progressed = false;
+            foreach (var id in oldest)
+            {
+                if (remaining <= quotaBytes) break;
+                cancellationToken.ThrowIfCancellationRequested();
+                // An empty replacement set over the entry's prefix, for both shapes. A chunked
+                // normalized plan goes as one atomic group; a standalone record's own id is its
+                // prefix, and every opaque id this type mints is the same length, so no id is a
+                // proper prefix of another and the range cannot widen to a neighbour.
+                var removed = await store.ReplaceSetAsync(
+                    EvictionPrefixOf(id), [], cancellationToken).ConfigureAwait(false);
+                if (removed.RecordsDeleted == 0) continue;
+                evictedRecords += removed.RecordsDeleted;
+                evictedEntries++;
+                remaining -= removed.DeletedBytes;
+                progressed = true;
+            }
+            // Every id in the batch was already gone, so listing again would return the same
+            // empty answer forever.
+            if (!progressed) break;
+        }
+
+        return new QueryStorePlanCacheEviction(
+            retained, Math.Max(remaining, 0), evictedEntries, evictedRecords);
+    }
+
+    /// <summary>
+    /// The prefix that removes one whole plan-cache entry. A normalized plan larger than one
+    /// record is a manifest plus N chunks under a shared prefix, and dropping a chunk while its
+    /// manifest survives turns a cache miss -- which re-hydrates -- into an
+    /// <see cref="InvalidDataException"/> on read, so the group goes together. Every other
+    /// plan-cache record stands alone and is its own prefix. Recognizing the shape here rather
+    /// than in storage keeps the id scheme inside the one type that mints it.
+    /// </summary>
+    private static string EvictionPrefixOf(ProtectedRecordId id)
+    {
+        const string root = "qs:normalized-plan:";
+        if (!id.Value.StartsWith(root, StringComparison.Ordinal)) return id.Value;
+        var separator = id.Value.IndexOf(':', root.Length);
+        return separator < 0 ? id.Value : id.Value[..(separator + 1)];
+    }
+
+    private const int EvictionBatchSize = 256;
+    private const int EvictionPasses = 32;
+
+    /// <summary>
+    /// Writes the whole snapshot into the inactive slot and flips the pointer last. Cost is
+    /// O(all retained families) per publish, not O(changed families), and the returned figures
+    /// are what that actually came to -- the arithmetic in issue #82 bounded neither the family
+    /// count nor the bytes per family, and both are properties of the observed workload.
+    /// </summary>
+    public async Task<QueryStorePublishCost> PublishSnapshotAsync(
         QueryStorePublishedSnapshot snapshot,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
         var current = await ReadJsonAsync<QueryStoreSnapshotPointer>(
             CurrentPointerId, cancellationToken).ConfigureAwait(false);
         var slot = current?.StorageSlot == "0" ? "1" : "0";
         var indexSets = new List<QueryStoreIndexSet>();
         var snapshotRecordId = SlotId(slot, "snapshot", "header");
-        await store.ReplaceSetAsync(
+        var replacement = await store.ReplaceSetAsync(
             SlotPrefix(slot),
             BuildSlotRecords(snapshot, slot, snapshotRecordId, indexSets),
             cancellationToken).ConfigureAwait(false);
@@ -155,6 +264,9 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
             new QueryStoreSnapshotPointer(snapshotRecordId.Value, slot),
             cancellationToken)
             .ConfigureAwait(false);
+        elapsed.Stop();
+        return new QueryStorePublishCost(
+            snapshot.Families.Count, slot, replacement, elapsed.Elapsed);
     }
 
     /// <summary>
@@ -465,14 +577,14 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
             {
                 yield return BytesWrite(
                     new ProtectedRecordId($"{prefix}manifest"),
-                    "query-store-normalized-plan", capturedAt, bytes);
+                    NormalizedPlanKind, capturedAt, bytes);
                 yield break;
             }
 
             var chunkCount = ChunkCount(bytes.Length, store.MaxPayloadBytes);
             foreach (var record in JsonWrites(
                          new ProtectedRecordId($"{prefix}manifest"),
-                         "query-store-normalized-plan",
+                         NormalizedPlanKind,
                          capturedAt,
                          new QueryStoreChunkManifest(chunkCount)))
                 yield return record;
@@ -485,7 +597,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
                     yield return BytesWrite(
                         new ProtectedRecordId(
                             $"{prefix}chunk:{offset / store.MaxPayloadBytes}"),
-                        "query-store-normalized-plan-chunk", capturedAt, chunk);
+                        NormalizedPlanChunkKind, capturedAt, chunk);
                 }
                 finally
                 {
@@ -742,6 +854,51 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
 }
 
 public sealed record QueryStoreSnapshotPointer(string SnapshotRecordId, string? StorageSlot = null);
+
+/// <summary>
+/// What one plan-cache quota pass reclaimed. An entry is one hydrated thing -- a raw Showplan, a
+/// raw query text, or a normalized plan with however many chunks it needed -- so entries and
+/// records differ whenever a plan was large enough to be chunked.
+/// </summary>
+public sealed record QueryStorePlanCacheEviction(
+    long RetainedBytesBefore,
+    long RetainedBytesAfter,
+    int EvictedEntries,
+    int EvictedRecords)
+{
+    public static QueryStorePlanCacheEviction None { get; } = new(0, 0, 0, 0);
+
+    public long ReclaimedBytes => RetainedBytesBefore - RetainedBytesAfter;
+}
+
+/// <summary>
+/// What one Query Store publish cost. Every publish rewrites a whole slot, so
+/// <see cref="StoredBytes"/> is the write churn one collection cycle causes, and
+/// <see cref="BytesPerFamily"/> is the per-unit figure to extrapolate from -- the only honest way
+/// to reason about a store larger than the one that was measured.
+/// </summary>
+public sealed record QueryStorePublishCost(
+    int FamilyCount,
+    string Slot,
+    ProtectedSetReplacement Replacement,
+    TimeSpan Elapsed)
+{
+    public static QueryStorePublishCost None { get; } =
+        new(0, "", default, TimeSpan.Zero);
+
+    public int RecordsWritten => Replacement.RecordsWritten;
+    public int RecordsDeleted => Replacement.RecordsDeleted;
+    public long PayloadBytes => Replacement.PayloadBytes;
+
+    /// <summary>Bytes written into the slot, envelope framing included.</summary>
+    public long StoredBytes => Replacement.StoredBytes;
+
+    /// <summary>How long the slot rewrite held other writers out of the store.</summary>
+    public TimeSpan WriteLockHold => Replacement.WriteLockHold;
+
+    public long BytesPerFamily => FamilyCount == 0 ? 0 : StoredBytes / FamilyCount;
+    public double RecordsPerFamily => FamilyCount == 0 ? 0 : (double)RecordsWritten / FamilyCount;
+}
 
 public sealed record QueryStorePublishedSnapshot(
     string SchemaVersion,

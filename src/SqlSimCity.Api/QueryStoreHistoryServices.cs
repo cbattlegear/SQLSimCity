@@ -52,6 +52,15 @@ public static class QueryStoreHistoryConfiguration
         return options;
     }
 
+    public static QueryStorePlanCacheOptions BuildPlanCacheOptions(IConfiguration configuration)
+    {
+        var options = new QueryStorePlanCacheOptions(
+            configuration.GetSection("QueryStoreHistory").GetValue<long?>("PlanCacheQuotaBytes")
+            ?? QueryStorePlanCacheOptions.DefaultQuotaBytes);
+        options.Validate();
+        return options;
+    }
+
     public static QueryStoreHistoryHostOptions BuildHostOptions(IConfiguration configuration)
     {
         var section = configuration.GetSection("QueryStoreHistory");
@@ -78,6 +87,7 @@ public sealed class QueryStoreHistoryBackgroundService(
     QueryStoreCollectionStatusTracker statusTracker,
     ProtectedQueryStoreRepository repository,
     IProtectedRecordStore protectedStore,
+    QueryStoreStorageTelemetry storageTelemetry,
     TimeProvider timeProvider,
     ILogger<QueryStoreHistoryBackgroundService> logger) : BackgroundService
 {
@@ -124,7 +134,8 @@ public sealed class QueryStoreHistoryBackgroundService(
                     {
                         LogNotificationFailure(logger, null);
                     }
-                    await protectedStore.PruneExpiredAsync(stoppingToken).ConfigureAwait(false);
+                    var pruned = await protectedStore.PruneExpiredAsync(stoppingToken).ConfigureAwait(false);
+                    await storageTelemetry.ReportAsync(pruned, stoppingToken).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

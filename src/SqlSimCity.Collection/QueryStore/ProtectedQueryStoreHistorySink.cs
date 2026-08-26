@@ -3,19 +3,42 @@ using System.Globalization;
 using System.Numerics;
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using SqlSimCity.Contracts.V1;
 
 namespace SqlSimCity.Collection.QueryStore;
 
 public sealed class ProtectedQueryStoreHistorySink(
     ProtectedQueryStoreRepository repository,
-    QueryStoreCollectionStatusTracker statusTracker) : IQueryStoreHistorySink
+    QueryStoreCollectionStatusTracker statusTracker,
+    ILogger<ProtectedQueryStoreHistorySink>? logger = null) : IQueryStoreHistorySink
 {
+    /// <summary>
+    /// Information, not Debug: every publish rewrites the whole slot, so this is the one number
+    /// that says what a collection cycle costs the disk, and an operator sizing a deployment
+    /// should not have to turn on verbose logging to see it. One line per cycle, and the cycle
+    /// is minutes long by default. Six values is the ceiling <see cref="LoggerMessage.Define"/>
+    /// supports, so the slot id is left on <see cref="LastPublishCost"/> rather than logged --
+    /// which of the two buffers was rewritten tells an operator nothing.
+    /// </summary>
+    private static readonly Action<ILogger, int, int, long, long, double, double, Exception?> LogPublishCost =
+        LoggerMessage.Define<int, int, long, long, double, double>(
+            LogLevel.Information, new EventId(22, "QueryStorePublishCost"),
+            "Query Store publish rewrote {FamilyCount} families as {RecordCount} records, " +
+            "{StoredBytes} bytes ({BytesPerFamily} bytes/family), holding the storage write lock " +
+            "{WriteLockHoldMs:0.#} ms of {ElapsedMs:0.#} ms. Every publish rewrites the whole slot, " +
+            "so this is the write churn per collection cycle, not the change since the last one.");
+
+    private readonly ILogger _logger = logger ?? NullLogger<ProtectedQueryStoreHistorySink>.Instance;
     private readonly ConcurrentDictionary<string, DatabaseFacts> _committed = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DatabaseFacts> _staged = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, QueryStoreWatermark> _pendingWatermarks = new(StringComparer.Ordinal);
     private long _sequence;
     public QueryStoreBuildInspection LastBuildInspection { get; private set; } = new(0, 0, 0, 0, 0, 0);
+
+    /// <summary>What the most recent publish cost. <see cref="QueryStorePublishCost.None"/> before the first.</summary>
+    public QueryStorePublishCost LastPublishCost { get; private set; } = QueryStorePublishCost.None;
 
     public Task<QueryStoreWatermark?> GetWatermarkAsync(
         string databaseId,
@@ -202,7 +225,11 @@ public sealed class ProtectedQueryStoreHistorySink(
         var snapshot = new QueryStorePublishedSnapshot(
             "1.0", Guid.NewGuid().ToString("N"), sequence, publishedAt, details, status);
 
-        await repository.PublishSnapshotAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        var cost = await repository.PublishSnapshotAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        LastPublishCost = cost;
+        LogPublishCost(
+            _logger, cost.FamilyCount, cost.RecordsWritten, cost.StoredBytes, cost.BytesPerFamily,
+            cost.WriteLockHold.TotalMilliseconds, cost.Elapsed.TotalMilliseconds, null);
         foreach (var databaseId in removedDatabases)
         {
             await repository.DeleteWatermarkAsync(databaseId, cancellationToken).ConfigureAwait(false);
