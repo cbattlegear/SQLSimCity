@@ -225,6 +225,8 @@ public sealed record ConnectorOptions
             QueryStoreWindow = TimeSpan.FromMinutes(
                 ParseIntStrict(Get("QUERY_STORE_WINDOW_MINUTES"), 1_440, "SQL_QUERY_STORE_WINDOW_MINUTES")),
             RefreshInterval = TimeSpan.FromSeconds(10),
+            QueryStoreRefreshInterval = TimeSpan.FromSeconds(ParseIntStrict(
+                Get("QUERY_STORE_REFRESH_INTERVAL_SECONDS"), 900, "SQL_QUERY_STORE_REFRESH_INTERVAL_SECONDS")),
             StaleAfter = TimeSpan.FromSeconds(
                 ParseIntStrict(Get("STALE_AFTER_SECONDS"), 180, "SQL_STALE_AFTER_SECONDS")),
         };

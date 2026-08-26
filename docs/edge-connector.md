@@ -139,6 +139,7 @@ or configure these fields:
 | `SQLSIMCITY_EDGE_SQL_SECRETS_DIR` | Directory containing SQL authentication files (default `/run/secrets`). |
 | `SQLSIMCITY_EDGE_SQL_DATABASE_CONCURRENCY` | Atlas/Query Store database concurrency, 1–16 (default 4). |
 | `SQLSIMCITY_EDGE_SQL_QUERY_STORE_WINDOW_MINUTES` | Atlas Query Store window (default 1440). |
+| `SQLSIMCITY_EDGE_SQL_QUERY_STORE_REFRESH_INTERVAL_SECONDS` | How often the atlas re-collects the Query Store workload aggregate, at least the atlas refresh interval and at most 86400 (default 900). Between collections the previous result is reported unchanged, keeping its own window and observation time. |
 | `SQLSIMCITY_EDGE_SQL_QUERY_STORE_PAGE_SIZE` | Incremental page bound, 1–10000 (default 1000). |
 | `SQLSIMCITY_EDGE_SQL_QUERY_STORE_OVERLAP_MINUTES` | Incremental overlap, 0–1440 (default 65). |
 

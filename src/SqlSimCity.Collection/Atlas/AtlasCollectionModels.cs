@@ -14,6 +14,16 @@ public sealed record AtlasCollectionOptions
     public int DatabaseConcurrency { get; init; } = 4;
     public TimeSpan QueryStoreWindow { get; init; } = TimeSpan.FromHours(24);
     public TimeSpan RefreshInterval { get; init; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// How often the Query Store workload aggregate is re-collected. Its cost is linear in the
+    /// runtime-stats buckets the window covers, so a day-long window re-aggregated on every atlas
+    /// cycle repeats the same scan around 1,440 times a day without the answer changing
+    /// meaningfully. Between collections the previous result is reported unchanged, keeping its own
+    /// observation time and window, which <see cref="QueryStoreHistoryV1"/> already carries.
+    /// </summary>
+    public TimeSpan QueryStoreRefreshInterval { get; init; } = TimeSpan.FromMinutes(15);
+
     public TimeSpan StaleAfter { get; init; } = TimeSpan.FromMinutes(3);
 
     public void Validate()
@@ -38,6 +48,8 @@ public sealed record AtlasCollectionOptions
             throw new ArgumentOutOfRangeException(nameof(QueryStoreWindow));
         if (RefreshInterval < TimeSpan.FromSeconds(10) || RefreshInterval > TimeSpan.FromHours(1))
             throw new ArgumentOutOfRangeException(nameof(RefreshInterval));
+        if (QueryStoreRefreshInterval < RefreshInterval || QueryStoreRefreshInterval > TimeSpan.FromDays(1))
+            throw new ArgumentOutOfRangeException(nameof(QueryStoreRefreshInterval));
         if (StaleAfter < RefreshInterval || StaleAfter > TimeSpan.FromDays(1))
             throw new ArgumentOutOfRangeException(nameof(StaleAfter));
     }
@@ -59,7 +71,7 @@ public sealed record AtlasDatabaseIdentity(
 
 public sealed record AtlasProbeSelection(
     string QueryStoreOptionsProbeId,
-    string QueryStoreWorkloadProbeId,
+    string? QueryStoreWorkloadProbeId,
     string FileIoProbeId);
 
 public sealed record AtlasSpaceResult(
@@ -130,6 +142,14 @@ public sealed record AtlasComponentOutcome<T>(
     int RowCount,
     bool IsSkipped)
 {
+    /// <summary>
+    /// The component was not probed because its own refresh interval had not elapsed, not because
+    /// anything about it was unavailable. Only this marker permits a previously collected value to
+    /// be reported again; every other unprobed outcome describes a real condition that must not be
+    /// papered over with an older success.
+    /// </summary>
+    public bool IsDeferred { get; init; }
+
     public bool IsSuccess => Value is not null && Status == DataStatus.Available;
     public bool IsFailure => Value is null && !IsSkipped;
 }
@@ -144,6 +164,9 @@ public static class AtlasComponentOutcome
 
     public static AtlasComponentOutcome<T> Skipped<T>(DataStatus status, string reason) =>
         new(default, status, reason, 0, true);
+
+    public static AtlasComponentOutcome<T> Deferred<T>(string reason) =>
+        new(default, DataStatus.Unknown, reason, 0, true) { IsDeferred = true };
 }
 
 public sealed record AtlasCollectionResult(
