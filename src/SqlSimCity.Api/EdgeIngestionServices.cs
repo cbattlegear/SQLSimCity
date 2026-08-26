@@ -26,6 +26,30 @@ public sealed class EdgeIngestionOptions
     public long MaxBatchBytes { get; init; } = 4 * 1024 * 1024;
     public int RateLimitPermitPerMinute { get; init; } = 120;
 
+    /// <summary>
+    /// Maximum buffered bytes across every in-progress section group of one target. The default is
+    /// five sections at the 32 MiB reassembly cap, so a connector operating within the existing
+    /// per-section bound is never rejected by this one.
+    /// </summary>
+    public long MaxPendingBytesPerTarget { get; init; } = 160L * 1024 * 1024;
+
+    /// <summary>Maximum buffered bytes across every in-progress section group of every target.</summary>
+    public long MaxPendingBytesTotal { get; init; } = 320L * 1024 * 1024;
+
+    /// <summary>Maximum in-progress section groups one target may hold open at once.</summary>
+    public int MaxPendingGroupsPerTarget { get; init; } = 64;
+
+    /// <summary>Maximum number of distinct targets the observation store will hold state for.</summary>
+    public int MaxTargets { get; init; } = 64;
+
+    public EdgeRetentionLimits Retention => new()
+    {
+        MaxPendingBytesPerTarget = MaxPendingBytesPerTarget,
+        MaxPendingBytesTotal = MaxPendingBytesTotal,
+        MaxPendingGroupsPerTarget = MaxPendingGroupsPerTarget,
+        MaxTargets = MaxTargets,
+    };
+
     public void Validate()
     {
         if (!Enabled)
@@ -44,6 +68,14 @@ public sealed class EdgeIngestionOptions
             throw new InvalidOperationException($"{SectionName}:MaxBatchBytes must be between 4 KiB and 64 MiB.");
         if (RateLimitPermitPerMinute is < 1 or > 100_000)
             throw new InvalidOperationException($"{SectionName}:RateLimitPermitPerMinute must be between 1 and 100000.");
+        if (MaxPendingBytesPerTarget < MaxBatchBytes || MaxPendingBytesPerTarget > 1024L * 1024 * 1024)
+            throw new InvalidOperationException($"{SectionName}:MaxPendingBytesPerTarget must be at least MaxBatchBytes and no more than 1 GiB.");
+        if (MaxPendingBytesTotal < MaxPendingBytesPerTarget || MaxPendingBytesTotal > 8L * 1024 * 1024 * 1024)
+            throw new InvalidOperationException($"{SectionName}:MaxPendingBytesTotal must be at least MaxPendingBytesPerTarget and no more than 8 GiB.");
+        if (MaxPendingGroupsPerTarget is < 1 or > 4096)
+            throw new InvalidOperationException($"{SectionName}:MaxPendingGroupsPerTarget must be between 1 and 4096.");
+        if (MaxTargets is < 1 or > 4096)
+            throw new InvalidOperationException($"{SectionName}:MaxTargets must be between 1 and 4096.");
     }
 }
 
@@ -79,6 +111,10 @@ public static class EdgeIngestionServiceCollectionExtensions
             ClockSkewSeconds = section.GetValue<int?>(nameof(EdgeIngestionOptions.ClockSkewSeconds)) ?? 300,
             MaxBatchBytes = section.GetValue<long?>(nameof(EdgeIngestionOptions.MaxBatchBytes)) ?? 4 * 1024 * 1024,
             RateLimitPermitPerMinute = section.GetValue<int?>(nameof(EdgeIngestionOptions.RateLimitPermitPerMinute)) ?? 120,
+            MaxPendingBytesPerTarget = section.GetValue<long?>(nameof(EdgeIngestionOptions.MaxPendingBytesPerTarget)) ?? 160L * 1024 * 1024,
+            MaxPendingBytesTotal = section.GetValue<long?>(nameof(EdgeIngestionOptions.MaxPendingBytesTotal)) ?? 320L * 1024 * 1024,
+            MaxPendingGroupsPerTarget = section.GetValue<int?>(nameof(EdgeIngestionOptions.MaxPendingGroupsPerTarget)) ?? 64,
+            MaxTargets = section.GetValue<int?>(nameof(EdgeIngestionOptions.MaxTargets)) ?? 64,
         };
         options.Validate();
         services.AddSingleton(options);
@@ -92,7 +128,8 @@ public static class EdgeIngestionServiceCollectionExtensions
         services.AddSingleton<INonceReplayStore>(nonces);
         services.AddSingleton(new SignatureVerificationOptions(TimeSpan.FromSeconds(options.ClockSkewSeconds)));
         services.AddSingleton(new EdgeObservationStore(
-            generationValidator: EdgeProjectionPayloadValidator.Validate));
+            generationValidator: EdgeProjectionPayloadValidator.Validate,
+            retention: options.Retention));
         services.AddSingleton(new IngestionLimits());
         services.AddRateLimiter(rateLimiter => rateLimiter.AddPolicy("edge-ingest", context =>
             RateLimitPartition.GetFixedWindowLimiter(

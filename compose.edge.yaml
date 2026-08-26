@@ -46,6 +46,13 @@ services:
       EdgeIngestion__ClockSkewSeconds: "300"
       EdgeIngestion__MaxBatchBytes: "4194304"
       EdgeIngestion__RateLimitPermitPerMinute: "120"
+      # Aggregate residency bounds. The 32 MiB section cap is per section group, so these bound the
+      # total a connector can hold buffered centrally. 160 MiB is five sections at that cap, so a
+      # legitimate connector is never rejected by them. Exceeding one is a 422, never a silent drop.
+      EdgeIngestion__MaxPendingBytesPerTarget: "167772160"
+      EdgeIngestion__MaxPendingBytesTotal: "335544320"
+      EdgeIngestion__MaxPendingGroupsPerTarget: "64"
+      EdgeIngestion__MaxTargets: "64"
     secrets:
       - edge-connector-catalog
       - edge-a-hmac
@@ -90,6 +97,9 @@ services:
       SQLSIMCITY_EDGE_SPOOL_DIR: /spool
       SQLSIMCITY_EDGE_FIXTURES_DIR: /app/fixtures/v1
       SQLSIMCITY_EDGE_COLLECT_INTERVAL_SECONDS: "15"
+      # Ceiling on the decayed collection cadence while the spool is rejecting batches, so a long
+      # outage stops re-querying SQL Server every cycle for evidence that cannot be stored.
+      SQLSIMCITY_EDGE_COLLECT_MAX_BACKOFF_SECONDS: "300"
       SQLSIMCITY_EDGE_DELIVER_INTERVAL_SECONDS: "5"
       SQLSIMCITY_EDGE_SPOOL_MAX_BYTES: "67108864"
       SQLSIMCITY_EDGE_SPOOL_MAX_ITEMS: "4096"

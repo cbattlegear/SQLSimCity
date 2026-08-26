@@ -2,12 +2,15 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Time.Testing;
 using SqlSimCity.Collection.LiveIncidents;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
 using SqlSimCity.Edge.Envelope;
+using SqlSimCity.Edge.Ingestion;
 using SqlSimCity.Edge.Signing;
 
 namespace SqlSimCity.Api.Tests;
@@ -27,7 +30,9 @@ public sealed class ApiEdgeIngestionTests : IDisposable
             "{\"formatVersion\":1,\"connectors\":[{\"connectorId\":\"edge-1\",\"keys\":[{\"keyId\":\"k1\",\"secretFile\":\"edge-1.key\"}]}]}");
     }
 
-    private WebApplicationFactory<ApiAssemblyMarker> EnabledFactory(int edgePermitPerMinute = 120) =>
+    private WebApplicationFactory<ApiAssemblyMarker> EnabledFactory(
+        int edgePermitPerMinute = 120,
+        Action<IWebHostBuilder>? configure = null) =>
         new WebApplicationFactory<ApiAssemblyMarker>().WithWebHostBuilder(builder =>
         {
             builder.UseSetting("EdgeIngestion:Enabled", "true");
@@ -40,6 +45,7 @@ public sealed class ApiEdgeIngestionTests : IDisposable
                 edgePermitPerMinute.ToString(CultureInfo.InvariantCulture));
             // In-process test clients share one rate-limit partition; keep it out of the way here.
             builder.UseSetting("HttpSecurity:ApiPermitLimit", "10000");
+            configure?.Invoke(builder);
         });
 
     private static ObservationBatchV1 SampleBatch()
@@ -310,6 +316,118 @@ public sealed class ApiEdgeIngestionTests : IDisposable
         Assert.Equal(before, await client.GetStringAsync("/api/v1/atlas"));
         var source = await client.GetStringAsync("/api/v1/edge/source");
         Assert.Contains("\"sequence\":1", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RepeatedReadsOfAnUnchangedGenerationDoNotCopyIt()
+    {
+        await using var factory = EnabledFactory();
+        using var client = factory.CreateClient();
+        var body = EdgeJson.SerializeToUtf8Bytes(await FullProjectionBatchAsync());
+        using (var request = SignedRequest(body))
+        using (var response = await client.SendAsync(request))
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        var store = factory.Services.GetRequiredService<EdgeObservationStore>();
+        // Prime the projection, then read every surface repeatedly. Cloning a generation deep-copies
+        // every section's bytes under the store's global lock, which also blocks ingestion, so a
+        // reader whose projection is already current must add no copies at all.
+        await client.GetStringAsync("/api/v1/atlas");
+        var copiesAfterPriming = store.PublishedGenerationCopies;
+
+        for (var read = 0; read < 5; read++)
+        {
+            await client.GetStringAsync("/api/v1/atlas");
+            await client.GetStringAsync("/api/v1/query-store/queries?metric=cpu&pageSize=10");
+            await client.GetStringAsync("/api/v1/database-city");
+            await client.GetStringAsync("/api/v1/live");
+            await client.GetStringAsync("/api/v1/edge/source");
+        }
+
+        Assert.Equal(copiesAfterPriming, store.PublishedGenerationCopies);
+    }
+
+    [Fact]
+    public async Task SingleSectionEndpointServesOneSectionWithoutCopyingTheGeneration()
+    {
+        await using var factory = EnabledFactory();
+        using var client = factory.CreateClient();
+        var body = EdgeJson.SerializeToUtf8Bytes(await FullProjectionBatchAsync());
+        using (var request = SignedRequest(body))
+        using (var response = await client.SendAsync(request))
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        var store = factory.Services.GetRequiredService<EdgeObservationStore>();
+        var before = store.PublishedGenerationCopies;
+
+        using var section = await client.GetAsync("/api/v1/edge/targets/target-1/sections/Atlas");
+        Assert.Equal(HttpStatusCode.OK, section.StatusCode);
+        var payload = await section.Content.ReadAsStringAsync();
+        Assert.Contains("\"section\":\"Atlas\"", payload, StringComparison.Ordinal);
+        Assert.Contains("\"targetId\":\"target-1\"", payload, StringComparison.Ordinal);
+
+        // Serving one section must not clone the other four.
+        Assert.Equal(before, store.PublishedGenerationCopies);
+
+        using var missing = await client.GetAsync("/api/v1/edge/targets/other-target/sections/Atlas");
+        Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+    }
+
+    [Fact]
+    public async Task AggregateRetentionBoundRejectsAnOversizedPendingBacklog()
+    {
+        await using var factory = EnabledFactory(configure: builder =>
+        {
+            // Below MaxBatchBytes is refused as incoherent, so bound the backlog at exactly one batch.
+            builder.UseSetting("EdgeIngestion:MaxBatchBytes", "4096");
+            builder.UseSetting("EdgeIngestion:MaxPendingBytesPerTarget", "4096");
+            builder.UseSetting("EdgeIngestion:MaxPendingBytesTotal", "4096");
+        });
+        using var client = factory.CreateClient();
+
+        var accepted = 0;
+        HttpStatusCode? rejection = null;
+        for (var attempt = 0; attempt < 12 && rejection is null; attempt++)
+        {
+            var body = EdgeJson.SerializeToUtf8Bytes(PartialGroupBatch($"partial-{attempt}", attempt + 1));
+            using var request = SignedRequest(body);
+            using var response = await client.SendAsync(request);
+            if (response.StatusCode == HttpStatusCode.Accepted)
+                accepted++;
+            else
+                rejection = response.StatusCode;
+        }
+
+        Assert.True(accepted > 0, "No partial group was ever accepted.");
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, rejection);
+    }
+
+    [Theory]
+    [InlineData("EdgeIngestion:MaxPendingBytesPerTarget", "1024")]
+    [InlineData("EdgeIngestion:MaxPendingBytesTotal", "1024")]
+    [InlineData("EdgeIngestion:MaxPendingGroupsPerTarget", "0")]
+    [InlineData("EdgeIngestion:MaxTargets", "0")]
+    public async Task IncoherentRetentionBoundsFailStartupClosed(string setting, string value)
+    {
+        await using var factory = EnabledFactory(configure: builder => builder.UseSetting(setting, value));
+        Assert.Throws<InvalidOperationException>(() => factory.CreateClient());
+    }
+
+    /// <summary>One chunk of a two-chunk group: it buffers pending bytes and never completes.</summary>
+    private static ObservationBatchV1 PartialGroupBatch(string batchId, long sequence)
+    {
+        var now = DateTimeOffset.UnixEpoch;
+        var payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(new string('p', 1400)));
+        var envelope = new ObservationEnvelopeV1(
+            "1.0", "edge-1", "target-1", sequence, "epoch-1", "boot-1", now,
+            ObservationSection.Atlas, $"group-{sequence}", 0, 2, ObservationCompression.None,
+            EdgeJson.Sha256Hex(Convert.FromBase64String(payload)),
+            new ObservationFreshnessV1(now, now, null),
+            payload);
+        return new ObservationBatchV1(
+            "1.0", "edge-1", batchId,
+            ObservationBatchBuilder.DeriveIdempotencyKey("edge-1", [envelope]),
+            now, now, [envelope]);
     }
 
     public void Dispose()

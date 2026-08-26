@@ -146,6 +146,76 @@ public sealed class EncryptedSpoolTests : IDisposable
         Assert.Throws<SpoolIntegrityException>(() => spool.PeekOldest());
     }
 
+    [Fact]
+    public void Status_accounting_tracks_enqueue_acknowledge_and_prune()
+    {
+        using var key = Key();
+        var time = new FakeTimeProvider(DateTimeOffset.UnixEpoch);
+        var spool = new EncryptedSpool(Options(maxAge: TimeSpan.FromMinutes(10)), key, time);
+        Assert.Equal(0, spool.GetStatus().ItemCount);
+        Assert.Equal(0, spool.GetStatus().ByteCount);
+
+        spool.Enqueue(EdgeTestSupport.SampleBatch(sequence: 1));
+        time.Advance(TimeSpan.FromMinutes(20));
+        spool.Enqueue(EdgeTestSupport.SampleBatch(sequence: 2));
+
+        var afterEnqueue = spool.GetStatus();
+        Assert.Equal(2, afterEnqueue.ItemCount);
+        Assert.Equal(OnDiskBytes(), afterEnqueue.ByteCount);
+
+        Assert.Equal(1, spool.PruneExpired());
+        var afterPrune = spool.GetStatus();
+        Assert.Equal(1, afterPrune.ItemCount);
+        Assert.Equal(OnDiskBytes(), afterPrune.ByteCount);
+
+        spool.Acknowledge(spool.PeekOldest()!.FileName);
+        var afterAcknowledge = spool.GetStatus();
+        Assert.Equal(0, afterAcknowledge.ItemCount);
+        Assert.Equal(0, afterAcknowledge.ByteCount);
+        Assert.Equal(OnDiskBytes(), afterAcknowledge.ByteCount);
+    }
+
+    [Fact]
+    public void Status_accounting_reflects_files_written_by_a_previous_process()
+    {
+        using var key = Key();
+        {
+            var first = new EncryptedSpool(Options(), key);
+            first.Enqueue(EdgeTestSupport.SampleBatch(sequence: 1));
+            first.Enqueue(EdgeTestSupport.SampleBatch(sequence: 2));
+        }
+
+        // A restart must not trust a stale tally: the directory is the source of truth.
+        using var resumed = Key();
+        var status = new EncryptedSpool(Options(), resumed).GetStatus();
+        Assert.Equal(2, status.ItemCount);
+        Assert.Equal(OnDiskBytes(), status.ByteCount);
+    }
+
+    [Fact]
+    public void Bounds_still_apply_to_a_spool_resumed_from_disk()
+    {
+        using var key = Key();
+        {
+            var first = new EncryptedSpool(Options(maxItems: 2), key);
+            Assert.Equal(SpoolEnqueueOutcome.Accepted, first.Enqueue(EdgeTestSupport.SampleBatch(sequence: 1)));
+            Assert.Equal(SpoolEnqueueOutcome.Accepted, first.Enqueue(EdgeTestSupport.SampleBatch(sequence: 2)));
+        }
+
+        using var resumedKey = Key();
+        var resumed = new EncryptedSpool(Options(maxItems: 2), resumedKey);
+        Assert.Equal(
+            SpoolEnqueueOutcome.RejectedBackpressure,
+            resumed.Enqueue(EdgeTestSupport.SampleBatch(sequence: 3)));
+        Assert.Equal(2, resumed.GetStatus().ItemCount);
+    }
+
+    /// <summary>Ground truth read straight off the file system, independent of the spool's own tally.</summary>
+    private long OnDiskBytes() =>
+        Directory.Exists(_dir)
+            ? Directory.EnumerateFiles(_dir, "*.spool").Sum(path => new FileInfo(path).Length)
+            : 0;
+
     public void Dispose()
     {
         if (Directory.Exists(_dir))

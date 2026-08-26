@@ -332,14 +332,20 @@ public sealed class EdgeAcquisitionSource :
 
     private Projection Current()
     {
-        var generation = _store.GetPublishedGeneration(_options.TargetId);
         lock (_gate)
         {
-            if (_cached is not null &&
-                _cached.Generation?.PublicationGeneration == generation?.PublicationGeneration)
-                return _cached;
-            _cached = generation is null ? Projection.Empty : Deserialize(generation);
-            return _cached;
+            // Ask the store for a clone only if the publication generation moved. A cache hit must
+            // not deep-copy every section's bytes under the store's global lock, which would also
+            // stall ingestion on a read that had nothing new to return.
+            var cached = _cached ?? Projection.Empty;
+            if (_store.TryGetPublishedGenerationIfChanged(
+                    _options.TargetId, cached.Generation?.PublicationGeneration, out var generation))
+            {
+                cached = generation is null ? Projection.Empty : Deserialize(generation);
+            }
+
+            _cached = cached;
+            return cached;
         }
     }
 

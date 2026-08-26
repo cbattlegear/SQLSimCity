@@ -23,6 +23,43 @@ public sealed record PublishedEdgeGeneration(
     long PublicationGeneration,
     IReadOnlyDictionary<ObservationSection, SectionGeneration> Sections);
 
+/// <summary>
+/// Aggregate residency bounds for the whole store. The per-section cap only bounds one section
+/// group, so without these an aggressive or hostile connector can grow resident memory without
+/// limit by opening many partial groups, many sections, or many targets at once. Every bound fails
+/// closed with a fixed, non-secret reason; evidence is never silently dropped.
+/// <para>
+/// The defaults are deliberately set so nothing a connector can legally do under the existing
+/// per-section cap is newly rejected: five sections at the 32 MiB cap is 160 MiB, so that is the
+/// per-target ceiling. These bound the pathological case, not the legitimate one.
+/// </para>
+/// </summary>
+public sealed record EdgeRetentionLimits
+{
+    /// <summary>Sections in a complete generation; the per-target default is this many at the section cap.</summary>
+    private const int SectionCount = 5;
+
+    /// <summary>Maximum buffered bytes across every in-progress section group of one target.</summary>
+    public long MaxPendingBytesPerTarget { get; init; } = SectionCount * 32L * 1024 * 1024;
+
+    /// <summary>Maximum buffered bytes across every in-progress section group of every target.</summary>
+    public long MaxPendingBytesTotal { get; init; } = 2 * SectionCount * 32L * 1024 * 1024;
+
+    /// <summary>Maximum in-progress section groups one target may hold open at once.</summary>
+    public int MaxPendingGroupsPerTarget { get; init; } = 64;
+
+    /// <summary>Maximum number of distinct targets the store will ever hold state for.</summary>
+    public int MaxTargets { get; init; } = 64;
+
+    public void Validate()
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxPendingBytesPerTarget, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxPendingBytesTotal, MaxPendingBytesPerTarget);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxPendingGroupsPerTarget, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxTargets, 1);
+    }
+}
+
 /// <summary>A generic, non-secret status summary for one monitored target, for the source/status panel.</summary>
 public sealed record EdgeTargetStatus(
     string TargetId,
@@ -40,7 +77,9 @@ public sealed record EdgeTargetStatus(
 /// complete, so a partial generation is never visible. Ingestion is atomic per batch: idempotency,
 /// epoch, and sequence conflicts are resolved before any chunk is buffered, so a rejected batch
 /// leaves no trace. Edge targets live in their own namespace and can never replace a fixture or
-/// connected source; multiple connectors and targets coexist without mixing ids.
+/// connected source; multiple connectors and targets coexist without mixing ids. Residency is
+/// bounded per section, per target, and across the whole store, so an aggressive or hostile
+/// connector cannot grow resident memory without limit.
 /// </summary>
 public sealed class EdgeObservationStore
 {
@@ -51,21 +90,26 @@ public sealed class EdgeObservationStore
     private readonly Dictionary<string, string> _batchIdToKey = new(StringComparer.Ordinal);
     private readonly int _idempotencyHistoryLimit;
     private readonly int _maxSectionBytes;
+    private readonly EdgeRetentionLimits _retention;
     private readonly TimeProvider _timeProvider;
     private readonly Func<PublishedEdgeGeneration, string?>? _generationValidator;
     private long _generation;
+    private long _publishedGenerationCopies;
 
     public EdgeObservationStore(
         TimeProvider? timeProvider = null,
         int idempotencyHistoryLimit = 8192,
         int maxSectionBytes = 32 * 1024 * 1024,
-        Func<PublishedEdgeGeneration, string?>? generationValidator = null)
+        Func<PublishedEdgeGeneration, string?>? generationValidator = null,
+        EdgeRetentionLimits? retention = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(idempotencyHistoryLimit, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxSectionBytes, 1);
         _timeProvider = timeProvider ?? TimeProvider.System;
         _idempotencyHistoryLimit = idempotencyHistoryLimit;
         _maxSectionBytes = maxSectionBytes;
+        _retention = retention ?? new EdgeRetentionLimits();
+        _retention.Validate();
         _generationValidator = generationValidator;
     }
 
@@ -77,6 +121,15 @@ public sealed class EdgeObservationStore
     internal int AcceptedBatchIdCount
     {
         get { lock (_gate) return _batchIdToKey.Count; }
+    }
+
+    /// <summary>
+    /// Read-path deep copies of a full published generation. Each one duplicates every section's
+    /// bytes under the global lock, so a reader whose projection is already current must not add one.
+    /// </summary>
+    internal long PublishedGenerationCopies
+    {
+        get { lock (_gate) return _publishedGenerationCopies; }
     }
 
     /// <summary>
@@ -105,9 +158,17 @@ public sealed class EdgeObservationStore
             {
                 if (!stagedTargets.TryGetValue(chunk.TargetId, out var state))
                 {
-                    state = _targets.TryGetValue(chunk.TargetId, out var existing)
-                        ? existing.Clone()
-                        : new TargetState(chunk.TargetId, batch.ConnectorId);
+                    if (!_targets.TryGetValue(chunk.TargetId, out var existing))
+                    {
+                        if (StagedTargetCount(stagedTargets) + 1 > _retention.MaxTargets)
+                            return IngestionResult.Rejected("Server holds the maximum number of monitored targets.");
+                        state = new TargetState(chunk.TargetId, batch.ConnectorId);
+                    }
+                    else
+                    {
+                        state = existing.Clone();
+                    }
+
                     stagedTargets.Add(chunk.TargetId, state);
                 }
 
@@ -129,6 +190,17 @@ public sealed class EdgeObservationStore
 
                 state.Admit(chunk, () => ++stagedGeneration);
                 state.TryPublishComplete();
+
+                // Aggregate residency is checked after every chunk rather than once at the end, so a
+                // hostile batch cannot walk past a bound part-way through. The staged clone is
+                // discarded on rejection, so nothing over the bound is ever retained; the transient
+                // peak stays bounded by the per-batch and per-chunk limits.
+                if (state.PendingGroupCount > _retention.MaxPendingGroupsPerTarget)
+                    return IngestionResult.Rejected("Target holds the maximum number of in-progress section groups.");
+                if (state.TotalPendingBytes > _retention.MaxPendingBytesPerTarget)
+                    return IngestionResult.Rejected("Target exceeds the maximum buffered evidence size.");
+                if (StagedPendingBytes(stagedTargets) > _retention.MaxPendingBytesTotal)
+                    return IngestionResult.Rejected("Server exceeds the maximum buffered evidence size.");
             }
 
             if (_generationValidator is not null)
@@ -159,12 +231,65 @@ public sealed class EdgeObservationStore
         }
     }
 
+    /// <summary>
+    /// Returns a full deep copy of the target's published generation. This duplicates every
+    /// section's bytes under the global lock, which also blocks ingestion for the duration — up to
+    /// ~160 MiB with sections at their cap. Prefer
+    /// <see cref="TryGetPublishedGenerationIfChanged"/> for a projection that may already be current,
+    /// or <see cref="GetPublishedSection"/> to serve a single section.
+    /// </summary>
     public PublishedEdgeGeneration? GetPublishedGeneration(string targetId)
     {
         lock (_gate)
         {
+            if (!_targets.TryGetValue(targetId, out var state) || state.PublishedGeneration is null)
+                return null;
+            _publishedGenerationCopies++;
+            return state.GetPublishedGeneration();
+        }
+    }
+
+    /// <summary>
+    /// Atomically compares the caller's already-projected publication generation against the
+    /// published one and clones only when they differ. A caller whose projection is still current
+    /// pays no copy at all — which matters because cloning a generation deep-copies every section's
+    /// bytes under this store's global lock, blocking ingestion for the duration.
+    /// <paramref name="generation"/> is the fresh clone when the result is <c>true</c>, or
+    /// <c>null</c> when nothing is published for the target (itself a change if the caller had a
+    /// projection). Cloning stays inside the lock: handing out the internal arrays instead would
+    /// trade the copy for a data race.
+    /// </summary>
+    public bool TryGetPublishedGenerationIfChanged(
+        string targetId,
+        long? knownPublicationGeneration,
+        out PublishedEdgeGeneration? generation)
+    {
+        lock (_gate)
+        {
+            var published = _targets.TryGetValue(targetId, out var state) ? state.PublishedGeneration : null;
+            if (published?.PublicationGeneration == knownPublicationGeneration)
+            {
+                generation = null;
+                return false;
+            }
+
+            generation = published is null ? null : TargetState.Clone(published);
+            if (generation is not null)
+                _publishedGenerationCopies++;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Returns one section of the target's published generation, cloning only that section. A
+    /// caller serving a single section never pays for a clone of the other four.
+    /// </summary>
+    public SectionGeneration? GetPublishedSection(string targetId, ObservationSection section)
+    {
+        lock (_gate)
+        {
             return _targets.TryGetValue(targetId, out var state)
-                ? state.GetPublishedGeneration()
+                ? state.GetPublishedSection(section)
                 : null;
         }
     }
@@ -177,6 +302,21 @@ public sealed class EdgeObservationStore
             var now = _timeProvider.GetUtcNow();
             return _targets.Values.Select(state => state.ToStatus(now)).ToArray();
         }
+    }
+
+    private int StagedTargetCount(IReadOnlyDictionary<string, TargetState> staged) =>
+        _targets.Count + staged.Keys.Count(targetId => !_targets.ContainsKey(targetId));
+
+    private long StagedPendingBytes(IReadOnlyDictionary<string, TargetState> staged)
+    {
+        var total = staged.Values.Sum(state => state.TotalPendingBytes);
+        foreach (var (targetId, state) in _targets)
+        {
+            if (!staged.ContainsKey(targetId))
+                total += state.TotalPendingBytes;
+        }
+
+        return total;
     }
 
     private void RecordIdempotency(string batchId, string key)
@@ -294,6 +434,17 @@ public sealed class EdgeObservationStore
 
         public PublishedEdgeGeneration? GetPublishedGeneration() => CloneGeneration(PublishedGeneration);
 
+        public SectionGeneration? GetPublishedSection(ObservationSection section) =>
+            PublishedGeneration is not null && PublishedGeneration.Sections.TryGetValue(section, out var published)
+                ? CloneSection(published)
+                : null;
+
+        /// <summary>Buffered bytes across every in-progress group of every section of this target.</summary>
+        public long TotalPendingBytes => _slots.Values.Sum(slot => slot.TotalPendingBytes);
+
+        /// <summary>In-progress groups across every section of this target.</summary>
+        public int PendingGroupCount => _slots.Values.Sum(slot => slot.PendingGroupCount);
+
         public void TryPublishComplete()
         {
             var sections = Enum.GetValues<ObservationSection>()
@@ -365,14 +516,15 @@ public sealed class EdgeObservationStore
         }
 
         private static PublishedEdgeGeneration? CloneGeneration(PublishedEdgeGeneration? generation) =>
-            generation is null
-                ? null
-                : generation with
-                {
-                    Sections = generation.Sections.ToDictionary(
-                        pair => pair.Key,
-                        pair => CloneSection(pair.Value)),
-                };
+            generation is null ? null : Clone(generation);
+
+        public static PublishedEdgeGeneration Clone(PublishedEdgeGeneration generation) =>
+            generation with
+            {
+                Sections = generation.Sections.ToDictionary(
+                    pair => pair.Key,
+                    pair => CloneSection(pair.Value)),
+            };
 
         private static SectionGeneration CloneSection(SectionGeneration section) =>
             section with { Content = (byte[])section.Content.Clone() };
@@ -384,6 +536,12 @@ public sealed class EdgeObservationStore
 
         public long PublishedSequence { get; private set; } = -1;
         public SectionGeneration? Published { get; private set; }
+
+        /// <summary>Buffered bytes across this section's in-progress groups.</summary>
+        public long TotalPendingBytes => _pending.Values.Sum(group => group.BufferedBytes);
+
+        /// <summary>In-progress groups this section is holding open.</summary>
+        public int PendingGroupCount => _pending.Count;
 
         public SectionSlot Clone()
         {

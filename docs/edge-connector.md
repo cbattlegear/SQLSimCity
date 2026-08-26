@@ -76,6 +76,26 @@ Disabled by default. Set `Acquisition:Mode=Edge`, configure the single source ta
 | `EdgeIngestion:ClockSkewSeconds` | Allowed timestamp skew (default 300). |
 | `EdgeIngestion:MaxBatchBytes` | Maximum accepted batch body size (default 4 MiB). |
 | `EdgeIngestion:RateLimitPermitPerMinute` | Per-client ingest limit, in addition to the global API limiter (default 120). |
+| `EdgeIngestion:MaxPendingBytesPerTarget` | Buffered bytes one target may hold across in-progress section groups (default 160 MiB). |
+| `EdgeIngestion:MaxPendingBytesTotal` | Buffered bytes across every target (default 320 MiB). |
+| `EdgeIngestion:MaxPendingGroupsPerTarget` | In-progress section groups one target may hold open (default 64). |
+| `EdgeIngestion:MaxTargets` | Distinct targets the observation store will hold state for (default 64). |
+
+### Bounded central residency
+
+A section is capped at 32 MiB reassembled, but that cap is **per section group**, so the four
+settings above bound the aggregate. Without them an aggressive or hostile connector can grow resident
+memory without limit by opening many partial groups, many sections, or many targets at once.
+
+The defaults bound the pathological case, not the legitimate one: 160 MiB per target is exactly five
+sections at the 32 MiB reassembly cap, so nothing a connector can legally do under the existing
+per-section bound is rejected by the aggregate one. Lower them if you want a tighter memory ceiling
+than the per-section caps imply, and remember that pending bytes are resident memory.
+
+Every bound fails closed with a `422` and a fixed, non-secret reason; evidence is never silently
+dropped, and a rejected batch leaves no trace — its buffers are not retained. Incoherent values (a
+per-target bound below `MaxBatchBytes`, or a total below the per-target bound) are rejected at
+startup rather than silently clamped.
 
 ### Connector secret catalog
 
@@ -105,6 +125,7 @@ separators, `..`, and rooted paths are rejected. Each secret file holds base64 o
 | `SQLSIMCITY_EDGE_SPOOL_KEY_FILE` | Separate AES-256 spool key file. |
 | `SQLSIMCITY_EDGE_FIXTURES_DIR` | Directory of the validated fixtures the connector forwards. |
 | `SQLSIMCITY_EDGE_COLLECT_INTERVAL_SECONDS` | Collection cadence (default 15). |
+| `SQLSIMCITY_EDGE_COLLECT_MAX_BACKOFF_SECONDS` | Ceiling on the decayed collection cadence during spool backpressure (default 300; 0 disables backoff). |
 | `SQLSIMCITY_EDGE_DELIVER_INTERVAL_SECONDS` | Delivery cadence (default 5). |
 | `SQLSIMCITY_EDGE_SPOOL_MAX_BYTES` / `_MAX_ITEMS` / `_MAX_AGE_SECONDS` | Spool bounds. |
 | `SQLSIMCITY_EDGE_ALLOW_LOOPBACK_HTTP` | Allow plain HTTP only for a loopback dev endpoint. |
@@ -223,6 +244,15 @@ Spool key file format:
 - Bounded collection and delivery loops never overlap a cycle with the previous one.
 - Exceeding a spool bound applies **explicit backpressure** (the batch is rejected and the connector
   reports paused) — never a silent drop. Age-based pruning reports a `droppedByAge` count.
+- After a rejection the **collection cadence decays exponentially**, up to
+  `SQLSIMCITY_EDGE_COLLECT_MAX_BACKOFF_SECONDS`, so a long outage stops charging the monitored SQL
+  Server a full query/serialize/compress/encrypt cycle every 15 seconds for evidence that cannot be
+  stored. The connector keeps trying at the decayed rate and recovers on its own once delivery frees
+  space — no operator action, and no separate reset.
+  Collection is deliberately **not** gated on the paused flag. That flag is set by a rejection and
+  cleared only by a *successful enqueue*, never merely by delivery draining space, so skipping
+  collection while paused would suppress the very enqueue that clears it and the connector would
+  never recover. The `connector.backpressure` event reports the next cadence as `nextCollectSeconds`.
 - Transient failures back off exponentially with jitter. `429` honors `Retry-After`. A `413` splits
   the batch at existing chunk boundaries and re-spools the halves. An authentication failure **stops**
   delivery instead of retry-storming; it clears when credentials are corrected.
@@ -288,5 +318,10 @@ bounds necessarily drops the oldest evidence. Size the bounds for your longest e
   content, or a target already owned by another connector. Confirm the connector/target id mapping.
 - **`413` from central:** batch exceeds `MaxBatchBytes`; the connector splits and retries automatically.
 - **Connector `paused` / `droppedByAge` > 0:** the central endpoint has been unreachable long enough to
-  fill or age out the spool. Restore connectivity or raise the spool bounds.
+  fill or age out the spool. Restore connectivity or raise the spool bounds. While paused the
+  connector collects on a decayed cadence (`nextCollectSeconds` on the `connector.backpressure`
+  event) and resumes the configured interval by itself once a batch is spooled again.
+- **`422` naming a buffered-evidence or target bound:** central residency limits were reached. Either
+  a connector is opening more partial section groups or targets than configured, or the
+  `EdgeIngestion:MaxPending*`/`MaxTargets` bounds are too tight for a legitimate workload.
 - **HTTP refused at startup:** the endpoint is not HTTPS and is not a loopback dev address.

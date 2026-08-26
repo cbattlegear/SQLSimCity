@@ -12,6 +12,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="SqlSimCity.Edge.Tests" />
+    <!-- EdgeAcquisitionSource lives in SqlSimCity.Api; its read-path copy accounting is asserted there. -->
+    <InternalsVisibleTo Include="SqlSimCity.Api.Tests" />
   </ItemGroup>
 
 </Project>

@@ -57,6 +57,15 @@ public sealed record ConnectorOptions
 
     public TimeSpan CollectInterval { get; init; } = TimeSpan.FromSeconds(15);
     public TimeSpan DeliverInterval { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Ceiling on the collection cadence after consecutive spool backpressure rejections. During an
+    /// outage the collection cycle decays exponentially from <see cref="CollectInterval"/> up to this
+    /// bound instead of querying, serializing, and sealing a batch every cycle only to have it
+    /// rejected. A ceiling below <see cref="CollectInterval"/> simply means no backoff.
+    /// </summary>
+    public TimeSpan CollectBackoffMaxInterval { get; init; } = TimeSpan.FromMinutes(5);
+
     public bool AllowLoopbackHttp { get; init; }
 
     /// <summary>Optional loopback-only health port. 0 disables it. Never a control API.</summary>
@@ -85,6 +94,8 @@ public sealed record ConnectorOptions
             throw new ConnectorConfigurationException("Collect interval must be between 1 second and 1 hour.");
         if (DeliverInterval < TimeSpan.FromSeconds(1) || DeliverInterval > TimeSpan.FromHours(1))
             throw new ConnectorConfigurationException("Deliver interval must be between 1 second and 1 hour.");
+        if (CollectBackoffMaxInterval < TimeSpan.Zero || CollectBackoffMaxInterval > TimeSpan.FromHours(24))
+            throw new ConnectorConfigurationException("Collect backoff ceiling must be between 0 seconds and 24 hours.");
         if (LoopbackHealthPort is < 0 or > 65535)
             throw new ConnectorConfigurationException("Loopback health port must be between 0 and 65535.");
     }
@@ -116,6 +127,7 @@ public sealed record ConnectorOptions
                 FixturesDirectory = Get("FIXTURES_DIR") ?? string.Empty,
                 CollectInterval = ParseSeconds(Get("COLLECT_INTERVAL_SECONDS"), 15),
                 DeliverInterval = ParseSeconds(Get("DELIVER_INTERVAL_SECONDS"), 5),
+                CollectBackoffMaxInterval = ParseSeconds(Get("COLLECT_MAX_BACKOFF_SECONDS"), 300),
                 AllowLoopbackHttp = ParseBool(Get("ALLOW_LOOPBACK_HTTP")),
                 LoopbackHealthPort = ParseInt(Get("LOOPBACK_HEALTH_PORT"), 0),
                 SpoolMaxBytes = ParseLong(Get("SPOOL_MAX_BYTES"), 64L * 1024 * 1024),

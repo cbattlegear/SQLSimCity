@@ -8,8 +8,10 @@ namespace SqlSimCity.Edge.Connector;
 /// batch per cadence and durably spools it (applying backpressure), and a delivery loop that drains
 /// the spool oldest-first, honoring 429/Retry-After, splitting 413 at chunk boundaries, and stopping
 /// on auth failure instead of retry-storming. Neither loop keeps unbounded in-memory state — the
-/// backlog lives in the bounded spool. On shutdown the delivery loop performs one final, time-bounded
-/// drain so queued evidence has a chance to flush before the process exits.
+/// backlog lives in the bounded spool. When the spool rejects a batch the collection cadence backs
+/// off exponentially, so a long outage stops re-paying for evidence that cannot be stored. On
+/// shutdown the delivery loop performs one final, time-bounded drain so queued evidence has a chance
+/// to flush before the process exits.
 /// </summary>
 public sealed class ConnectorRuntime(
     ConnectorOptions options,
@@ -47,6 +49,7 @@ public sealed class ConnectorRuntime(
 
     private async Task CollectionLoopAsync(CancellationToken cancellationToken)
     {
+        var consecutiveRejections = 0;
         while (!cancellationToken.IsCancellationRequested)
         {
             try
@@ -58,10 +61,14 @@ public sealed class ConnectorRuntime(
                     var outcome = pump.Submit(batch);
                     if (outcome == SpoolEnqueueOutcome.RejectedBackpressure)
                     {
-                        log.Warn("connector.backpressure", Status());
+                        consecutiveRejections++;
+                        var fields = Status();
+                        fields["nextCollectSeconds"] = CollectDelay(options, consecutiveRejections).TotalSeconds;
+                        log.Warn("connector.backpressure", fields);
                     }
                     else
                     {
+                        consecutiveRejections = 0;
                         log.Info("connector.collected", new Dictionary<string, object?>
                         {
                             ["batchId"] = batch.BatchId,
@@ -75,9 +82,33 @@ public sealed class ConnectorRuntime(
                 log.Error("connector.collect_failed", new Dictionary<string, object?> { ["error"] = ex.GetType().Name });
             }
 
-            if (!await DelayAsync(options.CollectInterval, cancellationToken).ConfigureAwait(false))
+            if (!await DelayAsync(CollectDelay(options, consecutiveRejections), cancellationToken).ConfigureAwait(false))
                 break;
         }
+    }
+
+    /// <summary>
+    /// How long to wait before the next collection cycle. After a real spool rejection the cadence
+    /// decays exponentially up to <see cref="ConnectorOptions.CollectBackoffMaxInterval"/>, so an
+    /// outage stops costing the monitored SQL Server a full query/serialize/seal cycle every
+    /// interval, while the connector keeps trying and recovers on its own once delivery drains space.
+    /// <para>
+    /// Collection is deliberately <b>not</b> gated on the pump's paused flag. That flag is set by a
+    /// rejection and cleared only by a <i>successful enqueue</i> — never merely by delivery freeing
+    /// space — so skipping collection while paused would suppress the very enqueue that clears it and
+    /// the connector would never recover. Backoff decays the wasted work without that deadlock.
+    /// </para>
+    /// </summary>
+    internal static TimeSpan CollectDelay(ConnectorOptions options, int consecutiveRejections)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (consecutiveRejections <= 0)
+            return options.CollectInterval;
+
+        var baseMs = options.CollectInterval.TotalMilliseconds;
+        var ceilingMs = Math.Max(options.CollectBackoffMaxInterval.TotalMilliseconds, baseMs);
+        var scaled = baseMs * Math.Pow(2, Math.Min(consecutiveRejections, 16));
+        return TimeSpan.FromMilliseconds(Math.Min(scaled, ceilingMs));
     }
 
     private async Task DeliveryLoopAsync(CancellationToken cancellationToken)

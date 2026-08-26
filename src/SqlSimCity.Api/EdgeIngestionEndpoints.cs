@@ -41,10 +41,9 @@ public static class EdgeIngestionEndpoints
             if (!Enum.TryParse<ObservationSection>(section, ignoreCase: true, out var parsed))
                 return Results.BadRequest(new { error = "Unknown observation section." });
 
-            var generation = ctx.Store.GetPublishedGeneration(targetId) is { } published &&
-                             published.Sections.TryGetValue(parsed, out var completeSection)
-                ? completeSection
-                : null;
+            // Clone only the requested section: taking the whole published generation would deep-copy
+            // all five sections under the store's global lock to serve one.
+            var generation = ctx.Store.GetPublishedSection(targetId, parsed);
             if (generation is null)
                 return Results.NotFound();
 

@@ -21,6 +21,9 @@ public sealed record SpooledBatch(string FileName, string BatchId, ObservationBa
 /// production order after a restart.</item>
 /// <item>No traversal or special files: only regular files whose names match the strict spool
 /// pattern are ever read, and batch ids are validated to a safe token before they touch the path.</item>
+/// <item>Cheap accounting: occupancy is scanned once, then maintained from this instance's own
+/// mutations, so a per-cycle status or enqueue does not re-enumerate and re-stat the directory. A
+/// restart or a mutation that fails part-way discards the tally and rescans.</item>
 /// </list>
 /// </summary>
 public sealed partial class EncryptedSpool
@@ -32,6 +35,7 @@ public sealed partial class EncryptedSpool
     private long _sequence;
     private long _droppedByAge;
     private bool _paused;
+    private (int Count, long Bytes)? _occupancy;
 
     public EncryptedSpool(SpoolOptions options, SpoolKey key, TimeProvider? timeProvider = null)
     {
@@ -81,6 +85,9 @@ public sealed partial class EncryptedSpool
             var finalPath = Path.Combine(_options.DataDirectory, name);
             var tempPath = Path.Combine(_options.DataDirectory, $".tmp-{Guid.NewGuid():N}");
 
+            // Any failure between here and the tally update leaves the directory as the source of
+            // truth; discard the cached occupancy so the next measure rescans.
+            _occupancy = null;
             using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 stream.Write(sealed_, 0, sealed_.Length);
@@ -88,6 +95,7 @@ public sealed partial class EncryptedSpool
             }
 
             File.Move(tempPath, finalPath, overwrite: false);
+            _occupancy = (count + 1, bytes + sealed_.Length);
             _paused = false;
             fileName = name;
             return SpoolEnqueueOutcome.Accepted;
@@ -123,8 +131,12 @@ public sealed partial class EncryptedSpool
         lock (_gate)
         {
             var path = Path.Combine(_options.DataDirectory, fileName);
-            if (File.Exists(path))
-                File.Delete(path);
+            if (!File.Exists(path))
+                return;
+
+            var length = TryFileLength(path);
+            File.Delete(path);
+            Deduct(length);
         }
     }
 
@@ -140,7 +152,9 @@ public sealed partial class EncryptedSpool
                 var millis = ParsePrefixMillis(Path.GetFileName(path));
                 if (millis < cutoff)
                 {
+                    var length = TryFileLength(path);
                     File.Delete(path);
+                    Deduct(length);
                     dropped++;
                 }
             }
@@ -159,17 +173,53 @@ public sealed partial class EncryptedSpool
         }
     }
 
+    /// <summary>
+    /// Current occupancy, scanned once and then maintained from this instance's own mutations. The
+    /// directory stays the source of truth: a fresh instance (a restart) rescans, and so does any
+    /// mutation that could not account for itself.
+    /// </summary>
     private (int Count, long Bytes) MeasureLocked()
     {
+        if (_occupancy is { } cached)
+            return cached;
+
         var count = 0;
         long bytes = 0;
         foreach (var path in ListValidFilesLocked())
         {
+            var length = TryFileLength(path);
+            if (length is null)
+                continue; // Vanished between enumeration and stat; it is no longer occupancy.
             count++;
-            bytes += new FileInfo(path).Length;
+            bytes += length.Value;
         }
 
-        return (count, bytes);
+        _occupancy = (count, bytes);
+        return _occupancy.Value;
+    }
+
+    /// <summary>Removes one accounted-for file from the tally, or discards it if the size is unknown.</summary>
+    private void Deduct(long? length)
+    {
+        if (_occupancy is not { } cached || length is null)
+        {
+            _occupancy = null;
+            return;
+        }
+
+        _occupancy = (Math.Max(cached.Count - 1, 0), Math.Max(cached.Bytes - length.Value, 0));
+    }
+
+    private static long? TryFileLength(string path)
+    {
+        try
+        {
+            return new FileInfo(path).Length;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or IOException)
+        {
+            return null;
+        }
     }
 
     private IEnumerable<string> ListValidFilesLocked()
