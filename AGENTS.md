@@ -164,12 +164,17 @@ Do not weaken `--locked-mode` in CI to get around this. It is a supply-chain con
 
 ```powershell
 dotnet build SqlSimCity.slnx -c Release        # 0 warnings expected
-dotnet test SqlSimCity.slnx -c Release         # 1,144 tests
-cd web; npm ci; npm run build; npm test -- --run   # 753 tests / 41 files
+dotnet test SqlSimCity.slnx -c Release         # 1,226 tests
+npm test                                       # 598 probe-catalog tests
+cd web; npm ci; npm run build; npm test -- --run   # 772 tests / 42 files
 npm run typecheck
 ```
 
 Those counts are the baselines to compare against. Investigate any delta rather than accepting it.
+
+The root `npm test` is easy to miss because the web suite is the one usually meant by "the
+frontend tests". It validates `sql/manifest.json` against the probe files, and it is what pins
+the shape of the Query Store paging probes — a probe edit can leave both other suites green.
 
 ## Every pull request needs a `release:*` label
 
@@ -201,6 +206,26 @@ unlabelled.
 
 If a change genuinely should not ship on its own, prefer `release:skip` over leaving it bare, so the
 intent is recorded rather than inferred.
+
+### Merge one pull request at a time, and wait for its release
+
+The label is only half of it. Auto-release triggers on **CI completing on `main`**, not on the
+merge, and CI cancels a superseded in-progress run. So merging a second pull request before the
+first one's run finishes cancels that run, and the release it would have cut never happens — the
+commits still land, but one commit's label never gets read.
+
+That is not hypothetical. #85 (`release:minor`) and #86 (`release:patch`) were merged 94 seconds
+apart. #85's run on `main` was cancelled, only #86's reached the release job, and both shipped as
+**v0.7.2** — a patch. The new `Atlas:QueryStoreRefreshIntervalSeconds` setting went out understated,
+which is the same understatement failure as merging unlabelled, reached by a different route.
+
+It cannot be repaired afterwards by dispatching a bump, either: the workflow declines to cut a
+second release for a commit that is already tagged, deliberately, so the tag stays where the first
+release put it. The only clean fix is not to cause it.
+
+Wait for the release to appear before merging the next one. If several pull requests share a bump
+class the collapse is harmless — the version lands in the right place either way — but confirm that
+before relying on it, rather than after.
 
 ## Scratch files
 
