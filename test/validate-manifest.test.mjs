@@ -1440,3 +1440,151 @@ describe('regression: by-name column readers never use CommandBehavior.Sequentia
     );
   });
 });
+
+// Issue #81 part 3. Live collection had no row cap and no text cap, so a live snapshot's size was
+// bounded by the watched workload rather than by anything SqlSimCity controlled: measured against
+// SQL Server 2022, 5,009 idle sessions carrying no batch text produced a 5.88 MiB snapshot, and 50
+// sessions each executing a 1 MiB single-statement batch produced a 100.2 MiB snapshot that took
+// 4.35 s to collect -- longer than the sampler's own 2-5 s cadence -- and allocated 103 GiB in the
+// collecting process. The same workload with @IncludeSqlText = 0 collected in 39 ms and allocated
+// 0.9 MiB, which is why the text cap has to be a probe parameter and not a post-read truncation.
+//
+// Both caps are only acceptable because they disclose what they omitted. These guards pin that
+// disclosure, not merely the caps: a cap that shipped without visible_session_count or without the
+// untruncated text lengths would turn a bandwidth fix into an evidence-honesty defect, and would
+// still pass every test that only checks the result got smaller.
+describe('regression: sessions.active_requests bounds its result and discloses what it omitted', () => {
+  const probe = () => probeById('sessions.active_requests');
+  const source = () => stripSqlComments(readProbeSource(probe()));
+
+  test('declares both caps as optional parameters that default to no cap', () => {
+    for (const name of ['@MaxRows', '@MaxTextLength']) {
+      const param = probe().parameters.find((p) => p.name === name);
+      assert.ok(param, `sessions.active_requests must declare ${name}`);
+      assert.equal(param.required, false, `${name} must stay optional`);
+      assert.equal(param.default, null, `${name} must default to no cap, leaving the policy to the caller`);
+    }
+  });
+
+  test('caps the row count by a deterministic rank rather than an arbitrary TOP', () => {
+    assert.match(
+      source(),
+      /ROW_NUMBER\(\)\s+OVER\s*\(/i,
+      'the row cap must keep a defined set of rows, not whichever ones the engine happens to emit first',
+    );
+    assert.match(
+      source(),
+      /@MaxRows\s+IS\s+NULL\s+OR\s+v\.selection_rank\s*<=\s*@MaxRows/i,
+      'a NULL @MaxRows must mean no cap, so the probe stays usable uncapped',
+    );
+  });
+
+  test('reports the pre-cap row count, so a capped sample is not read as a smaller server', () => {
+    assert.match(
+      source(),
+      /COUNT\(\*\)\s+OVER\s*\(\s*\)\s+AS\s+visible_session_count/i,
+      'without a pre-cap count, "5,009 sessions showing 1,000" is indistinguishable from "1,000 sessions"',
+    );
+    assert.match(source(), /v\.visible_session_count/i, 'the count must survive into the projected result');
+    assert.match(source(), /v\.selection_rank/i, 'the rank the cap used must be visible to the consumer');
+  });
+
+  test('shortens both text columns and reports both untruncated lengths', () => {
+    assert.match(
+      source(),
+      /LEFT\(\s*st\.text\s*,\s*@MaxTextLength\s*\)/i,
+      'batch text must be shortened in SQL: the cost is paid materializing it out of the engine, ' +
+        'so truncating after the read would save none of it',
+    );
+    assert.match(
+      source(),
+      /DATALENGTH\(st\.text\)\s*\/\s*2\s+AS\s+int\)\s+AS\s+batch_text_length/i,
+      'a shortened batch must carry its real length or it reads as a short batch',
+    );
+    assert.match(
+      source(),
+      /AS\s+int\)\s+AS\s+current_statement_text_length/i,
+      'a shortened statement must carry its real length too; the batch length does not imply it',
+    );
+    assert.match(
+      source(),
+      />\s*@MaxTextLength\s+THEN\s+@MaxTextLength/i,
+      'the statement substring length must be clamped to the cap, not just the batch',
+    );
+  });
+
+  // The statement-offset idiom adds 1 to SUBSTRING's length argument, which is harmless for
+  // SUBSTRING and wrong as a reported length: it overstates by one character, so every
+  // single-statement batch claimed a truncation that had not happened. A cap that fabricates
+  // omissions is no better than one that hides them.
+  test('reports the statement length without the substring idiom\'s off-by-one', () => {
+    const reported = source().match(
+      /CAST\(\s*([\s\S]*?)AS\s+int\)\s+AS\s+current_statement_text_length/i,
+    );
+    assert.ok(reported, 'current_statement_text_length must be a CAST(... AS int) expression');
+    assert.doesNotMatch(
+      reported[1],
+      /\)\s*\+\s*1\s*$/,
+      'the reported statement length must not carry the substring idiom\'s trailing "+ 1"; ' +
+        'a 562-character statement reported as 563 makes the collector claim a truncation that ' +
+        'never happened',
+    );
+  });
+
+  test('manifest result contract states that both caps disclose their omissions', () => {
+    assert.match(probe().resultContract, /visible_session_count/i);
+    assert.match(probe().resultContract, /batch_text_length/i);
+    assert.match(probe().resultContract, /current_statement_text_length/i);
+  });
+});
+
+// Issue #81 part 3, second measured term. Once the request sample was capped, sys.dm_db_session_space_usage
+// and sys.dm_db_task_space_usage became the largest part of a live snapshot: they return a row per
+// session and per task whether or not tempdb was ever touched, so they scale with connection count
+// rather than tempdb activity, and 5,028 sessions measured 1.76 MiB of almost entirely zero counters.
+// The cap keeps the heaviest allocators -- which is what "spot a runaway session before tempdb fills
+// up" needs -- and, as with the request caps, is only acceptable because it says what it dropped.
+describe('regression: tempdb.usage bounds its per-session and per-task rows and discloses the pre-cap counts', () => {
+  const probe = () => probeById('tempdb.usage');
+  const source = () => stripSqlComments(readProbeSource(probe()));
+
+  test('declares a separate optional cap for each of the two growing result sets', () => {
+    for (const name of ['@MaxSessionRows', '@MaxTaskRows']) {
+      const param = probe().parameters.find((p) => p.name === name);
+      assert.ok(param, `tempdb.usage must declare ${name}`);
+      assert.equal(param.required, false, `${name} must stay optional`);
+      assert.equal(param.default, null, `${name} must default to no cap, leaving the policy to the caller`);
+    }
+  });
+
+  test('keeps the heaviest tempdb allocators rather than an arbitrary slice', () => {
+    assert.match(
+      source(),
+      /ORDER\s+BY\s+ss\.user_objects_alloc_page_count\s*\+\s*ss\.internal_objects_alloc_page_count\s+DESC/i,
+      'the session cap must keep the biggest allocators; dropping them would discard exactly the ' +
+        'evidence this probe exists to surface',
+    );
+    assert.match(
+      source(),
+      /ORDER\s+BY\s+ts\.user_objects_alloc_page_count\s*\+\s*ts\.internal_objects_alloc_page_count\s+DESC/i,
+      'the task cap must keep the biggest allocators too',
+    );
+  });
+
+  test('reports both pre-cap counts, so a bounded result is not read as a quieter instance', () => {
+    assert.match(source(), /COUNT\(\*\)\s+OVER\s*\(\s*\)\s+AS\s+visible_session_count/i);
+    assert.match(source(), /COUNT\(\*\)\s+OVER\s*\(\s*\)\s+AS\s+visible_task_count/i);
+    assert.match(source(), /v\.visible_session_count/i, 'the session count must survive into the projected result');
+    assert.match(source(), /v\.visible_task_count/i, 'the task count must survive into the projected result');
+  });
+
+  test('each cap is independently optional, so a NULL cap still returns every row', () => {
+    assert.match(source(), /@MaxSessionRows\s+IS\s+NULL\s+OR\s+v\.selection_rank\s*<=\s*@MaxSessionRows/i);
+    assert.match(source(), /@MaxTaskRows\s+IS\s+NULL\s+OR\s+v\.selection_rank\s*<=\s*@MaxTaskRows/i);
+  });
+
+  test('manifest result contract states that the two caps disclose their omissions', () => {
+    assert.match(probe().resultContract, /visible_session_count/i);
+    assert.match(probe().resultContract, /visible_task_count/i);
+  });
+});

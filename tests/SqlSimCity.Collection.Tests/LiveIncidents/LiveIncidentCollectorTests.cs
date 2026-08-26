@@ -14,10 +14,14 @@ public class LiveIncidentCollectorTests
 {
     private static readonly DateTimeOffset EngineStart = new(2024, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
+    // The trailing 0/1/null arguments are the probe's cap-disclosure columns (visible_session_count,
+    // selection_rank, and the two untruncated text lengths). These tests do not exercise a cap; the
+    // collector floors the visible count at the number of rows it actually received.
     private static ActiveRequestRow Request(int sessionId, int requestId = 1) => new(
         sessionId, "app_user", "app-host", "MyApp", "running",
         null, null, requestId, "running", "SELECT", null, null, null, null,
-        DateTimeOffset.UnixEpoch, 10, 5, 100, 50, 200, 0, 5, "AppDb", "SELECT 1", "SELECT 1");
+        DateTimeOffset.UnixEpoch, 10, 5, 100, 50, 200, 0, 5, "AppDb", "SELECT 1", "SELECT 1",
+        0, 1, "SELECT 1".Length, "SELECT 1".Length);
 
     [Fact]
     public async Task RequestPresentInPreviousCycleButMissingNowIsReportedAsDisappearedNotDropped()
@@ -239,7 +243,7 @@ public class LiveIncidentCollectorTests
             {
                 tempdbProbeWasCalled = true;
                 return Task.FromResult(new TempdbUsageRaw(
-                    [], [new TempdbSessionRow(51, 10, 2, 0, 0)], []));
+                    [], [new TempdbSessionRow(51, 10, 2, 0, 0, VisibleSessionCount: 1)], []));
             },
         };
         var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
@@ -306,11 +310,12 @@ public class LiveIncidentCollectorTests
         var idleRow = new ActiveRequestRow(
             60, "app_user", "app-host", "MyApp", "sleeping",
             DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null, null, null, null);
+            null, null, null, null, null, null, null, null, null, null, null, 0, 1, null, null);
         var realRequestZeroRow = new ActiveRequestRow(
             61, "app_user", "app-host", "MyApp", "running",
             null, null, 0, "running", "SELECT", null, null, null, null,
-            DateTimeOffset.UnixEpoch, 5, 5, 1, 1, 1, 0, 5, "AppDb", "SELECT 1", "SELECT 1");
+            DateTimeOffset.UnixEpoch, 5, 5, 1, 1, 1, 0, 5, "AppDb", "SELECT 1", "SELECT 1",
+            0, 2, "SELECT 1".Length, "SELECT 1".Length);
 
         var probes = new FakeLiveIncidentProbeExecutor
         {
@@ -501,5 +506,221 @@ public class LiveIncidentCollectorTests
         var scheduler = Assert.Single(second.Scheduler.Schedulers);
         Assert.Equal(CounterEpochState.EpochReset, scheduler.CpuUsageMsDelta.State);
         Assert.Equal(CounterEpochState.EpochReset, scheduler.SchedulerDelayMsDelta.State); // must NOT be Delta/0
+    }
+
+    // --- Issue #81 part 3: a bounded live sample has to disclose what it left out. ---
+    //
+    // Live collection had no row cap and no text cap, so snapshot size was bounded by the watched
+    // workload rather than by anything SqlSimCity controlled. Measured against SQL Server 2022,
+    // 5,009 idle sessions carrying no batch text produced a 5.88 MiB snapshot, and 50 sessions each
+    // executing a 1 MiB batch produced a 100.2 MiB snapshot that took 4.35 s to collect -- longer
+    // than the sampler's own cadence. Both caps now exist, and the point of these tests is that
+    // neither is allowed to shrink the evidence quietly.
+
+    private static ActiveRequestRow CappedRow(int sessionId, int visibleSessionCount, int selectionRank) => new(
+        sessionId, "app_user", "app-host", "MyApp", "running",
+        null, null, 1, "running", "SELECT", null, null, null, null,
+        DateTimeOffset.UnixEpoch, 10, 5, 100, 50, 200, 0, 5, "AppDb", "SELECT 1", "SELECT 1",
+        visibleSessionCount, selectionRank, "SELECT 1".Length, "SELECT 1".Length);
+
+    [Fact]
+    public async Task RowCapReportsHowManySessionsWereVisibleSoACappedSampleIsNotASmallerServer()
+    {
+        var probes = new FakeLiveIncidentProbeExecutor
+        {
+            ServerIdentity = _ => Task.FromResult(FakeLiveIncidentProbeExecutor.DefaultIdentity(EngineStart)),
+            ActiveRequests = _ => Task.FromResult<IReadOnlyList<ActiveRequestRow>>(
+                [CappedRow(51, visibleSessionCount: 5009, selectionRank: 1),
+                 CappedRow(52, visibleSessionCount: 5009, selectionRank: 2)]),
+        };
+        var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
+
+        var snapshot = await collector.CollectAsync(1, CancellationToken.None);
+
+        var truncation = Assert.Single(snapshot.Diagnostics.Truncations);
+        Assert.Equal("requests", truncation.Field);
+        Assert.Equal(2, truncation.ReturnedRows);
+        Assert.Equal(5009, truncation.TotalRows);
+        Assert.Contains("5009", truncation.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnUncappedSampleReportsNoTruncationSoDisclosureNeverImpliesLossThatDidNotHappen()
+    {
+        var probes = new FakeLiveIncidentProbeExecutor
+        {
+            ServerIdentity = _ => Task.FromResult(FakeLiveIncidentProbeExecutor.DefaultIdentity(EngineStart)),
+            ActiveRequests = _ => Task.FromResult<IReadOnlyList<ActiveRequestRow>>(
+                [CappedRow(51, visibleSessionCount: 2, selectionRank: 1),
+                 CappedRow(52, visibleSessionCount: 2, selectionRank: 2)]),
+        };
+        var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
+
+        var snapshot = await collector.CollectAsync(1, CancellationToken.None);
+
+        Assert.Empty(snapshot.Diagnostics.Truncations);
+        Assert.All(snapshot.Requests, r => Assert.Null(r.BatchTextTruncation));
+        Assert.All(snapshot.Requests, r => Assert.Null(r.CurrentStatementTextTruncation));
+    }
+
+    [Fact]
+    public async Task TruncatedTextCarriesItsUntruncatedLengthSoItIsNeverMistakenForAShortStatement()
+    {
+        var row = new ActiveRequestRow(
+            51, "app_user", "app-host", "MyApp", "running",
+            null, null, 1, "running", "SELECT", null, null, null, null,
+            DateTimeOffset.UnixEpoch, 10, 5, 100, 50, 200, 0, 5, "AppDb",
+            BatchText: "SELECT 1",
+            CurrentStatementText: "SELECT",
+            VisibleSessionCount: 1,
+            SelectionRank: 1,
+            BatchTextLength: 1_048_576,
+            CurrentStatementTextLength: 262_144);
+        var probes = new FakeLiveIncidentProbeExecutor
+        {
+            ServerIdentity = _ => Task.FromResult(FakeLiveIncidentProbeExecutor.DefaultIdentity(EngineStart)),
+            ActiveRequests = _ => Task.FromResult<IReadOnlyList<ActiveRequestRow>>([row]),
+        };
+        var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
+
+        var snapshot = await collector.CollectAsync(1, CancellationToken.None);
+
+        var request = Assert.Single(snapshot.Requests);
+        var batch = Assert.IsType<LiveTextTruncationV1>(request.BatchTextTruncation);
+        Assert.Equal(8, batch.RetainedCharacters);
+        Assert.Equal(1_048_576, batch.TotalCharacters);
+        Assert.Contains("1048576", batch.Reason, StringComparison.Ordinal);
+
+        // Tracked separately: a short statement inside a very long batch is truncated in the batch
+        // and not in the statement, so one disclosure can never stand in for the other.
+        var statement = Assert.IsType<LiveTextTruncationV1>(request.CurrentStatementTextTruncation);
+        Assert.Equal(6, statement.RetainedCharacters);
+        Assert.Equal(262_144, statement.TotalCharacters);
+    }
+
+    [Fact]
+    public async Task TextReturnedWholeCarriesNoTruncationEvenThoughTheProbeReportedItsLength()
+    {
+        var row = new ActiveRequestRow(
+            51, "app_user", "app-host", "MyApp", "running",
+            null, null, 1, "running", "SELECT", null, null, null, null,
+            DateTimeOffset.UnixEpoch, 10, 5, 100, 50, 200, 0, 5, "AppDb",
+            BatchText: "SELECT 1",
+            CurrentStatementText: "SELECT 1",
+            VisibleSessionCount: 1,
+            SelectionRank: 1,
+            BatchTextLength: 8,
+            CurrentStatementTextLength: 8);
+        var probes = new FakeLiveIncidentProbeExecutor
+        {
+            ServerIdentity = _ => Task.FromResult(FakeLiveIncidentProbeExecutor.DefaultIdentity(EngineStart)),
+            ActiveRequests = _ => Task.FromResult<IReadOnlyList<ActiveRequestRow>>([row]),
+        };
+        var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
+
+        var snapshot = await collector.CollectAsync(1, CancellationToken.None);
+
+        var request = Assert.Single(snapshot.Requests);
+        Assert.Null(request.BatchTextTruncation);
+        Assert.Null(request.CurrentStatementTextTruncation);
+    }
+
+    // The row cap and requirement 6's disappearance disclosure interact, and the interaction is a
+    // trap: "absent from this cycle" only means "no longer running" while the sample is complete.
+    // Under a cap a request can be absent purely because it ranked below the cap, so reporting it
+    // Disappeared would assert an ending that never happened -- a bandwidth fix turning into a
+    // fabricated fact.
+    [Fact]
+    public async Task ARequestPushedOutByTheRowCapIsNeverReportedAsHavingDisappeared()
+    {
+        var probes = new FakeLiveIncidentProbeExecutor
+        {
+            ServerIdentity = _ => Task.FromResult(FakeLiveIncidentProbeExecutor.DefaultIdentity(EngineStart)),
+            ActiveRequests = _ => Task.FromResult<IReadOnlyList<ActiveRequestRow>>(
+                [CappedRow(51, visibleSessionCount: 2, selectionRank: 1),
+                 CappedRow(52, visibleSessionCount: 2, selectionRank: 2)]),
+        };
+        var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
+        await collector.CollectAsync(1, CancellationToken.None);
+
+        // Session 52 is still running; the sample is simply capped at one row now.
+        probes.ActiveRequests = _ => Task.FromResult<IReadOnlyList<ActiveRequestRow>>(
+            [CappedRow(51, visibleSessionCount: 2, selectionRank: 1)]);
+        var second = await collector.CollectAsync(2, CancellationToken.None);
+
+        Assert.DoesNotContain(second.Requests, r => r.Availability == SampleAvailability.Disappeared);
+        var truncation = Assert.Single(second.Diagnostics.Truncations);
+        Assert.Contains("Disappearance detection is suspended", truncation.Reason, StringComparison.Ordinal);
+    }
+
+    // The guard above must not cost the disclosure it protects: when the sample is complete, a
+    // request that really did end still has to be reported rather than dropped.
+    [Fact]
+    public async Task DisappearanceIsStillReportedWhenTheSampleWasNotCapped()
+    {
+        var probes = new FakeLiveIncidentProbeExecutor
+        {
+            ServerIdentity = _ => Task.FromResult(FakeLiveIncidentProbeExecutor.DefaultIdentity(EngineStart)),
+            ActiveRequests = _ => Task.FromResult<IReadOnlyList<ActiveRequestRow>>(
+                [CappedRow(51, visibleSessionCount: 2, selectionRank: 1),
+                 CappedRow(52, visibleSessionCount: 2, selectionRank: 2)]),
+        };
+        var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
+        await collector.CollectAsync(1, CancellationToken.None);
+
+        probes.ActiveRequests = _ => Task.FromResult<IReadOnlyList<ActiveRequestRow>>(
+            [CappedRow(51, visibleSessionCount: 1, selectionRank: 1)]);
+        var second = await collector.CollectAsync(2, CancellationToken.None);
+
+        Assert.Empty(second.Diagnostics.Truncations);
+        var disappeared = Assert.Single(second.Requests, r => r.Availability == SampleAvailability.Disappeared);
+        Assert.Equal("req:52:1", disappeared.RequestId);
+    }
+    // tempdb's session and task views carry a row per session and per task whether or not tempdb
+    // was ever touched, so they scale with connection count rather than tempdb activity. Once the
+    // request sample was capped they became the largest part of the snapshot -- 1.76 MiB of
+    // mostly-zero rows at 5,028 sessions -- so they are capped too, and on the same terms.
+    [Fact]
+    public async Task TempdbRowCapsReportTheirPreCapCountsSeparatelyForSessionsAndTasks()
+    {
+        var probes = new FakeLiveIncidentProbeExecutor
+        {
+            ServerIdentity = _ => Task.FromResult(FakeLiveIncidentProbeExecutor.DefaultIdentity(EngineStart)),
+            TempdbUsage = (_, _) => Task.FromResult(new TempdbUsageRaw(
+                [],
+                [new TempdbSessionRow(51, 10, 2, 0, 0, VisibleSessionCount: 5028)],
+                [new TempdbTaskRow(51, 1, 0, 10, 2, 0, 0, VisibleTaskCount: 4096)])),
+        };
+        var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
+
+        var snapshot = await collector.CollectAsync(1, CancellationToken.None);
+
+        var sessions = Assert.Single(snapshot.Diagnostics.Truncations, t => t.Field == "tempdb.sessions");
+        Assert.Equal(1, sessions.ReturnedRows);
+        Assert.Equal(5028, sessions.TotalRows);
+
+        // Reported separately: the two views are capped independently, so one count can never be
+        // read as covering the other.
+        var tasks = Assert.Single(snapshot.Diagnostics.Truncations, t => t.Field == "tempdb.tasks");
+        Assert.Equal(1, tasks.ReturnedRows);
+        Assert.Equal(4096, tasks.TotalRows);
+    }
+
+    [Fact]
+    public async Task UncappedTempdbUsageReportsNoTruncationAtAll()
+    {
+        var probes = new FakeLiveIncidentProbeExecutor
+        {
+            ServerIdentity = _ => Task.FromResult(FakeLiveIncidentProbeExecutor.DefaultIdentity(EngineStart)),
+            TempdbUsage = (_, _) => Task.FromResult(new TempdbUsageRaw(
+                [],
+                [new TempdbSessionRow(51, 10, 2, 0, 0, VisibleSessionCount: 1)],
+                [new TempdbTaskRow(51, 1, 0, 10, 2, 0, 0, VisibleTaskCount: 1)])),
+        };
+        var collector = new LiveIncidentCollector(probes, "target-1", "Test Server", TimeProvider.System);
+
+        var snapshot = await collector.CollectAsync(1, CancellationToken.None);
+
+        Assert.Empty(snapshot.Diagnostics.Truncations);
     }
 }

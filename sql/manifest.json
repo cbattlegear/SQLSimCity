@@ -537,10 +537,24 @@
           "required": false,
           "default": true,
           "description": "When false, SQL text resolution is skipped and batch/statement text columns are NULL."
+        },
+        {
+          "name": "@MaxRows",
+          "sqlDbType": "Int",
+          "required": false,
+          "default": null,
+          "description": "When supplied, returns at most this many rows, keeping the lowest selection_rank (active requests before idle sessions, then longest-running, then session_id). NULL returns every visible row. visible_session_count always reports the pre-cap row count."
+        },
+        {
+          "name": "@MaxTextLength",
+          "sqlDbType": "Int",
+          "required": false,
+          "default": null,
+          "description": "When supplied, shortens batch_text and current_statement_text to this many characters. NULL returns them in full. batch_text_length and current_statement_text_length always report the untruncated lengths."
         }
       ],
       "resultSets": 1,
-      "resultContract": "Zero or more rows, one per (session_id, request_id). Idle rows have NULL request_id and NULL request_status, and use the session's current database_id/name; active rows use the request database. sys.dm_exec_requests.status is never NULL for a request that exists, so a NULL request_status means the session has no request and must not be replaced with a synthetic status. With @IncludeSqlText=1 current_statement_text is the offset-resolved executing statement and batch_text is the submitted batch; with 0 both are NULL and sys.dm_exec_sql_text is not invoked. No plan XML is fetched.",
+      "resultContract": "Zero or more rows, one per (session_id, request_id). Idle rows have NULL request_id and NULL request_status, and use the session's current database_id/name; active rows use the request database. sys.dm_exec_requests.status is never NULL for a request that exists, so a NULL request_status means the session has no request and must not be replaced with a synthetic status. With @IncludeSqlText=1 current_statement_text is the offset-resolved executing statement and batch_text is the submitted batch; with 0 both are NULL and sys.dm_exec_sql_text is not invoked. No plan XML is fetched. Both caps disclose what they omitted instead of shrinking the result silently: visible_session_count is the row count before @MaxRows applied, selection_rank is the deterministic order the cap keeps, and batch_text_length / current_statement_text_length are the character counts before @MaxTextLength applied, so a capped result can never be mistaken for a smaller server or a shorter statement.",
       "relativeCost": "low"
     },
     {
@@ -629,10 +643,24 @@
           "required": false,
           "default": false,
           "description": "When false, session_id <= 50 (system sessions) are excluded from the session/task result sets."
+        },
+        {
+          "name": "@MaxSessionRows",
+          "sqlDbType": "Int",
+          "required": false,
+          "default": null,
+          "description": "When supplied, result set 2 returns at most this many sessions, heaviest tempdb allocators first. NULL returns every row. visible_session_count always reports the pre-cap row count."
+        },
+        {
+          "name": "@MaxTaskRows",
+          "sqlDbType": "Int",
+          "required": false,
+          "default": null,
+          "description": "When supplied, result set 3 returns at most this many tasks, heaviest tempdb allocators first. NULL returns every row. visible_task_count always reports the pre-cap row count."
         }
       ],
       "resultSets": 3,
-      "resultContract": "Three result sets in order: (1) tempdb file space usage, requires the connection's current database to be tempdb; (2) per-session tempdb page allocation; (3) per-task tempdb page allocation with exec_context_id preserved. Page counts converted to MiB where noted.",
+      "resultContract": "Three result sets in order: (1) tempdb file space usage, requires the connection's current database to be tempdb; (2) per-session tempdb page allocation; (3) per-task tempdb page allocation with exec_context_id preserved. Page counts converted to MiB where noted. Result sets 2 and 3 return one row per session and per task whether or not tempdb was touched, so they grow with the instance's connection count; @MaxSessionRows/@MaxTaskRows bound them to the heaviest allocators and visible_session_count/visible_task_count report the pre-cap row counts, so a bounded result is never mistaken for a quieter instance.",
       "relativeCost": "low"
     },
     {

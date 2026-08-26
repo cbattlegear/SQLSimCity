@@ -15,6 +15,48 @@ public sealed class LiveIncidentsOptions
     public string Mode { get; set; } = nameof(LiveIncidentsMode.Fixture);
 
     public LiveIncidentsConnectionOptions Connection { get; set; } = new();
+
+    /// <summary>How much of a sampled instance one live snapshot is allowed to carry.</summary>
+    public LiveIncidentsSampleBoundsOptions SampleBounds { get; set; } = new();
+}
+
+/// <summary>
+/// The bounds a live snapshot is collected under. They exist because both axes are unbounded by
+/// anything SqlSimCity controls: an instance's session count, and the length of the batch text each
+/// session is running. Measured against SQL Server 2022, 5,009 idle sessions carrying no batch text
+/// produced a 5.88 MiB snapshot, and 50 sessions each executing a 1 MiB batch produced a 100.2 MiB
+/// snapshot that took 4.35 s to collect -- longer than the sampler's own 2-5 s cadence -- and
+/// allocated 103 GiB in the process. Every snapshot is rebroadcast whole to every connected client.
+/// <para>
+/// Each bound is a positive row/character count, or <c>0</c> to remove it entirely and restore the
+/// unbounded behaviour. Nothing a bound omits is omitted silently: the snapshot reports the pre-cap
+/// counts and each row reports its untruncated text lengths, so a bounded sample can always be told
+/// apart from a smaller server or a shorter statement.
+/// </para>
+/// </summary>
+public sealed class LiveIncidentsSampleBoundsOptions
+{
+    /// <summary>
+    /// Maximum session/request rows in one snapshot; <c>0</c> for no cap. Rows are kept
+    /// active-requests-first, then longest-running, then by session id.
+    /// </summary>
+    public int MaxRequestRows { get; set; } = 1_000;
+
+    /// <summary>
+    /// Maximum characters of batch text and of executing-statement text per row; <c>0</c> for no
+    /// cap. Collection cost grows faster than linearly in this value -- measured at 250 concurrent
+    /// 64 KiB batches, raising it from 16,384 to 65,536 took one snapshot from 8.4 MiB to 31.9 MiB
+    /// and one cycle's allocation from 99 MiB to 1,158 MiB -- so raising it far is a deliberate
+    /// trade rather than a free one.
+    /// </summary>
+    public int MaxTextLength { get; set; } = 16_384;
+
+    /// <summary>
+    /// Maximum tempdb session rows and task rows in one snapshot; <c>0</c> for no cap. Those DMVs
+    /// carry a row per session and per task whether or not tempdb was touched, so they scale with
+    /// connection count; the cap keeps the heaviest allocators.
+    /// </summary>
+    public int MaxTempdbRows { get; set; } = 1_000;
 }
 
 /// <summary>
