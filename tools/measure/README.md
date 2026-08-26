@@ -60,9 +60,12 @@ measured statement is parameterized exactly as the collector issues it. A
 literal-substituted variant can get a different plan, which would measure the wrong thing.
 
 The first iteration is discarded as a warm-up so compilation does not dominate. Logical
-reads are parsed from `SET STATISTICS IO`, so the figure is work the engine did rather than
-round-trip time. A probe that errors throws rather than reporting a plausible-looking wall
-time — an earlier version of this script silently measured failed batches.
+reads are parsed from `SET STATISTICS IO`, and CPU and elapsed from `SET STATISTICS TIME`,
+so the figures are work the engine did. **Quote `MedianServerMs`, `MedianCpuMs` and
+`MedianReads`, never `MedianHarnessMs`** — `docker exec` and sqlcmd start-up add roughly
+300 ms per invocation, which swamps a probe that costs 15 ms server-side. A probe that
+errors throws rather than reporting a plausible-looking wall time — an earlier version of
+this script silently measured failed batches.
 
 Use `-ShowPlan` to capture the estimated plan instead of executing.
 

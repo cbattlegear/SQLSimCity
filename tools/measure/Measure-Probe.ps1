@@ -138,16 +138,24 @@ for ($i = 0; $i -lt $Iterations; $i++) {
             $logicalReads += [int]$m.Groups[1].Value
         }
     }
+    # Server-side CPU and elapsed, from STATISTICS TIME. The wall clock around
+    # `docker exec` carries roughly 300 ms of process and round-trip overhead that
+    # swamps the probe itself, so it is reported but never the figure to quote.
     $cpuMs = 0
+    $elapsedMs = 0
     foreach ($line in $output) {
-        $m = [regex]::Match([string]$line, 'CPU time = (\d+) ms')
-        if ($m.Success) { $cpuMs += [int]$m.Groups[1].Value }
+        $m = [regex]::Match([string]$line, 'CPU time = (\d+) ms,\s*elapsed time = (\d+) ms')
+        if ($m.Success) {
+            $cpuMs += [int]$m.Groups[1].Value
+            $elapsedMs += [int]$m.Groups[2].Value
+        }
     }
 
     $results += [pscustomobject]@{
         Iteration    = $i
         WarmUp       = ($i -eq 0)
-        WallMs       = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+        HarnessMs    = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+        ServerMs     = $elapsedMs
         CpuMs        = $cpuMs
         LogicalReads = $logicalReads
     }
@@ -155,10 +163,11 @@ for ($i = 0; $i -lt $Iterations; $i++) {
 
 $measured = $results | Where-Object { -not $_.WarmUp }
 [pscustomobject]@{
-    Probe           = Split-Path -Leaf $Probe
-    Iterations      = $measured.Count
-    MedianWallMs    = ($measured.WallMs | Sort-Object)[[int]($measured.Count / 2)]
-    MedianCpuMs     = ($measured.CpuMs | Sort-Object)[[int]($measured.Count / 2)]
-    MedianReads     = ($measured.LogicalReads | Sort-Object)[[int]($measured.Count / 2)]
-    Detail          = $results
+    Probe            = Split-Path -Leaf $Probe
+    Iterations       = $measured.Count
+    MedianServerMs   = ($measured.ServerMs | Sort-Object)[[int]($measured.Count / 2)]
+    MedianCpuMs      = ($measured.CpuMs | Sort-Object)[[int]($measured.Count / 2)]
+    MedianReads      = ($measured.LogicalReads | Sort-Object)[[int]($measured.Count / 2)]
+    MedianHarnessMs  = ($measured.HarnessMs | Sort-Object)[[int]($measured.Count / 2)]
+    Detail           = $results
 }
