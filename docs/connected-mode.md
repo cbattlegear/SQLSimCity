@@ -262,6 +262,24 @@ its own boundary wins. The lookback cannot exceed the 90-day retention horizon, 
 `oldestAvailableAt` reports what was actually collected and retained, never the server's older
 boundary.
 
+That cap means history older than the lookback is not collected at all. To reach it, set
+`QueryStoreHistory__BackfillIncrementHours`. Each cycle then reads its ordinary forward window and
+one further step backwards of that size, so a shallow `InitialLookbackDays` makes the first cycle
+cheap and the depth arrives over the following cycles instead of all at once. Unset — the default —
+there is no backward window at all and collection behaves exactly as it does without this setting.
+
+The walk stops at `QueryStoreHistory__BackfillHorizonDays`, which defaults to and cannot exceed the
+90-day retention horizon: reading past what the store keeps would re-create the waste the lookback
+cap removed. It also stops at the server's own oldest retained interval, whichever is later. How far
+it has actually reached is persisted per database as a second, low watermark, so a run interrupted
+part-way resumes from there rather than starting the walk again; a reset restarts it along with the
+epoch. Pick an increment larger than the ground the horizon covers between cycles, or the floor
+slides forward as fast as the walk moves back and the backfill never finishes.
+
+`oldestAvailableAt` is unaffected by any of this. It is derived from the runtime buckets actually
+being published, so it follows collected and retained history as the low watermark moves, and stays
+`null` while nothing has been collected rather than reporting where the backfill intends to reach.
+
 Collection needs Query Store to be enabled on the databases themselves (`ALTER DATABASE ... SET
 QUERY_STORE = ON`); databases with it off are discovered and skipped.
 

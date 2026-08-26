@@ -47,6 +47,15 @@ public static class QueryStoreHistoryConfiguration
             TimeSpan.FromMinutes(section.GetValue<int?>("OverlapMinutes") ?? 65),
             TimeSpan.FromDays(
                 section.GetValue<int?>("InitialLookbackDays") ??
+                QueryStoreRetention.History.TotalDays),
+            // Absent means off: a progressive backfill is something an operator asks for, so
+            // configuring nothing keeps the first cycle bounded by the initial lookback and every
+            // later cycle reading forward only.
+            section.GetValue<int?>("BackfillIncrementHours") is { } hours
+                ? TimeSpan.FromHours(hours)
+                : null,
+            TimeSpan.FromDays(
+                section.GetValue<int?>("BackfillHorizonDays") ??
                 QueryStoreRetention.History.TotalDays));
         options.Validate();
         return options;

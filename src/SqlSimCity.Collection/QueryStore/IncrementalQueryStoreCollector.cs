@@ -29,13 +29,25 @@ public sealed record QueryStoreDatabaseState(
     bool SupportsOppo,
     long? LatestIntervalId = null);
 
+/// <param name="Through">
+/// The forward (high) watermark: collection for this epoch is complete up to here.
+/// </param>
+/// <param name="BackfilledFrom">
+/// The low watermark: the earliest instant this epoch has actually been collected from. It is
+/// recorded on every commit, not only when <see cref="QueryStoreCollectionOptions.BackfillEnabled"/>
+/// is on, so that enabling a progressive backfill later resumes from a real figure rather than
+/// starting the walk again. <c>null</c> only on a watermark written before the low watermark
+/// existed; a backfill then adopts that cycle's forward start, which re-reads a little rather than
+/// skipping anything.
+/// </param>
 public sealed record QueryStoreWatermark(
     string DatabaseId,
     string SourceSignature,
     string StorageEpoch,
     DateTimeOffset Through,
     IReadOnlyDictionary<QueryStoreFactKind, string?> PageTokens,
-    long? LatestIntervalId = null);
+    long? LatestIntervalId = null,
+    DateTimeOffset? BackfilledFrom = null);
 
 public abstract record QueryStoreCollectedFact;
 
@@ -132,11 +144,23 @@ public interface IQueryStoreHistorySink
     Task PublishAsync(QueryStoreCollectionResult result, CancellationToken cancellationToken);
 }
 
+/// <param name="BackfillIncrement">
+/// How much further back each cycle reaches once the forward window is collected. <c>null</c>, the
+/// default, switches the progressive backfill off entirely, so an operator who configures nothing
+/// keeps exactly the behaviour that shipped without it.
+/// </param>
+/// <param name="BackfillHorizon">
+/// How far back the backfill is allowed to walk. Defaults to, and is capped at,
+/// <see cref="QueryStoreRetention.History"/>: reading past what the sink retains would re-create the
+/// waste the initial lookback cap removed, so the two horizons are held to the same figure.
+/// </param>
 public sealed record QueryStoreCollectionOptions(
     int PageSize = 1_000,
     int DatabaseConcurrency = 4,
     TimeSpan? Overlap = null,
-    TimeSpan? InitialLookback = null)
+    TimeSpan? InitialLookback = null,
+    TimeSpan? BackfillIncrement = null,
+    TimeSpan? BackfillHorizon = null)
 {
     public TimeSpan EffectiveOverlap => Overlap ?? TimeSpan.FromMinutes(65);
 
@@ -146,6 +170,11 @@ public sealed record QueryStoreCollectionOptions(
     /// instance only to be discarded by the first prune.
     /// </summary>
     public TimeSpan EffectiveInitialLookback => InitialLookback ?? QueryStoreRetention.History;
+
+    /// <summary>Whether cycles reach backwards past what the first cycle collected.</summary>
+    public bool BackfillEnabled => BackfillIncrement is not null;
+
+    public TimeSpan EffectiveBackfillHorizon => BackfillHorizon ?? QueryStoreRetention.History;
 
     public void Validate()
     {
@@ -159,6 +188,19 @@ public sealed record QueryStoreCollectionOptions(
                 nameof(InitialLookback),
                 "The initial Query Store lookback must be at least the overlap window and at most " +
                 $"the {QueryStoreRetention.History.TotalDays:0}-day horizon retained history covers.");
+        if (BackfillIncrement is { } increment &&
+            (increment <= TimeSpan.Zero || increment > QueryStoreRetention.History))
+            throw new ArgumentOutOfRangeException(
+                nameof(BackfillIncrement),
+                "The Query Store backfill increment must be positive and no larger than the " +
+                $"{QueryStoreRetention.History.TotalDays:0}-day horizon retained history covers.");
+        if (EffectiveBackfillHorizon > QueryStoreRetention.History ||
+            EffectiveBackfillHorizon < EffectiveInitialLookback)
+            throw new ArgumentOutOfRangeException(
+                nameof(BackfillHorizon),
+                "The Query Store backfill horizon must be at least the initial lookback and at most " +
+                $"the {QueryStoreRetention.History.TotalDays:0}-day horizon retained history covers; " +
+                "reaching past what the sink retains collects evidence the first prune discards.");
     }
 }
 
@@ -295,49 +337,92 @@ public sealed class IncrementalQueryStoreCollector : IDisposable
             : watermark.StorageEpoch;
         await _sink.BeginDatabaseCycleAsync(
             state, storageEpoch, reset, cancellationToken).ConfigureAwait(false);
-        var start = watermark is null || reset
+        var forwardStart = watermark is null || reset
             ? InitialStart(state, throughExclusive)
             : watermark.Through - _options.EffectiveOverlap;
+        // A reset restarts the epoch, so the low watermark restarts with it rather than claiming
+        // the discarded epoch's reach.
+        DateTimeOffset? reachedBack = watermark is null || reset
+            ? null
+            : watermark.BackfilledFrom ?? forwardStart;
+        var windows = new List<(DateTimeOffset Start, DateTimeOffset End)> { (forwardStart, throughExclusive) };
+        if (reachedBack is { } reached && NextBackfillWindow(state, throughExclusive, reached) is { } step)
+            windows.Add(step);
 
         var pageCount = 0;
         var bucketCount = 0;
         var kinds = KindsFor(state);
-        foreach (var kind in kinds)
+        foreach (var (start, end) in windows)
         {
-            string? token = null;
-            do
+            foreach (var kind in kinds)
             {
-                var page = await _source.ReadPageAsync(
-                    databaseId, kind, start, throughExclusive, token,
-                    _options.PageSize, cancellationToken).ConfigureAwait(false);
-                await _sink.StageFactsAsync(databaseId, page, cancellationToken).ConfigureAwait(false);
-                if (kind == QueryStoreFactKind.Runtime)
+                string? token = null;
+                do
                 {
-                    var rows = page.Facts.Cast<QueryRuntimeFact>().Select(fact => fact.Value);
-                    var buckets = QueryStoreRuntimeAggregator.Aggregate(rows);
-                    var active = buckets.Where(bucket => bucket.Key.IntervalEnd >= throughExclusive).ToArray();
-                    var closed = buckets.Where(bucket => bucket.Key.IntervalEnd < throughExclusive).ToArray();
-                    if (closed.Length > 0)
-                        await _sink.StageRuntimeBucketsAsync(
-                            databaseId, closed, false, cancellationToken).ConfigureAwait(false);
-                    if (active.Length > 0)
-                        await _sink.StageRuntimeBucketsAsync(
-                            databaseId, active, true, cancellationToken).ConfigureAwait(false);
-                    bucketCount += buckets.Count;
+                    var page = await _source.ReadPageAsync(
+                        databaseId, kind, start, end, token,
+                        _options.PageSize, cancellationToken).ConfigureAwait(false);
+                    await _sink.StageFactsAsync(databaseId, page, cancellationToken).ConfigureAwait(false);
+                    if (kind == QueryStoreFactKind.Runtime)
+                    {
+                        var rows = page.Facts.Cast<QueryRuntimeFact>().Select(fact => fact.Value);
+                        var buckets = QueryStoreRuntimeAggregator.Aggregate(rows);
+                        var active = buckets.Where(bucket => bucket.Key.IntervalEnd >= throughExclusive).ToArray();
+                        var closed = buckets.Where(bucket => bucket.Key.IntervalEnd < throughExclusive).ToArray();
+                        if (closed.Length > 0)
+                            await _sink.StageRuntimeBucketsAsync(
+                                databaseId, closed, false, cancellationToken).ConfigureAwait(false);
+                        if (active.Length > 0)
+                            await _sink.StageRuntimeBucketsAsync(
+                                databaseId, active, true, cancellationToken).ConfigureAwait(false);
+                        bucketCount += buckets.Count;
+                    }
+                    pageCount++;
+                    token = page.NextPageToken;
                 }
-                pageCount++;
-                token = page.NextPageToken;
+                while (token is not null);
             }
-            while (token is not null);
         }
 
+        // Published only now, with the rest of the cycle. A run interrupted anywhere above leaves
+        // both watermarks where they were, so the next cycle repeats this step rather than skipping
+        // past it -- which is the whole reason the backfill has a watermark instead of a counter.
+        var earliestThisCycle = windows.Min(window => window.Start);
+        var backfilledFrom = reachedBack is { } prior && prior < earliestThisCycle
+            ? prior
+            : earliestThisCycle;
         var newWatermark = new QueryStoreWatermark(
             databaseId, state.ResetEpoch, storageEpoch, throughExclusive,
             kinds.ToDictionary(kind => kind, _ => (string?)null),
-            state.LatestIntervalId ?? watermark?.LatestIntervalId);
+            state.LatestIntervalId ?? watermark?.LatestIntervalId,
+            backfilledFrom);
         await _sink.CommitDatabaseCycleAsync(state, newWatermark, cancellationToken).ConfigureAwait(false);
         return new QueryStoreDatabaseCollectionResult(
             databaseId, state.State, pageCount, bucketCount, reset, state.Reason, null);
+    }
+
+    /// <summary>
+    /// One bounded step backwards, or <c>null</c> when there is nothing left to take. The backfill
+    /// is off unless <see cref="QueryStoreCollectionOptions.BackfillIncrement"/> is configured, and
+    /// it never starts on a first or post-reset cycle: that cycle already reads a full initial
+    /// lookback, and adding to it would front-load exactly the work this spreads out.
+    ///
+    /// The floor is the later of the backfill horizon and what the source still holds. Walking past
+    /// the horizon would read a production instance for evidence the first prune discards, which is
+    /// the waste the initial lookback cap removed; walking past the source's own boundary would
+    /// read nothing at all, forever, because the low watermark would never reach a floor below it.
+    /// </summary>
+    private (DateTimeOffset Start, DateTimeOffset End)? NextBackfillWindow(
+        QueryStoreDatabaseState state,
+        DateTimeOffset throughExclusive,
+        DateTimeOffset reachedBack)
+    {
+        if (_options.BackfillIncrement is not { } increment) return null;
+        var floor = throughExclusive - _options.EffectiveBackfillHorizon;
+        if (state.OldestIntervalStart is { } oldest && oldest > floor) floor = oldest;
+        if (reachedBack <= floor) return null;
+        var start = reachedBack - increment;
+        return (start < floor ? floor : start, reachedBack);
     }
 
     /// <summary>
