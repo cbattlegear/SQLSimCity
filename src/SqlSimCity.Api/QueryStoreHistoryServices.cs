@@ -44,7 +44,10 @@ public static class QueryStoreHistoryConfiguration
         var options = new QueryStoreCollectionOptions(
             section.GetValue<int?>("PageSize") ?? 1_000,
             section.GetValue<int?>("DatabaseConcurrency") ?? 4,
-            TimeSpan.FromMinutes(section.GetValue<int?>("OverlapMinutes") ?? 65));
+            TimeSpan.FromMinutes(section.GetValue<int?>("OverlapMinutes") ?? 65),
+            TimeSpan.FromDays(
+                section.GetValue<int?>("InitialLookbackDays") ??
+                QueryStoreRetention.History.TotalDays));
         options.Validate();
         return options;
     }

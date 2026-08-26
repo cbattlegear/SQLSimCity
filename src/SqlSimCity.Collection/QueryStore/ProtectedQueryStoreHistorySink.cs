@@ -158,13 +158,15 @@ public sealed class ProtectedQueryStoreHistorySink(
         LastBuildInspection = inspections.Aggregate(
             new QueryStoreBuildInspection(0, 0, 0, 0, 0, 0),
             (sum, value) => sum + value);
+        var oldestCollected = OldestCollected(details);
         var statuses = result.Databases.Select(item =>
         {
             var state = _committed.TryGetValue(item.DatabaseId, out var facts) ? facts.State : null;
             return new QueryStoreDatabaseStatusV1(
                 item.DatabaseId, ContractState(item.State),
                 state?.ResetEpoch ?? "", state is null ? null : result.CompletedAt,
-                state?.OldestIntervalStart, item.Reason);
+                oldestCollected.TryGetValue(item.DatabaseId, out var oldest) ? oldest : null,
+                item.Reason);
         }).ToArray();
         var failures = result.Databases.Count(item => item.FailureType is not null);
         var status = new QueryStoreCollectorStatusV1(
@@ -192,6 +194,25 @@ public sealed class ProtectedQueryStoreHistorySink(
             await repository.StoreWatermarkAsync(pair.Value, cancellationToken).ConfigureAwait(false);
             _pendingWatermarks.TryRemove(pair.Key, out _);
         }
+    }
+
+    /// <summary>
+    /// The published horizon must describe what this store actually holds, not how far back the
+    /// source could be read. The collector's first cycle looks back only
+    /// <see cref="QueryStoreRetention.History"/>, and anything older than that is pruned here
+    /// anyway, so reporting the server's own oldest interval would promise history that was never
+    /// ingested. Deriving it from the runtime actually being published cannot drift from either.
+    /// </summary>
+    private static Dictionary<string, DateTimeOffset> OldestCollected(
+        IReadOnlyList<QueryFamilyDetailV1> details)
+    {
+        var oldest = new Dictionary<string, DateTimeOffset>(StringComparer.Ordinal);
+        foreach (var detail in details)
+            foreach (var bucket in detail.Runtime)
+                if (!oldest.TryGetValue(detail.Family.DatabaseId, out var current) ||
+                    bucket.IntervalStart < current)
+                    oldest[detail.Family.DatabaseId] = bucket.IntervalStart;
+        return oldest;
     }
 
     private async Task EnsureLoadedAsync(CancellationToken cancellationToken)
@@ -224,7 +245,7 @@ public sealed class ProtectedQueryStoreHistorySink(
 
     private static void PruneCommitted(DatabaseFacts state, DateTimeOffset observedAt)
     {
-        var cutoff = observedAt.AddDays(-90);
+        var cutoff = observedAt - QueryStoreRetention.History;
         for (var index = state.ArchivedFamilies.Count - 1; index >= 0; index--)
         {
             var archived = state.ArchivedFamilies[index];
@@ -269,8 +290,8 @@ public sealed class ProtectedQueryStoreHistorySink(
         IReadOnlyList<RuntimeBucketV1> runtime,
         DateTimeOffset observedAt)
     {
-        var detailCutoff = observedAt.AddDays(-7);
-        var retentionCutoff = observedAt.AddDays(-90);
+        var detailCutoff = observedAt - QueryStoreRetention.Detail;
+        var retentionCutoff = observedAt - QueryStoreRetention.History;
         var retained = runtime.Where(bucket => bucket.IntervalEnd >= detailCutoff).ToList();
         foreach (var group in runtime.Where(bucket =>
                      bucket.IntervalEnd >= retentionCutoff && bucket.IntervalEnd < detailCutoff)
@@ -553,8 +574,8 @@ public sealed class ProtectedQueryStoreHistorySink(
         DatabaseFacts state,
         DateTimeOffset observedAt)
     {
-        var detailCutoff = observedAt.AddDays(-7);
-        var retentionCutoff = observedAt.AddDays(-90);
+        var detailCutoff = observedAt - QueryStoreRetention.Detail;
+        var retentionCutoff = observedAt - QueryStoreRetention.History;
         foreach (var value in state.Runtime.Values.Where(value =>
                      value.Bucket.Key.IntervalEnd >= detailCutoff))
             yield return value;

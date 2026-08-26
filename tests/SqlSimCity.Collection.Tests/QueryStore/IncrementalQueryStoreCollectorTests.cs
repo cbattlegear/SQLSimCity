@@ -215,6 +215,78 @@ public sealed class IncrementalQueryStoreCollectorTests
         Assert.True(sink.Published);
     }
 
+    [Fact]
+    public async Task FirstCycleStartsAtTheRetainedHorizonRatherThanTheSourcesOldestInterval()
+    {
+        var source = new FakeSource { State = State(Through.AddDays(-400)) };
+        var sink = new FakeSink();
+        using var collector = new IncrementalQueryStoreCollector(
+            source, sink, new QueryStoreCollectionOptions(DatabaseConcurrency: 1));
+
+        await collector.CollectAsync(["db"], Through);
+
+        Assert.NotEmpty(source.Starts);
+        Assert.All(source.Starts, start => Assert.Equal(Through - QueryStoreRetention.History, start));
+    }
+
+    [Fact]
+    public async Task FirstCycleDoesNotReachPastWhatTheSourceStillRetains()
+    {
+        var oldest = Through.AddDays(-3);
+        var source = new FakeSource { State = State(oldest) };
+        var sink = new FakeSink();
+        using var collector = new IncrementalQueryStoreCollector(
+            source, sink, new QueryStoreCollectionOptions(DatabaseConcurrency: 1));
+
+        await collector.CollectAsync(["db"], Through);
+
+        Assert.All(source.Starts, start => Assert.Equal(oldest, start));
+    }
+
+    [Fact]
+    public async Task ResetCycleIsBoundedByTheSameHorizonAsTheFirstCycle()
+    {
+        var source = new FakeSource { State = State(Through.AddDays(-400)) };
+        var sink = new FakeSink
+        {
+            Watermark = new QueryStoreWatermark(
+                "db", "other-signature", "epoch", Through.AddHours(-2),
+                new Dictionary<QueryStoreFactKind, string?>()),
+        };
+        using var collector = new IncrementalQueryStoreCollector(
+            source, sink, new QueryStoreCollectionOptions(DatabaseConcurrency: 1));
+
+        var result = await collector.CollectAsync(["db"], Through);
+
+        Assert.True(result.Databases[0].ResetDetected);
+        Assert.All(source.Starts, start => Assert.Equal(Through - QueryStoreRetention.History, start));
+    }
+
+    [Fact]
+    public async Task ConfiguredInitialLookbackBoundsTheFirstCycle()
+    {
+        var source = new FakeSource { State = State(Through.AddDays(-400)) };
+        var sink = new FakeSink();
+        using var collector = new IncrementalQueryStoreCollector(
+            source, sink,
+            new QueryStoreCollectionOptions(
+                DatabaseConcurrency: 1, InitialLookback: TimeSpan.FromDays(2)));
+
+        await collector.CollectAsync(["db"], Through);
+
+        Assert.All(source.Starts, start => Assert.Equal(Through.AddDays(-2), start));
+    }
+
+    [Theory]
+    [InlineData(91)]
+    [InlineData(0)]
+    public void InitialLookbackBeyondTheRetainedHorizonOrInsideTheOverlapIsRejected(int days)
+    {
+        var options = new QueryStoreCollectionOptions(InitialLookback: TimeSpan.FromDays(days));
+
+        Assert.Throws<ArgumentOutOfRangeException>(options.Validate);
+    }
+
     private static QueryStoreFactPage Page(QueryStoreFactKind kind, string? next) =>
         new(kind, [], next, false);
 

@@ -324,6 +324,44 @@ public sealed class ProtectedQueryStoreHistoryTests
         Assert.Equal(familyCount, inspected.WaitIndexLookups);
     }
 
+    [Fact]
+    public async Task PublishedHorizonFollowsCollectedHistoryNotTheSourcesOlderBoundary()
+    {
+        var repository = new ProtectedQueryStoreRepository(new MemoryProtectedStore());
+        var tracker = new QueryStoreCollectionStatusTracker();
+        var sink = new ProtectedQueryStoreHistorySink(repository, tracker);
+        // The server still holds well over a year; the collector only ever walked back 30 days.
+        var state = new QueryStoreDatabaseState(
+            "db", QueryStoreCollectionState.ReadWrite, "epoch", Now.AddDays(-400), Now,
+            "available", 16, 160, true, true, false, false);
+        var collectedFrom = Now.AddDays(-30);
+        await sink.BeginDatabaseCycleAsync(state, "epoch", false, default);
+        await sink.StageFactsAsync("db", new QueryStoreFactPage(QueryStoreFactKind.Identity,
+            [new QueryIdentityFact(
+                "q", "q-text", "context", "hash", Now, false, true, null, null, null, null)],
+            null, false), default);
+        await sink.StageFactsAsync("db", new QueryStoreFactPage(QueryStoreFactKind.Plan,
+            [new QueryPlanFact(
+                "plan", "q", "plan-hash", QueryPlanType.Compiled, null, false, null,
+                BigInteger.Zero, null, "16", "160", Now)],
+            null, false), default);
+        await sink.StageRuntimeBucketsAsync(
+            "db", [Bucket("plan", 3, collectedFrom.AddHours(1))], false, default);
+        await sink.CommitDatabaseCycleAsync(state, new QueryStoreWatermark(
+            "db", state.ResetEpoch, "epoch", Now,
+            new Dictionary<QueryStoreFactKind, string?>()), default);
+        await sink.PublishAsync(new QueryStoreCollectionResult(
+            false, Now.AddSeconds(-1), Now, [DatabaseResult("db")], ["db"]), default);
+
+        var status = Assert.Single(tracker.Current!.Databases);
+        Assert.Equal(collectedFrom, status.OldestAvailableAt);
+        Assert.NotEqual(state.OldestIntervalStart, status.OldestAvailableAt);
+        var snapshot = await repository.ReadPublishedSnapshotAsync();
+        Assert.Equal(
+            collectedFrom,
+            snapshot!.Families.SelectMany(family => family.Runtime).Min(bucket => bucket.IntervalStart));
+    }
+
     private static async Task PublishCycleAsync(
         ProtectedQueryStoreHistorySink sink,
         long count,

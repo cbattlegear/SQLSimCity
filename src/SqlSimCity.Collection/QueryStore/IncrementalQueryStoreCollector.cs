@@ -135,9 +135,17 @@ public interface IQueryStoreHistorySink
 public sealed record QueryStoreCollectionOptions(
     int PageSize = 1_000,
     int DatabaseConcurrency = 4,
-    TimeSpan? Overlap = null)
+    TimeSpan? Overlap = null,
+    TimeSpan? InitialLookback = null)
 {
     public TimeSpan EffectiveOverlap => Overlap ?? TimeSpan.FromMinutes(65);
+
+    /// <summary>
+    /// How far back the first cycle for a database reads when there is no watermark to resume from.
+    /// Defaults to the horizon retained history covers: anything older is read off a production
+    /// instance only to be discarded by the first prune.
+    /// </summary>
+    public TimeSpan EffectiveInitialLookback => InitialLookback ?? QueryStoreRetention.History;
 
     public void Validate()
     {
@@ -145,6 +153,12 @@ public sealed record QueryStoreCollectionOptions(
         if (DatabaseConcurrency is < 1 or > 16) throw new ArgumentOutOfRangeException(nameof(DatabaseConcurrency));
         if (EffectiveOverlap < TimeSpan.Zero || EffectiveOverlap > TimeSpan.FromHours(24))
             throw new ArgumentOutOfRangeException(nameof(Overlap));
+        if (EffectiveInitialLookback < EffectiveOverlap ||
+            EffectiveInitialLookback > QueryStoreRetention.History)
+            throw new ArgumentOutOfRangeException(
+                nameof(InitialLookback),
+                "The initial Query Store lookback must be at least the overlap window and at most " +
+                $"the {QueryStoreRetention.History.TotalDays:0}-day horizon retained history covers.");
     }
 }
 
@@ -282,7 +296,7 @@ public sealed class IncrementalQueryStoreCollector : IDisposable
         await _sink.BeginDatabaseCycleAsync(
             state, storageEpoch, reset, cancellationToken).ConfigureAwait(false);
         var start = watermark is null || reset
-            ? state.OldestIntervalStart ?? throughExclusive - _options.EffectiveOverlap
+            ? InitialStart(state, throughExclusive)
             : watermark.Through - _options.EffectiveOverlap;
 
         var pageCount = 0;
@@ -324,6 +338,19 @@ public sealed class IncrementalQueryStoreCollector : IDisposable
         await _sink.CommitDatabaseCycleAsync(state, newWatermark, cancellationToken).ConfigureAwait(false);
         return new QueryStoreDatabaseCollectionResult(
             databaseId, state.State, pageCount, bucketCount, reset, state.Reason, null);
+    }
+
+    /// <summary>
+    /// Where a first (or post-reset) cycle begins. The source can retain months of Query Store
+    /// history, and the sink discards anything older than <see cref="QueryStoreRetention.History"/>,
+    /// so starting at the source's oldest interval reads a production instance for evidence the
+    /// first prune throws away. Start no earlier than the configured lookback, and no earlier than
+    /// what the source still holds when it reports a boundary.
+    /// </summary>
+    private DateTimeOffset InitialStart(QueryStoreDatabaseState state, DateTimeOffset throughExclusive)
+    {
+        var floor = throughExclusive - _options.EffectiveInitialLookback;
+        return state.OldestIntervalStart is { } oldest && oldest > floor ? oldest : floor;
     }
 
     private static string CreateStorageEpoch(QueryStoreDatabaseState state, string? priorStorageEpoch)

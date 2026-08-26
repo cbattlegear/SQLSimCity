@@ -238,6 +238,14 @@ generations, and a final publication pointer.
 Raw SQL and Showplan XML are fetched only on demand and stored as 7-day detail. Normalized
 facts and hourly history are retained for 90 days by default.
 
+The first cycle for a database has no watermark to resume from, so it looks back
+`QueryStoreHistory__InitialLookbackDays` (90 by default) rather than to the server's oldest
+retained interval. A source retaining more than that would otherwise be read in full on first
+connection, for evidence the first prune discards. When the source holds less than the lookback,
+its own boundary wins. The lookback cannot exceed the 90-day retention horizon, and the published
+`oldestAvailableAt` reports what was actually collected and retained, never the server's older
+boundary.
+
 Collection needs Query Store to be enabled on the databases themselves (`ALTER DATABASE ... SET
 QUERY_STORE = ON`); databases with it off are discovered and skipped.
 
