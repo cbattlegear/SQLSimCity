@@ -211,7 +211,7 @@ Apply exactly one before merging. All four already exist, so use `gh pr create -
 | `release:major` | Anyone running the image must change something to stay working — a removed or renamed API route or response field, a renamed configuration key or environment variable, a changed default that alters behaviour, a database or archive format that old readers cannot open. |
 | `release:minor` | New capability that costs the operator nothing — a new view, endpoint, opt-in setting or supported source. Nothing that worked before behaves differently. |
 | `release:patch` | Bug fix, performance work, a rendering or layout correction, dependency bumps, refactors with no visible effect. |
-| `release:skip` | Nothing reaches the shipped artifact: docs, `AGENTS.md`, tests, CI workflows, repository chores. |
+| `release:skip` | Nothing reaches the shipped artifact: docs, `AGENTS.md`, tests, CI workflows, repository chores. Also the deliberate choice when batching a run of changes into one hand-cut release — see below. |
 
 **The bump describes the promise to whoever runs the image, not the size of the diff.** A one-line
 change that renames a config key is `major`. A thousand-line refactor that no operator can observe
@@ -227,7 +227,36 @@ unlabelled.
 If a change genuinely should not ship on its own, prefer `release:skip` over leaving it bare, so the
 intent is recorded rather than inferred.
 
+### `release:skip` defers a bump, it does not cancel one
+
+Skipping is also used deliberately to batch. Every release builds and pushes an image to GHCR,
+which is far too slow to want on every pull request, so the working practice is to merge a run of
+changes as `release:skip` and then cut one release by hand with `workflow_dispatch` covering
+everything since the last one.
+
+That moves an obligation rather than removing it. The skipped change still lands on `main`, so
+**`release:skip` does not mean "no bump", it means "some later release carries this, and a decision
+made elsewhere picks its size".**
+
+When you cut that batched release, the bump is the **highest bump earned by any pull request merged
+since the last release** — not the size of whichever one triggered it, and not the size of the
+largest diff. Work out the label each merged pull request would have carried and take the maximum.
+
+This is the same understatement failure as merging unlabelled, reached by a third route. #99 added
+the operator-facing `LiveIncidents:SampleBounds` setting and was relabelled from `release:minor` to
+`release:skip` shortly before merging, so it sits on `main` unreleased. Cut the next release as a
+patch because the pull request prompting it happens to be a bug fix, and a minor-worthy capability
+ships inside a patch.
+
+So when a bump-worthy change is skipped, say so in the pull request body. Whoever cuts the batched
+release can then find it without re-reading every diff since the last tag.
+
 ### Merge one pull request at a time, and wait for its release
+
+This section is about pull requests that carry a bump label. When everything in flight is
+`release:skip` there is no release to wait for and no collapse to cause, which is much of the time
+under the batching practice above — but the moment one pull request carries a bump, the following
+applies to it.
 
 The label is only half of it. Auto-release triggers on **CI completing on `main`**, not on the
 merge, and CI cancels a superseded in-progress run. So merging a second pull request before the
@@ -239,9 +268,12 @@ apart. #85's run on `main` was cancelled, only #86's reached the release job, an
 **v0.7.2** — a patch. The new `Atlas:QueryStoreRefreshIntervalSeconds` setting went out understated,
 which is the same understatement failure as merging unlabelled, reached by a different route.
 
-It cannot be repaired afterwards by dispatching a bump, either: the workflow declines to cut a
-second release for a commit that is already tagged, deliberately, so the tag stays where the first
-release put it. The only clean fix is not to cause it.
+Whether that can be repaired afterwards depends on whether a release was actually cut. If one was,
+it is stuck: the workflow declines to cut a second release for a commit that is already tagged,
+deliberately, so the tag stays where the first release put it. That is the #85/#86 case, and the
+only clean fix is not to cause it. If no release was cut at all — the ordinary batching case above,
+or a collapse where the surviving run carried `release:skip` — then nothing is tagged and a
+`workflow_dispatch` bump from `main`'s tip fixes it cleanly.
 
 Wait for the release to appear before merging the next one. If several pull requests share a bump
 class the collapse is harmless — the version lands in the right place either way — but confirm that
@@ -265,6 +297,12 @@ least produced a version, merely understated.
 
 So when pull requests are ready together, merge every `release:skip` first and the release-bearing
 one last. Between two bumps there is no safe order, only the wait.
+
+This holds only while the two merges produce separate merge commits. The label read is an unordered
+union over every merged pull request the API returns for one SHA, so anything that puts both behind
+a single commit — merging one branch into the other before merging to `main`, or otherwise
+collapsing the two — lets the skip suppress the bump, with no ordering left to get right. Ordinary
+sequential merges never do this.
 
 ## Scratch files
 
