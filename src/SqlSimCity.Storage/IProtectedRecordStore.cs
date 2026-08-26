@@ -44,6 +44,12 @@ public interface IProtectedRecordStore
     /// The replacement sequence is consumed inside one storage transaction. Returns what the
     /// replacement cost, because the caller hands over a lazy sequence and cannot otherwise
     /// know how much was written or how long writers were held out.
+    /// <para>
+    /// An implementation may enumerate <paramref name="records"/> on another thread to keep the
+    /// caller's serialization off its write lock, so the sequence must not require the calling
+    /// thread. It is still enumerated once, in order, and a payload it yields is only read
+    /// before the enumerator advances.
+    /// </para>
     /// </summary>
     Task<ProtectedSetReplacement> ReplaceSetAsync(
         string idPrefix,

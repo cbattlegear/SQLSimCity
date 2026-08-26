@@ -97,18 +97,7 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
         CancellationToken cancellationToken = default)
     {
         EnsureInitialized();
-        ArgumentException.ThrowIfNullOrWhiteSpace(recordKind);
-        if (recordKind.Length > _maxRecordKindLength)
-        {
-            throw new ArgumentException(
-                $"Record kind must be {_maxRecordKindLength} characters or fewer.", nameof(recordKind));
-        }
-
-        if (payload.Length > _maxPayloadBytes)
-        {
-            throw new ArgumentException(
-                $"Payload must be {_maxPayloadBytes} bytes or fewer.", nameof(payload));
-        }
+        ValidateWrite(recordKind, payload);
 
         var envelope = EnvelopeCodec.Wrap(recordKind, id.Value, payload.Span);
 
@@ -225,13 +214,20 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
         var written = 0;
         var payloadBytes = 0L;
         var storedBytes = 0L;
+        // Started before the connection is opened, so the caller's own serialization runs on a
+        // producer task concurrently with the inserts it feeds instead of during the enumerator
+        // advance the writer performs -- which used to put all of it inside the hold below, with
+        // other writers already queued behind it. Buffering is bounded by the pipeline's batch
+        // budget, not by the size of the set.
+        await using var pipeline = new PreparedRecordPipeline(
+            records, idPrefix, this, cancellationToken);
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var transaction =
             (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
         // SQLite takes the write lock at the first write statement, not at BEGIN, so the hold
-        // starts here rather than above. It runs to the commit and therefore covers the caller's
-        // own serialization work: `records` is lazy, so every record it yields is built while
-        // other writers are already waiting. That is the cost being reported, not an artefact.
+        // starts here rather than above. It runs to the commit, and now covers the statements
+        // themselves plus whatever the writer waits for the producer to hand over -- not the
+        // producer's whole cost.
         var writeLockHold = System.Diagnostics.Stopwatch.StartNew();
         try
         {
@@ -273,33 +269,35 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
             var envelopeParameter = put.Parameters.Add("$envelope", SqliteType.Blob);
             var storedParameter = put.Parameters.Add("$storedAt", SqliteType.Integer);
 
-            foreach (var record in records)
+            await foreach (var batch in pipeline.Batches)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                ValidateWrite(record.RecordKind, record.Payload);
-                if (!record.Id.Value.StartsWith(idPrefix, StringComparison.Ordinal))
-                    throw new ArgumentException("Every replacement record id must start with the set prefix.", nameof(records));
-
-                var envelope = EnvelopeCodec.Wrap(
-                    record.RecordKind, record.Id.Value, record.Payload.Span);
                 try
                 {
-                    idParameter.Value = record.Id.Value;
-                    kindParameter.Value = record.RecordKind;
-                    capturedParameter.Value = record.CapturedAt.ToUnixTimeMilliseconds();
-                    resolutionParameter.Value = record.Resolution.ToString();
-                    envelopeParameter.Value = envelope;
-                    storedParameter.Value = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
-                    await put.ExecuteNonQueryAsync(cancellationToken);
-                    written++;
-                    payloadBytes += record.Payload.Length;
-                    storedBytes += envelope.Length;
+                    foreach (var prepared in batch)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        idParameter.Value = prepared.Id;
+                        kindParameter.Value = prepared.RecordKind;
+                        capturedParameter.Value = prepared.CapturedAtUnixMs;
+                        resolutionParameter.Value = prepared.Resolution;
+                        envelopeParameter.Value = prepared.Envelope;
+                        storedParameter.Value = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+                        await put.ExecuteNonQueryAsync(cancellationToken);
+                        written++;
+                        payloadBytes += prepared.PayloadLength;
+                        storedBytes += prepared.Envelope.Length;
+                    }
                 }
                 finally
                 {
-                    CryptographicOperations.ZeroMemory(envelope);
+                    PreparedRecordPipeline.Zero(batch);
                 }
             }
+
+            // The producer stops handing batches over when a record is rejected, which from the
+            // writer's side looks exactly like a set that ended. Committing here without asking
+            // would persist the prefix delete plus however much arrived first.
+            pipeline.ThrowIfFailed();
             await transaction.CommitAsync(cancellationToken);
             writeLockHold.Stop();
             return new ProtectedSetReplacement(
@@ -484,7 +482,12 @@ public sealed class SqliteProtectedRecordStore : IProtectedRecordStore, IProtect
         }
     }
 
-    private void ValidateWrite(string recordKind, ReadOnlyMemory<byte> payload)
+    /// <summary>
+    /// The per-record limits, in one place: <see cref="PutAsync"/> and the replacement pipeline
+    /// both reject through here, so a record rejected by one is rejected by the other with the
+    /// same wording.
+    /// </summary>
+    internal void ValidateWrite(string recordKind, ReadOnlyMemory<byte> payload)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(recordKind);
         if (recordKind.Length > _maxRecordKindLength)

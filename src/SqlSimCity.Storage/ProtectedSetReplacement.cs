@@ -14,9 +14,11 @@ namespace SqlSimCity.Storage;
 /// <param name="WriteLockHold">
 /// How long the store held writers out: measured from immediately before the first write
 /// statement -- which is where a deferred SQLite transaction takes the write lock, not
-/// <c>BEGIN</c> -- until the commit returns. Excludes connection setup, and excludes the caller's
-/// own serialization work only insofar as that work is interleaved with the inserts it feeds.
-/// A store with no write lock reports the equivalent exclusive section.
+/// <c>BEGIN</c> -- until the commit returns. Excludes connection setup. The caller's own
+/// serialization is prepared on a producer task that starts before the transaction opens, so
+/// this is the statements plus whatever the writer had to wait for that producer to hand over,
+/// not the producer's whole cost. A store with no write lock reports the equivalent exclusive
+/// section.
 /// </param>
 public readonly record struct ProtectedSetReplacement(
     int RecordsDeleted,
