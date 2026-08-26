@@ -10,6 +10,12 @@
 --   INTERVAL_LENGTH_MINUTES = 60 produces one runtime-stats interval per hour, so a
 --   short seed run yields a single interval and cannot exercise the paging behaviour
 --   at all. 1 is the minimum and lets a few minutes of workload build real history.
+--
+--   STALE_QUERY_THRESHOLD_DAYS bounds how far back the store keeps anything. The
+--   30-day default is ample for the fast path, whose history is minutes old, and
+--   silently fatal for a deep-history run, which relabels intervals as months old
+--   and would watch cleanup delete them. Add-DeepHistory.ps1 raises it via this
+--   variable before it stretches anything.
 
 SET NOCOUNT ON;
 GO
@@ -38,7 +44,7 @@ ALTER DATABASE [$(DatabaseName)] SET QUERY_STORE (
     INTERVAL_LENGTH_MINUTES = 1,
     MAX_STORAGE_SIZE_MB = $(QueryStoreMaxSizeMb),
     SIZE_BASED_CLEANUP_MODE = AUTO,
-    CLEANUP_POLICY = (STALE_QUERY_THRESHOLD_DAYS = 30),
+    CLEANUP_POLICY = (STALE_QUERY_THRESHOLD_DAYS = $(StaleQueryThresholdDays)),
     MAX_PLANS_PER_QUERY = 200,
     DATA_FLUSH_INTERVAL_SECONDS = 60
 );
@@ -73,6 +79,7 @@ SELECT
     actual_state_desc,
     query_capture_mode_desc,
     interval_length_minutes,
-    max_storage_size_mb
+    max_storage_size_mb,
+    stale_query_threshold_days
 FROM sys.database_query_store_options;
 GO
