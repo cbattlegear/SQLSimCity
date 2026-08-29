@@ -57,6 +57,8 @@ type Props = {
   feedState?: LiveFeedConnectionState
   /** Live blocking pins projected from the snapshot. Drawn in both view modes. */
   incidents?: IncidentProjection
+  /** Whether stale Query Store evidence should weather building facades. */
+  statsDecay?: boolean
   /**
    * The executions the live feed has observed, newest first, and the families they are matched
    * against.
@@ -150,6 +152,7 @@ export function DatabaseCityViewport({
   liveStatus,
   feedState,
   incidents,
+  statsDecay = false,
   liveQueries = null,
   families,
   onVehicleRoster,
@@ -218,6 +221,7 @@ export function DatabaseCityViewport({
   useEffect(() => sceneRef.current?.setRoute(route), [route])
   useEffect(() => sceneRef.current?.setSelected(selectedId), [selectedId])
   useEffect(() => sceneRef.current?.setSelectedRoad(selectedRoadId), [selectedRoadId])
+  useEffect(() => sceneRef.current?.setStatsDecay(statsDecay), [statsDecay])
   useEffect(() => sceneRef.current?.setLayers(layers), [layers])
   useEffect(() => sceneRef.current?.setViewMode(viewMode), [viewMode])
   useEffect(() => sceneRef.current?.setIncidents(incidents?.markers ?? []), [incidents])

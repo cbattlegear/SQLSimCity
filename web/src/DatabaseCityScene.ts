@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { directActivityWidth } from './databaseCity'
 import type { DatabaseCityObject, DatabaseCityQueryFamily } from './databaseCityContracts'
 import { ARTERIAL_WIDTH, streetPitch, streetRoute, type CityLot, type CityPlan, type StreetClass } from './cityPlan'
-import { buildBuildingGeometry, buildingColor, mapBuildingColor, neighborhoodTint } from './cityBuildings'
+import { buildBuildingGeometry, buildingColor, mapBuildingColor, mixColor, neighborhoodTint } from './cityBuildings'
 import { assignQueryRoutes } from './cityQueryTraffic'
 import { ROAD_WIDTH, type RoadTraffic } from './cityTraffic'
 import type { WorkloadTraffic } from './cityWorkloadTraffic'
@@ -245,6 +245,8 @@ export type DatabaseCitySceneController = {
   setSelected(objectId: string | null): void
   /** Highlights one road and pins both of its endpoints. */
   setSelectedRoad(routeId: string | null): void
+  /** Applies a weathered pass when Query Store evidence is older than the configured threshold. */
+  setStatsDecay(enabled: boolean): void
   setLayers(layers: Partial<CityLayerToggles>): void
   /** Live incident pins, placed on the road between the parties rather than on a roof. */
   setIncidents(markers: readonly IncidentMarker[]): void
@@ -1244,6 +1246,7 @@ export function createDatabaseCityScene(
   let plan: CityPlan | null = null
   let facilitySites: ReadonlyMap<FacilityKind, FacilitySite> = new Map<FacilityKind, FacilitySite>()
   let currentRoads: readonly RoadTraffic[] = []
+  let currentObjects: readonly DatabaseCityObject[] = []
   let currentTraffic: WorkloadTraffic | null = null
   let currentRoute: CityRoute | null = null
   let currentFacilities: readonly Facility[] = []
@@ -1284,6 +1287,7 @@ export function createDatabaseCityScene(
   let vehicleBatches: VehicleBatch[] = []
   /** Vehicles that are not stopped. Zero means there is nothing to animate and the loop must end. */
   let movingVehicles = 0
+  let statsDecay = false
   /** Placements keyed by the session they were pinned for, so a blocked vehicle stops at its pin. */
   const blockedPlacements = new Map<number, IncidentPlacement>()
   const layers: CityLayerToggles = {
@@ -2813,6 +2817,8 @@ export function createDatabaseCityScene(
     const tints = new Map<string, number>(
       cityPlan.districts.map(district => [district.districtId, neighborhoodTint(district.neighborhoodOrdinal)]),
     )
+    const weatheredBuildingColor = (color: number): number =>
+      statsDecay ? mixColor(color, 0x4f4a45, 0.35) : color
     /*
      * Shadow casting is capped rather than universal.
      *
@@ -2839,12 +2845,14 @@ export function createDatabaseCityScene(
       const character = cityPlan.terrain.characters.get(lot.districtId)
       const geometry = buildBuildingGeometry(lot, character)
       const tint = tints.get(lot.districtId)
+      const bodyColor = weatheredBuildingColor(buildingColor(lot.archetype, character, tint))
+      const mapColor = weatheredBuildingColor(mapBuildingColor(lot.archetype, MAP_PALETTE.building, tint))
       const body = new THREE.Mesh(
         track(geometry.body),
         known
           ? bodyMaterial(
-              buildingColor(lot.archetype, character, tint),
-              mapBuildingColor(lot.archetype, MAP_PALETTE.building, tint),
+              bodyColor,
+              mapColor,
             )
           : materials.unknown,
       )
@@ -3457,6 +3465,7 @@ export function createDatabaseCityScene(
 
   return {
     setObjects(objects, cityPlan) {
+      currentObjects = objects
       plan = cityPlan
       facilitySites = plan.facilities
       buildGround(plan)
@@ -3511,6 +3520,12 @@ export function createDatabaseCityScene(
     setSelectedRoad(routeId) {
       selectedRoadId = routeId
       applyRoadHighlight()
+      requestRender()
+    },
+    setStatsDecay(enabled) {
+      if (statsDecay === enabled) return
+      statsDecay = enabled
+      if (plan) buildBuildings(currentObjects, plan)
       requestRender()
     },
     setLayers(next) {
