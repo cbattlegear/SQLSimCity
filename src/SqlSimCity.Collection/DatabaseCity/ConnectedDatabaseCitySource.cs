@@ -98,6 +98,7 @@ public sealed class ConnectedDatabaseCitySource(
         var usageByIndex = probe.Usage.ToDictionary(
             row => (row.ObjectId, row.IndexId),
             row => row.TotalOperations);
+        var statisticsByObject = (probe.Statistics ?? []).ToDictionary(row => row.ObjectId);
         var directEvidence = new EvidenceV1(
             EvidenceSource.LiveDmvCumulative,
             probe.UsageStatus,
@@ -130,6 +131,43 @@ public sealed class ConnectedDatabaseCitySource(
         var familyIdsByObject = (joined?.Families ?? [])
             .SelectMany(family => family.ObjectIds.Select(objectId => (objectId, family.FamilyId)))
             .ToLookup(pair => pair.objectId, pair => pair.FamilyId, StringComparer.Ordinal);
+
+        /*
+         * Null means nobody measured this object's statistics, and is deliberately distinct from a
+         * row saying it has none. When the probe was denied or unsupported there is no evidence at
+         * all, so returning a zeroed row would let a caller read "no stale statistics" out of "we
+         * never looked" -- the same conflation the deadlock evidence already guards against.
+         */
+        DatabaseCityStatisticsAgeV1? StatisticsFor(int rawObjectId)
+        {
+            if (probe.StatisticsStatus != DataStatus.Available)
+            {
+                return probe.StatisticsReason is null
+                    ? null
+                    : new DatabaseCityStatisticsAgeV1(
+                        null, 0, 0, 0, null, MeasurementStatus.Unknown, probe.StatisticsReason);
+            }
+
+            // The probe returns no row for an object that carries no non-hypothetical statistic.
+            // That is a measured zero, not missing evidence, so it is Known with an empty count.
+            if (!statisticsByObject.TryGetValue(rawObjectId, out var row))
+            {
+                return new DatabaseCityStatisticsAgeV1(
+                    null, 0, 0, 0, null, MeasurementStatus.Known,
+                    "This object carries no non-hypothetical statistics.");
+            }
+
+            return new DatabaseCityStatisticsAgeV1(
+                row.OldestLastUpdated,
+                row.StatisticsCount,
+                row.NeverUpdatedCount,
+                row.UnreadableCount,
+                row.ModificationCounter,
+                MeasurementStatus.Known,
+                row.UnreadableCount > 0
+                    ? $"{row.UnreadableCount.ToString(CultureInfo.InvariantCulture)} of {row.StatisticsCount.ToString(CultureInfo.InvariantCulture)} statistics could not be read and are excluded from the age."
+                    : null);
+        }
         var schemas = selectedGroups
             .Select(group => group.First())
             .GroupBy(row => row.SchemaId)
@@ -200,10 +238,10 @@ public sealed class ConnectedDatabaseCitySource(
                     null,
                     directEvidence),
                 AttributedExposure = Exposure(joined, objectId, unavailableAttribution),
+                Statistics = StatisticsFor(first.ObjectId),
             };
         }).ToArray();
-        var projected = DatabaseCityProjector.ProjectObjects(schemas, evidenceObjects);
-        var nextToken = groups.Length > pageSize && selectedGroups.Length > 0
+        var projected = DatabaseCityProjector.ProjectObjects(schemas, evidenceObjects);        var nextToken = groups.Length > pageSize && selectedGroups.Length > 0
             ? EncodeToken(
                 databaseId, metric, pageSize, selectedGroups[^1].Key,
                 cursor.LayoutOffset + selectedGroups.Length)

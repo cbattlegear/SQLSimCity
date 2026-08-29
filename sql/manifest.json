@@ -883,6 +883,36 @@
       "relativeCost": "low"
     },
     {
+      "id": "city.statistics_age_page",
+      "title": "Keyset-bounded database-city statistics freshness",
+      "file": "probes/city/statistics_age_page.sql",
+      "connectionScope": "database",
+      "minPlatform": "SQL Server 2016 (13.x)",
+      "azureSqlDatabase": {
+        "unsupported": false,
+        "notes": "Supported and bounded to the current database and selected parent object page."
+      },
+      "requiredPermission": "SELECT on the statistics object, which sys.dm_db_stats_properties requires; it returns no row rather than raising when the permission is absent, so unreadable statistics are counted separately from never-updated ones.",
+      "cadenceClass": "standard",
+      "parameters": [
+        {
+          "name": "@AfterObjectId",
+          "sqlDbType": "Int",
+          "required": true,
+          "description": "Exclusive object_id keyset boundary shared with city.object_inventory_page."
+        },
+        {
+          "name": "@TopN",
+          "sqlDbType": "Int",
+          "required": true,
+          "description": "Maximum parent objects selected before joining sys.stats; runtime callers enforce 1 through 51."
+        }
+      ],
+      "resultSets": 1,
+      "resultContract": "One row per object carrying at least one non-hypothetical statistic, for at most @TopN parent objects selected by object_id > @AfterObjectId. oldest_last_updated is the stalest statistic on the object and is null when none has ever been updated; never_updated_count and unreadable_count separate 'never built' and 'could not be read' from staleness.",
+      "relativeCost": "low"
+    },
+    {
       "id": "index.usage_summary",
       "title": "Index seek/scan/lookup/update counts",
       "file": "probes/index/index_usage_summary.sql",

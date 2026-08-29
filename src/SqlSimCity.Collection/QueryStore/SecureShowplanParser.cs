@@ -27,6 +27,14 @@ namespace SqlSimCity.Collection.QueryStore;
 /// Cap on warnings retained for a single operator. Every element under <c>Warnings</c> allocates a
 /// warning and canonicalizes its attributes, so this bounds allocation and regex work alike.
 /// </param>
+/// <param name="MaximumMissingIndexes">
+/// Cap on plan-level missing-index suggestions retained. These are not bounded by
+/// <paramref name="MaximumNodes"/> because they hang off <c>QueryPlan</c> rather than off an
+/// operator, so a plan with no operators at all could still carry a long list.
+/// </param>
+/// <param name="MaximumMissingIndexColumns">
+/// Cap on columns retained across all three column groups of a single missing index.
+/// </param>
 public sealed record ShowplanParserLimits(
     int MaximumXmlCharacters = 8 * 1024 * 1024,
     int MaximumDepth = 128,
@@ -34,12 +42,26 @@ public sealed record ShowplanParserLimits(
     int MaximumTextCharacters = 4 * 1024 * 1024,
     int MaximumElements = 400_000,
     int MaximumNodeExpressions = 4_000,
-    int MaximumNodeWarnings = 1_000);
+    int MaximumNodeWarnings = 1_000,
+    int MaximumMissingIndexes = 1_000,
+    int MaximumMissingIndexColumns = 1_000);
 
 public sealed class SecureShowplanParser
 {
     private const string Caveat =
         "Compiled plan structure with aggregate query-level Query Store runtime only; Query Store does not provide actual operator progress or actual operator metrics.";
+
+    /*
+     * Warnings the engine writes as attributes on `<Warnings>` rather than as child elements.
+     *
+     * There is no marker in the document that distinguishes these from the element-shaped warnings,
+     * so they have to be named. The names are the attribute names from the Showplan schema, and they
+     * are emitted as warning kinds so that one vocabulary covers both spellings -- otherwise
+     * `NoJoinPredicate` is a kind no plan can ever carry.
+     */
+    private static readonly string[] WarningFlagAttributes =
+        ["NoJoinPredicate", "SpatialGuess", "FullUpdateForOnlineIndexBuild"];
+
     private readonly ShowplanParserLimits _limits;
 
     public SecureShowplanParser(ShowplanParserLimits? limits = null) =>
@@ -83,6 +105,12 @@ public sealed class SecureShowplanParser
         string? dispatcherExpression = null;
         var elementCount = 0;
         var operatorCount = 0;
+        var missingIndexes = new List<ShowplanMissingIndexV1>();
+        // The suggestion being filled in. `<MissingIndex>` carries the table and `<ColumnGroup>`
+        // children carry the columns, so it cannot be built until its subtree closes.
+        MissingIndexBuilder? missingIndex = null;
+        decimal? missingIndexGroupImpact = null;
+        string? columnGroupUsage = null;
 
         while (await reader.ReadAsync())
         {
@@ -102,6 +130,20 @@ public sealed class SecureShowplanParser
                 var local = reader.LocalName;
                 elementStack.Push(local);
                 if (local == "Warnings" && !reader.IsEmptyElement) warningsDepth++;
+                /*
+                 * Several warnings are attributes on `<Warnings>` rather than child elements:
+                 * `NoJoinPredicate`, `SpatialGuess` and `FullUpdateForOnlineIndexBuild` are all
+                 * written that way by the engine. Recording only child elements meant those kinds
+                 * were never produced at all, so a vocabulary that names them -- the findings rule
+                 * does -- could never match, and a plan with no join predicate reported nothing.
+                 */
+                if (local == "Warnings" && nodeStack.TryPeek(out var flagNode))
+                {
+                    foreach (var flag in WarningFlagAttributes)
+                        if (IsTrue(Attribute(reader, flag)))
+                            AddWarning(flagNode, flag, null);
+                }
+
                 if (local == "ShowPlanXML")
                 {
                     version = Attribute(reader, "Version") ?? version;
@@ -109,6 +151,36 @@ public sealed class SecureShowplanParser
                 else if (local == "StmtSimple")
                 {
                     ceVersion = Attribute(reader, "CardinalityEstimationModelVersion") ?? ceVersion;
+                }
+                /*
+                 * Missing indexes are plan-level and are handled before the warning branches below.
+                 *
+                 * `<MissingIndexes>` is a child of `<QueryPlan>` written *before* the first
+                 * `<RelOp>`, so at this point no operator is open and nothing under it can be
+                 * attributed to one. That is exactly why reading a missing index out of a node's
+                 * warnings finds nothing: the block is over before the first operator begins.
+                 */
+                else if (local == "MissingIndexGroup")
+                {
+                    missingIndexGroupImpact = DecimalAttribute(reader, "Impact");
+                }
+                else if (local == "MissingIndex")
+                {
+                    missingIndex = new MissingIndexBuilder(
+                        Attribute(reader, "Database"),
+                        Attribute(reader, "Schema"),
+                        Attribute(reader, "Table"),
+                        missingIndexGroupImpact);
+                    if (reader.IsEmptyElement) CompleteMissingIndex();
+                }
+                else if (local == "ColumnGroup" && missingIndex is not null)
+                {
+                    columnGroupUsage = Attribute(reader, "Usage");
+                }
+                else if (local == "Column" && missingIndex is not null && columnGroupUsage is not null)
+                {
+                    if (Attribute(reader, "Name") is { } columnName)
+                        missingIndex.Add(columnGroupUsage, columnName, _limits.MaximumMissingIndexColumns);
                 }
                 else if (local == "MemoryGrantInfo")
                 {
@@ -153,12 +225,12 @@ public sealed class SecureShowplanParser
                           local.Contains("Warning", StringComparison.OrdinalIgnoreCase) &&
                          nodeStack.TryPeek(out var warningNode))
                 {
-                    AddWarning(warningNode, local);
+                    AddWarning(warningNode, local, CanonicalWarningAttributes(reader));
                 }
                 else if (warningsDepth > 0 && local != "Warnings" &&
                          nodeStack.TryPeek(out warningNode))
                 {
-                    AddWarning(warningNode, local);
+                    AddWarning(warningNode, local, CanonicalWarningAttributes(reader));
                 }
                 else if (local is "ParameterSensitivePredicate" or "DispatcherExpression")
                 {
@@ -198,6 +270,9 @@ public sealed class SecureShowplanParser
             {
                 if (reader.LocalName == "RelOp" && nodeStack.Count > 0) nodeStack.Pop();
                 if (reader.LocalName == "Warnings" && warningsDepth > 0) warningsDepth--;
+                if (reader.LocalName == "MissingIndex") CompleteMissingIndex();
+                if (reader.LocalName == "ColumnGroup") columnGroupUsage = null;
+                if (reader.LocalName == "MissingIndexGroup") missingIndexGroupImpact = null;
                 if (elementStack.Count > 0) elementStack.Pop();
             }
         }
@@ -210,7 +285,10 @@ public sealed class SecureShowplanParser
             "1.0", planId, version, ceVersion, desiredMemory, requiredMemory, nodes,
             optimization, dispatcherExpression, fingerprint, Caveat,
             new QueryStoreEvidenceV1(QueryStoreSource.QueryStore, DataStatus.Available, null, null,
-                "Normalized from a single on-demand Query Store Showplan document.", Caveat));
+                "Normalized from a single on-demand Query Store Showplan document.", Caveat),
+            // Always a list, never null: this parser looked. Null is reserved for plans normalized
+            // by a build that had no missing-index reader at all.
+            missingIndexes);
 
         // Both lists are retained for the lifetime of the parse and neither is bounded by the
         // element counter, so each states its own limit rather than inheriting one by side effect.
@@ -225,7 +303,7 @@ public sealed class SecureShowplanParser
             node.AddExpression(expression);
         }
 
-        void AddWarning(NodeBuilder node, string name)
+        void AddWarning(NodeBuilder node, string name, string? detail)
         {
             if (node.Warnings.Count >= _limits.MaximumNodeWarnings)
             {
@@ -233,11 +311,34 @@ public sealed class SecureShowplanParser
                     $"A Showplan operator exceeds the {_limits.MaximumNodeWarnings}-warning limit.");
             }
 
-            node.Warnings.Add(new ShowplanWarningV1(name, CanonicalWarningAttributes(reader)));
+            node.Warnings.Add(new ShowplanWarningV1(name, detail));
+        }
+
+        void CompleteMissingIndex()
+        {
+            if (missingIndex is null) return;
+            if (missingIndexes.Count >= _limits.MaximumMissingIndexes)
+            {
+                throw new XmlException(
+                    $"A Showplan exceeds the {_limits.MaximumMissingIndexes}-missing-index limit.");
+            }
+
+            missingIndexes.Add(missingIndex.Build());
+            missingIndex = null;
+            columnGroupUsage = null;
         }
     }
 
     private static string? Attribute(XmlReader reader, string name) => reader.GetAttribute(name);
+
+    /// <summary>
+    /// Showplan writes its boolean attributes both ways -- <c>"true"</c> and <c>"1"</c> both appear
+    /// for the same attribute across engine versions -- so both spellings are accepted. Anything
+    /// else, including a missing attribute, is not a warning.
+    /// </summary>
+    private static bool IsTrue(string? value) =>
+        string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(value, "1", StringComparison.Ordinal);
     private static int? IntAttribute(XmlReader reader, string name) =>
         int.TryParse(Attribute(reader, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
     private static decimal? DecimalAttribute(XmlReader reader, string name) =>
@@ -307,6 +408,38 @@ public sealed class SecureShowplanParser
                 current = byId[parent];
             }
         }
+    }
+
+    /// <summary>
+    /// Accumulates one <c>&lt;MissingIndex&gt;</c> subtree. The table is on the element itself, the
+    /// impact is on its <c>&lt;MissingIndexGroup&gt;</c> parent, and the columns arrive as
+    /// <c>&lt;ColumnGroup&gt;</c> children, so the suggestion cannot be built until it closes.
+    /// </summary>
+    private sealed class MissingIndexBuilder(string? database, string? schema, string? table, decimal? impact)
+    {
+        private readonly List<string> _equality = [];
+        private readonly List<string> _inequality = [];
+        private readonly List<string> _included = [];
+
+        private int Count => _equality.Count + _inequality.Count + _included.Count;
+
+        public void Add(string usage, string column, int limit)
+        {
+            if (Count >= limit)
+            {
+                throw new XmlException(
+                    $"A Showplan missing index exceeds the {limit}-column limit.");
+            }
+
+            // Usage is matched case-insensitively because it is a schema enumeration, not data, and
+            // an unrecognised usage is dropped rather than filed under a group it does not belong to.
+            if (string.Equals(usage, "EQUALITY", StringComparison.OrdinalIgnoreCase)) _equality.Add(column);
+            else if (string.Equals(usage, "INEQUALITY", StringComparison.OrdinalIgnoreCase)) _inequality.Add(column);
+            else if (string.Equals(usage, "INCLUDE", StringComparison.OrdinalIgnoreCase)) _included.Add(column);
+        }
+
+        public ShowplanMissingIndexV1 Build() =>
+            new(database, schema, table, impact, [.. _equality], [.. _inequality], [.. _included]);
     }
 
     private sealed class NodeBuilder(int nodeId, int? parentNodeId, string logicalOperation, string physicalOperation)

@@ -32,7 +32,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     /// treats an unrecognized kind as a miss, and the miss re-hydrates from the Showplan and
     /// overwrites. Bump it whenever a member is added to the normalized plan contract.
     /// </summary>
-    internal const string NormalizedPlanKind = "query-store-normalized-plan-v2";
+    internal const string NormalizedPlanKind = "query-store-normalized-plan-v3";
 
     /// <summary>
     /// Kinds this type no longer writes but may still find in a store written by an earlier
@@ -41,7 +41,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     /// rather than becoming unaccounted-for storage that nothing can reclaim.
     /// </summary>
     internal static readonly IReadOnlyList<string> SupersededNormalizedPlanKinds =
-        ["query-store-normalized-plan"];
+        ["query-store-normalized-plan", "query-store-normalized-plan-v2"];
 
     internal const string NormalizedPlanChunkKind = "query-store-normalized-plan-chunk";
 

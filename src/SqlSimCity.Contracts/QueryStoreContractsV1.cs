@@ -105,6 +105,32 @@ public sealed record PageV1<T>(
 
 public sealed record ShowplanObjectV1(string? Database, string? Schema, string? Table, string? Index);
 public sealed record ShowplanWarningV1(string Kind, string? Detail);
+
+/// <summary>
+/// One index the optimizer says it would have liked, taken from the plan-level
+/// <c>&lt;MissingIndexes&gt;</c> block rather than from any operator's warnings.
+/// <para>
+/// It is emphatically <em>not</em> a node warning, which is why it needs its own home on the plan.
+/// <c>&lt;MissingIndexes&gt;</c> is a child of <c>&lt;QueryPlan&gt;</c> and is written before the
+/// first <c>&lt;RelOp&gt;</c>, so a parser that only records warnings while an operator is open sees
+/// it and drops it. Reading a missing index out of <see cref="ShowplanNodeV1.Warnings"/> therefore
+/// finds nothing, no matter how many indexes the optimizer asked for.
+/// </para>
+/// <para>
+/// <paramref name="ImpactPercent"/> is the optimizer's own estimate of how much cheaper this
+/// statement's plan could have been, 0..100. It is a compile-time estimate about one statement, not
+/// a measurement and not a recommendation for the workload as a whole: the same index can be
+/// suggested by many plans and creating it costs writes that no plan reports.
+/// </para>
+/// </summary>
+public sealed record ShowplanMissingIndexV1(
+    string? Database,
+    string? Schema,
+    string? Table,
+    decimal? ImpactPercent,
+    IReadOnlyList<string> EqualityColumns,
+    IReadOnlyList<string> InequalityColumns,
+    IReadOnlyList<string> IncludedColumns);
 public sealed record ShowplanNodeV1(
     int NodeId,
     int? ParentNodeId,
@@ -146,7 +172,19 @@ public sealed record NormalizedShowplanV1(
     string? DispatcherExpression,
     string StructuralFingerprint,
     string RuntimeOverlayCaveat,
-    QueryStoreEvidenceV1 Evidence);
+    QueryStoreEvidenceV1 Evidence,
+
+    /// <summary>
+    /// Plan-level missing-index suggestions, or <see langword="null"/> when this plan was normalized
+    /// by a build that did not read them.
+    /// <para>
+    /// The two empty answers are different claims and only one of them is about the plan. An empty
+    /// list means the optimizer asked for nothing; <see langword="null"/> means nobody looked, which
+    /// is what an archive normalized before this field existed can honestly say. Collapsing null
+    /// into empty would report "no index would have helped" on evidence that was never gathered.
+    /// </para>
+    /// </summary>
+    IReadOnlyList<ShowplanMissingIndexV1>? MissingIndexes = null);
 
 public sealed record PlanChangeV1(string Path, string ChangeKind, string? Before, string? After);
 

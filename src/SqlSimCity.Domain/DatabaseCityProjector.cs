@@ -21,6 +21,12 @@ public sealed record DatabaseCityObjectEvidence(
     public DatabaseCityAttributedExposureV1? AttributedExposure { get; init; }
     public string? SizeReason { get; init; }
     public int? LayoutOrdinal { get; init; }
+
+    /// <summary>
+    /// How stale this object's statistics are, or <see langword="null"/> when nothing measured them.
+    /// Null is not freshness and must never be projected as such.
+    /// </summary>
+    public DatabaseCityStatisticsAgeV1? Statistics { get; init; }
 }
 
 public sealed record DatabaseCityQueryEvidence(
@@ -139,7 +145,8 @@ public static class DatabaseCityProjector
                     item.DirectActivity ?? new DatabaseCityDirectActivityV1(null, null, UnavailableDirectEvidence),
                     item.AttributedExposure ?? new DatabaseCityAttributedExposureV1(
                         null, null, null, null, QueryAttributionConfidence.Unknown,
-                        "No normalized plan evidence names this object.", UnavailableAttributedEvidence));
+                        "No normalized plan evidence names this object.", UnavailableAttributedEvidence),
+                    item.Statistics);
             })
             .ToArray();
     }

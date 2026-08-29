@@ -85,6 +85,31 @@ public sealed record DatabaseCitySchemaV1(
     string ObjectCount,
     EvidenceV1 Evidence);
 
+/// <summary>
+/// How stale one object's statistics are.
+/// <para>
+/// <see cref="OldestLastUpdated"/> is the freshness of the object's <em>stalest</em> statistic, so an
+/// object is only as fresh as its worst one. It is <see langword="null"/> when no statistic on the
+/// object has ever been updated, which is why <see cref="NeverUpdatedCount"/> exists separately: a
+/// statistic that has never been built is not an old measurement, and folding the two together would
+/// report a never-analysed object as fresh.
+/// </para>
+/// <para>
+/// <see cref="UnreadableCount"/> is the count of statistics whose properties could not be read at
+/// all -- <c>sys.dm_db_stats_properties</c> returns no row rather than raising when the caller lacks
+/// SELECT on the statistics object. That is missing evidence, not evidence of freshness, and callers
+/// must not treat it as either fresh or stale.
+/// </para>
+/// </summary>
+public sealed record DatabaseCityStatisticsAgeV1(
+    DateTimeOffset? OldestLastUpdated,
+    int StatisticsCount,
+    int NeverUpdatedCount,
+    int UnreadableCount,
+    string? ModificationCounter,
+    MeasurementStatus Status,
+    string? Reason);
+
 public sealed record DatabaseCityObjectV1(
     string ObjectId,
     string SchemaId,
@@ -100,7 +125,10 @@ public sealed record DatabaseCityObjectV1(
     DatabaseCityLayoutV1 Layout,
     IReadOnlyList<DatabaseCityIndexV1> Indexes,
     DatabaseCityDirectActivityV1 DirectActivity,
-    DatabaseCityAttributedExposureV1 AttributedExposure);
+    DatabaseCityAttributedExposureV1 AttributedExposure,
+    // Trailing and optional so that every existing construction site keeps compiling, and so an
+    // archive written before this probe existed reads back as "nobody looked" rather than "fresh".
+    DatabaseCityStatisticsAgeV1? Statistics = null);
 
 /// <summary>
 /// One captured query family. <paramref name="WaitMillisecondsByCategory"/> is keyed by the verbatim

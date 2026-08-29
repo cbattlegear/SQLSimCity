@@ -74,6 +74,12 @@ public sealed class SqlClientDatabaseCityProbeExecutor(
             },
             cancellationToken).ConfigureAwait(false);
 
+        // Each of the two secondary probes gets its own try/catch. They read different DMVs with
+        // different permissions, so a denial on one is not evidence about the other -- sharing a
+        // catch would silently report index usage as denied because statistics were.
+        var statistics = await CollectStatisticsAsync(databaseName, afterObjectId, topN, cancellationToken)
+            .ConfigureAwait(false);
+
         try
         {
             var usage = await ExecuteAsync(
@@ -105,7 +111,8 @@ public sealed class SqlClientDatabaseCityProbeExecutor(
                 inventory.Rows, usage, DataStatus.Available,
                 "Direct cumulative index usage counters were collected; reset epoch is unavailable because database detach/shutdown resets are not timestamped.",
                 timeProvider.GetUtcNow(),
-                inventory.TotalObjects);
+                inventory.TotalObjects,
+                statistics.Rows, statistics.Status, statistics.Reason);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -115,13 +122,68 @@ public sealed class SqlClientDatabaseCityProbeExecutor(
         {
             return new DatabaseCityProbePage(
                 inventory.Rows, [], DataStatus.PermissionDenied, ex.Reason, timeProvider.GetUtcNow(),
-                inventory.TotalObjects);
+                inventory.TotalObjects, statistics.Rows, statistics.Status, statistics.Reason);
         }
         catch (ProbeObjectUnavailableException ex)
         {
             return new DatabaseCityProbePage(
                 inventory.Rows, [], DataStatus.Unsupported, ex.Reason, timeProvider.GetUtcNow(),
-                inventory.TotalObjects);
+                inventory.TotalObjects, statistics.Rows, statistics.Status, statistics.Reason);
+        }
+    }
+
+    private async Task<(IReadOnlyList<DatabaseCityStatisticsAgeRow> Rows, DataStatus Status, string Reason)>
+        CollectStatisticsAsync(
+            string databaseName,
+            int afterObjectId,
+            int topN,
+            CancellationToken cancellationToken)
+    {
+        try
+        {
+            var rows = await ExecuteAsync(
+                "city.statistics_age_page",
+                databaseName,
+                new Dictionary<string, object?>
+                {
+                    ["@AfterObjectId"] = afterObjectId,
+                    ["@TopN"] = topN,
+                },
+                async (reader, token) =>
+                {
+                    var collected = new List<DatabaseCityStatisticsAgeRow>();
+                    while (await reader.ReadAsync(token).ConfigureAwait(false))
+                    {
+                        collected.Add(new DatabaseCityStatisticsAgeRow(
+                            Convert.ToInt32(reader["object_id"], CultureInfo.InvariantCulture),
+                            reader["oldest_last_updated"] is DBNull
+                                ? null
+                                : new DateTimeOffset(
+                                    DateTime.SpecifyKind(
+                                        Convert.ToDateTime(reader["oldest_last_updated"], CultureInfo.InvariantCulture),
+                                        DateTimeKind.Utc)),
+                            Convert.ToInt32(reader["statistics_count"], CultureInfo.InvariantCulture),
+                            Convert.ToInt32(reader["never_updated_count"], CultureInfo.InvariantCulture),
+                            Convert.ToInt32(reader["unreadable_count"], CultureInfo.InvariantCulture),
+                            NullableUnsigned(reader["max_modification_counter"])));
+                    }
+                    return (IReadOnlyList<DatabaseCityStatisticsAgeRow>)collected;
+                },
+                cancellationToken).ConfigureAwait(false);
+            return (rows, DataStatus.Available,
+                "Statistics freshness was read per object; an object is reported as fresh as its stalest statistic.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (ProbePermissionDeniedException ex)
+        {
+            return ([], DataStatus.PermissionDenied, ex.Reason);
+        }
+        catch (ProbeObjectUnavailableException ex)
+        {
+            return ([], DataStatus.Unsupported, ex.Reason);
         }
     }
 

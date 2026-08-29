@@ -245,8 +245,11 @@ export type DatabaseCitySceneController = {
   setSelected(objectId: string | null): void
   /** Highlights one road and pins both of its endpoints. */
   setSelectedRoad(routeId: string | null): void
-  /** Applies a weathered pass when Query Store evidence is older than the configured threshold. */
-  setStatsDecay(enabled: boolean): void
+  /**
+   * Weathers the buildings whose statistics are stale. Per object rather than a whole-city flag,
+   * because a city-wide wash would weather buildings whose statistics are fresh.
+   */
+  setStaleStatsObjects(objectIds: readonly string[]): void
   setLayers(layers: Partial<CityLayerToggles>): void
   /** Live incident pins, placed on the road between the parties rather than on a roof. */
   setIncidents(markers: readonly IncidentMarker[]): void
@@ -1287,7 +1290,7 @@ export function createDatabaseCityScene(
   let vehicleBatches: VehicleBatch[] = []
   /** Vehicles that are not stopped. Zero means there is nothing to animate and the loop must end. */
   let movingVehicles = 0
-  let statsDecay = false
+  let staleStatsObjectIds = new Set<string>()
   /** Placements keyed by the session they were pinned for, so a blocked vehicle stops at its pin. */
   const blockedPlacements = new Map<number, IncidentPlacement>()
   const layers: CityLayerToggles = {
@@ -2817,8 +2820,15 @@ export function createDatabaseCityScene(
     const tints = new Map<string, number>(
       cityPlan.districts.map(district => [district.districtId, neighborhoodTint(district.neighborhoodOrdinal)]),
     )
-    const weatheredBuildingColor = (color: number): number =>
-      statsDecay ? mixColor(color, 0x4f4a45, 0.35) : color
+    /*
+     * Weathering is per object, not a city-wide wash.
+     *
+     * Staleness is measured per object, so a single flag would weather buildings whose statistics
+     * were rebuilt an hour ago just because some other table's were not — which reads as a claim
+     * about those buildings that the evidence does not make.
+     */
+    const weatheredBuildingColor = (color: number, objectId: string): number =>
+      staleStatsObjectIds.has(objectId) ? mixColor(color, 0x4f4a45, 0.35) : color
     /*
      * Shadow casting is capped rather than universal.
      *
@@ -2845,8 +2855,8 @@ export function createDatabaseCityScene(
       const character = cityPlan.terrain.characters.get(lot.districtId)
       const geometry = buildBuildingGeometry(lot, character)
       const tint = tints.get(lot.districtId)
-      const bodyColor = weatheredBuildingColor(buildingColor(lot.archetype, character, tint))
-      const mapColor = weatheredBuildingColor(mapBuildingColor(lot.archetype, MAP_PALETTE.building, tint))
+      const bodyColor = weatheredBuildingColor(buildingColor(lot.archetype, character, tint), object.objectId)
+      const mapColor = weatheredBuildingColor(mapBuildingColor(lot.archetype, MAP_PALETTE.building, tint), object.objectId)
       const body = new THREE.Mesh(
         track(geometry.body),
         known
@@ -3522,9 +3532,15 @@ export function createDatabaseCityScene(
       applyRoadHighlight()
       requestRender()
     },
-    setStatsDecay(enabled) {
-      if (statsDecay === enabled) return
-      statsDecay = enabled
+    setStaleStatsObjects(objectIds) {
+      // Rebuilding every building is the expensive part, so an unchanged set returns before it.
+      // Compared by content rather than identity: the projection allocates a fresh array each
+      // render, so an identity check would rebuild the whole city on every unrelated state change.
+      if (staleStatsObjectIds.size === objectIds.length &&
+          objectIds.every(objectId => staleStatsObjectIds.has(objectId))) {
+        return
+      }
+      staleStatsObjectIds = new Set(objectIds)
       if (plan) buildBuildings(currentObjects, plan)
       requestRender()
     },

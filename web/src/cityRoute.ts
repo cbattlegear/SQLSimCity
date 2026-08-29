@@ -89,6 +89,23 @@ export interface RouteStop {
   readonly warnings: readonly string[]
 }
 
+/**
+ * An index the optimizer asked for, resolved against the city where possible.
+ *
+ * Plan-level, not per-stop: `<MissingIndexes>` is written before the first `<RelOp>`, so it belongs
+ * to no operator and cannot be read off a stop's warnings. `objectId` is null when the suggestion
+ * names a table this page does not hold — a cross-database reference, or an object on another page.
+ */
+export interface RouteMissingIndex {
+  readonly objectId: string | null
+  readonly label: string
+  /** The optimizer's own estimate of how much cheaper the query would be, 0..100. */
+  readonly impactPercent: number | null
+  readonly equalityColumns: readonly string[]
+  readonly inequalityColumns: readonly string[]
+  readonly includedColumns: readonly string[]
+}
+
 export interface CityRoute {
   readonly planId: string
   readonly stops: readonly RouteStop[]
@@ -105,6 +122,13 @@ export interface CityRoute {
   readonly estimatedCostUnattributed: number
   /** Copied verbatim from the plan; never paraphrased. */
   readonly runtimeOverlayCaveat: string
+  /**
+   * Indexes the optimizer asked for. Empty both when the plan asked for none and when the plan was
+   * normalized by a build that did not read them; `missingIndexesObserved` tells those apart.
+   */
+  readonly missingIndexes: readonly RouteMissingIndex[]
+  /** False when the plan carries no missing-index evidence at all, so "none" is not claimed. */
+  readonly missingIndexesObserved: boolean
 }
 
 export interface RouteContext {
@@ -493,7 +517,37 @@ export function buildCityRoute(showplan: NormalizedShowplan, context: RouteConte
     estimatedCostUnattributed:
       split.total > 0 ? Math.max(0, Math.min(1, 1 - placedShare)) : 0,
     runtimeOverlayCaveat: showplan.runtimeOverlayCaveat,
+    missingIndexes: buildMissingIndexes(showplan, context),
+    missingIndexesObserved: showplan.missingIndexes !== undefined,
   }
+}
+
+function buildMissingIndexes(
+  showplan: NormalizedShowplan,
+  context: RouteContext,
+): RouteMissingIndex[] {
+  return (showplan.missingIndexes ?? []).map(missing => {
+    const matched = matchObject(
+      { database: missing.database, schema: missing.schema, table: missing.table, index: null },
+      context.objects,
+      context.databaseName,
+    )
+    return {
+      objectId: matched?.objectId ?? null,
+      label: matched
+        ? `${matched.schemaName}.${matched.name}`
+        : describeReference({
+            database: missing.database,
+            schema: missing.schema,
+            table: missing.table,
+            index: null,
+          }),
+      impactPercent: missing.impactPercent,
+      equalityColumns: (missing.equalityColumns ?? []).map(column => unquote(column) ?? column),
+      inequalityColumns: (missing.inequalityColumns ?? []).map(column => unquote(column) ?? column),
+      includedColumns: (missing.includedColumns ?? []).map(column => unquote(column) ?? column),
+    }
+  })
 }
 
 function formatRows(value: number): string {

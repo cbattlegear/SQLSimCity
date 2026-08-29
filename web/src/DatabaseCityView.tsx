@@ -596,12 +596,11 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
     () => projectCityDisasters({
       incidents,
       route,
-      queryStoreObservedAt: page?.evidence.observedAt ?? null,
+      objects: visibleObjects,
       search: window.location.search,
     }),
-    [incidents, route, page?.evidence.observedAt],
+    [incidents, route, visibleObjects],
   )
-  const statsDecay = disasters.items.some(item => item.key === 'stats-decay')
 
   /**
    * The traffic map: every ranked family driven through the tables its plans read, once per captured
@@ -1146,7 +1145,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
           liveStatus={liveStatus}
           feedState={feedState}
           incidents={incidents}
-          statsDecay={statsDecay}
+          staleStatsObjectIds={disasters.staleStatsObjectIds}
           liveQueries={queryFeed.events}
           families={families}
           onVehicleRoster={setVehicleRoster}

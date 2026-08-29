@@ -5,6 +5,124 @@ namespace SqlSimCity.Collection.Tests.QueryStore;
 
 public sealed class ShowplanParserTests
 {
+    /// <summary>
+    /// `&lt;MissingIndexes&gt;` is a child of `&lt;QueryPlan&gt;` written before the first
+    /// `&lt;RelOp&gt;`, so no operator is open while it is read and nothing in it can be attributed
+    /// to one. Reading a missing index out of a node's warnings therefore found nothing at all --
+    /// the block is over before the first operator begins -- which is why this asserts on the
+    /// plan-level list and also asserts that the warnings stayed empty.
+    /// </summary>
+    [Fact]
+    public async Task ReadsPlanLevelMissingIndexesThatNoOperatorCanCarry()
+    {
+        const string xml = """
+            <ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.539">
+              <BatchSequence><Batch><Statements><StmtSimple><QueryPlan>
+                <MissingIndexes>
+                  <MissingIndexGroup Impact="98.5">
+                    <MissingIndex Database="[d]" Schema="[dbo]" Table="[Orders]">
+                      <ColumnGroup Usage="EQUALITY"><Column Name="[CustomerId]" ColumnId="1" /></ColumnGroup>
+                      <ColumnGroup Usage="INEQUALITY"><Column Name="[OrderDate]" ColumnId="2" /></ColumnGroup>
+                      <ColumnGroup Usage="INCLUDE"><Column Name="[Total]" ColumnId="3" /></ColumnGroup>
+                    </MissingIndex>
+                  </MissingIndexGroup>
+                </MissingIndexes>
+                <RelOp NodeId="0" LogicalOp="Table Scan" PhysicalOp="Table Scan">
+                  <Object Database="[d]" Schema="[dbo]" Table="[Orders]" />
+                </RelOp>
+              </QueryPlan></StmtSimple></Statements></Batch></BatchSequence>
+            </ShowPlanXML>
+            """;
+
+        var plan = await new SecureShowplanParser().ParseAsync("p", xml);
+
+        var missing = Assert.Single(plan.MissingIndexes!);
+        Assert.Equal("[dbo]", missing.Schema);
+        Assert.Equal("[Orders]", missing.Table);
+        Assert.Equal(98.5m, missing.ImpactPercent);
+        Assert.Equal(["[CustomerId]"], missing.EqualityColumns);
+        Assert.Equal(["[OrderDate]"], missing.InequalityColumns);
+        Assert.Equal(["[Total]"], missing.IncludedColumns);
+        Assert.Empty(plan.Nodes.SelectMany(node => node.Warnings));
+    }
+
+    /// <summary>
+    /// A plan that asks for nothing reports an empty list, never null. Null is reserved for a plan
+    /// normalized by a build with no missing-index reader, so collapsing the two would let "we never
+    /// looked" be read as "the optimizer is satisfied".
+    /// </summary>
+    [Fact]
+    public async Task ReportsAnEmptyMissingIndexListRatherThanNullWhenThePlanAsksForNothing()
+    {
+        const string xml = """
+            <ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.539">
+              <BatchSequence><Batch><Statements><StmtSimple><QueryPlan>
+                <RelOp NodeId="0" LogicalOp="Select" PhysicalOp="Compute Scalar" />
+              </QueryPlan></StmtSimple></Statements></Batch></BatchSequence>
+            </ShowPlanXML>
+            """;
+
+        var plan = await new SecureShowplanParser().ParseAsync("p", xml);
+
+        Assert.NotNull(plan.MissingIndexes);
+        Assert.Empty(plan.MissingIndexes);
+    }
+
+    /// <summary>
+    /// `NoJoinPredicate`, `SpatialGuess` and `FullUpdateForOnlineIndexBuild` are attributes on
+    /// `&lt;Warnings&gt;` rather than child elements, so recording only child elements meant a
+    /// vocabulary naming them could never match and a join with no predicate reported nothing.
+    /// `&lt;Warnings&gt;` is written here as an empty element, which is the shape that carries only
+    /// attributes and the one that never increments the child-element depth.
+    /// </summary>
+    [Theory]
+    [InlineData("true")]
+    [InlineData("1")]
+    public async Task EmitsWarningsThatAreWrittenAsAttributesOnAnEmptyWarningsElement(string flag)
+    {
+        var xml = $"""
+            <ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.539">
+              <BatchSequence><Batch><Statements><StmtSimple><QueryPlan>
+                <RelOp NodeId="0" LogicalOp="Inner Join" PhysicalOp="Nested Loops">
+                  <Warnings NoJoinPredicate="{flag}" SpatialGuess="false" />
+                </RelOp>
+              </QueryPlan></StmtSimple></Statements></Batch></BatchSequence>
+            </ShowPlanXML>
+            """;
+
+        var plan = await new SecureShowplanParser().ParseAsync("p", xml);
+
+        var kinds = plan.Nodes.SelectMany(node => node.Warnings).Select(warning => warning.Kind).ToArray();
+        Assert.Contains("NoJoinPredicate", kinds);
+        Assert.DoesNotContain("SpatialGuess", kinds);
+    }
+
+    /// <summary>
+    /// The attribute-shaped and element-shaped warnings share one node, so reading one must not
+    /// displace the other.
+    /// </summary>
+    [Fact]
+    public async Task KeepsBothAttributeAndElementWarningsOnTheSameOperator()
+    {
+        const string xml = """
+            <ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.539">
+              <BatchSequence><Batch><Statements><StmtSimple><QueryPlan>
+                <RelOp NodeId="0" LogicalOp="Inner Join" PhysicalOp="Hash Match">
+                  <Warnings NoJoinPredicate="true">
+                    <SpillToTempDb SpillLevel="2" />
+                  </Warnings>
+                </RelOp>
+              </QueryPlan></StmtSimple></Statements></Batch></BatchSequence>
+            </ShowPlanXML>
+            """;
+
+        var plan = await new SecureShowplanParser().ParseAsync("p", xml);
+
+        var kinds = plan.Nodes.SelectMany(node => node.Warnings).Select(warning => warning.Kind).ToArray();
+        Assert.Contains("NoJoinPredicate", kinds);
+        Assert.Contains("SpillToTempDb", kinds);
+    }
+
     [Fact]
     public async Task ParsesNamespacedPlanAndFingerprintIgnoresAttributeOrder()
     {

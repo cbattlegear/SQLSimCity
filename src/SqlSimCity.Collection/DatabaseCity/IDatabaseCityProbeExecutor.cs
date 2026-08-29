@@ -20,6 +20,21 @@ public sealed record DatabaseCityIndexUsageRow(
     int IndexId,
     string TotalOperations);
 
+/// <param name="OldestLastUpdated">
+/// The stalest statistic on the object, or <see langword="null"/> when none has ever been updated.
+/// Never conflate that null with freshness: <paramref name="NeverUpdatedCount"/> carries it.
+/// </param>
+/// <param name="UnreadableCount">
+/// Statistics whose properties could not be read, which is missing evidence rather than staleness.
+/// </param>
+public sealed record DatabaseCityStatisticsAgeRow(
+    int ObjectId,
+    DateTimeOffset? OldestLastUpdated,
+    int StatisticsCount,
+    int NeverUpdatedCount,
+    int UnreadableCount,
+    string? ModificationCounter);
+
 /// <param name="TotalObjects">
 /// Every object the inventory probe would return across all pages, unbounded by the keyset, or
 /// <see langword="null"/> when the count could not be established. It is not the number of rows on
@@ -31,7 +46,13 @@ public sealed record DatabaseCityProbePage(
     DataStatus UsageStatus,
     string UsageReason,
     DateTimeOffset ObservedAt,
-    string? TotalObjects = null);
+    string? TotalObjects = null,
+    // Statistics freshness carries its own status because it is a separate probe against a separate
+    // DMF: it can be denied while index usage succeeds, and an empty list under an Available status
+    // means "measured, no statistics" rather than "not collected".
+    IReadOnlyList<DatabaseCityStatisticsAgeRow>? Statistics = null,
+    DataStatus StatisticsStatus = DataStatus.Unknown,
+    string? StatisticsReason = null);
 
 public interface IDatabaseCityProbeExecutor
 {

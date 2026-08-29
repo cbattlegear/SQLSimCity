@@ -371,7 +371,7 @@ public sealed class ProtectedQueryStoreHistoryTests
         // The re-hydrating write replaces the whole prefix, so the superseded record is gone
         // rather than left behind as a second manifest under the same plan id.
         var manifest = Assert.Single(NormalizedPlanManifests(store));
-        Assert.Equal("query-store-normalized-plan-v2", manifest.RecordKind);
+        Assert.Equal("query-store-normalized-plan-v3", manifest.RecordKind);
     }
 
     [Fact]
@@ -407,11 +407,11 @@ public sealed class ProtectedQueryStoreHistoryTests
     public void AddingAMemberToTheNormalizedPlanContractRequiresBumpingTheCacheKind()
     {
         Assert.Contains(
-            "query-store-normalized-plan-v2", ProtectedQueryStoreRepository.PlanCacheRecordKinds);
+            "query-store-normalized-plan-v3", ProtectedQueryStoreRepository.PlanCacheRecordKinds);
         Assert.Equal(
             13, typeof(ShowplanNodeV1).GetConstructors().Single().GetParameters().Length);
         Assert.Equal(
-            12, typeof(NormalizedShowplanV1).GetConstructors().Single().GetParameters().Length);
+            13, typeof(NormalizedShowplanV1).GetConstructors().Single().GetParameters().Length);
     }
 
     private static ProtectedRecord[] NormalizedPlanManifests(MemoryProtectedStore store) =>

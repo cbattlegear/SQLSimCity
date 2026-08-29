@@ -214,6 +214,17 @@ export interface ShowplanNode {
   estimatedRowSizeBytes?: number | null
 }
 
+export interface ShowplanMissingIndex {
+  database: string | null
+  schema: string | null
+  table: string | null
+  /** The optimizer's own estimate of how much cheaper the query would be, 0-100. */
+  impactPercent: number | null
+  equalityColumns: string[]
+  inequalityColumns: string[]
+  includedColumns: string[]
+}
+
 export interface NormalizedShowplan {
   planId: string
   showplanVersion: string
@@ -225,6 +236,16 @@ export interface NormalizedShowplan {
   structuralFingerprint: string
   runtimeOverlayCaveat: string
   nodes: ShowplanNode[]
+
+  /**
+   * Indexes the optimizer asked for. These are plan-level, not operator-level: `<MissingIndexes>` is
+   * written before the first `<RelOp>`, so they are deliberately not on any node's `warnings` and
+   * looking for them there finds nothing.
+   *
+   * `undefined` means the plan was normalized by a build that did not read them; `[]` means the
+   * optimizer asked for nothing. Those are different and must not be collapsed.
+   */
+  missingIndexes?: ShowplanMissingIndex[]
 }
 
 export interface PlanComparison {

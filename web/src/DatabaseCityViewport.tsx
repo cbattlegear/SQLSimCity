@@ -57,8 +57,8 @@ type Props = {
   feedState?: LiveFeedConnectionState
   /** Live blocking pins projected from the snapshot. Drawn in both view modes. */
   incidents?: IncidentProjection
-  /** Whether stale Query Store evidence should weather building facades. */
-  statsDecay?: boolean
+  /** Objects whose statistics are stale enough to weather their building facades. */
+  staleStatsObjectIds?: readonly string[]
   /**
    * The executions the live feed has observed, newest first, and the families they are matched
    * against.
@@ -108,6 +108,10 @@ const KEY_ACTIONS: Record<string, CameraNudge> = {
 
 const COMPASS_POINTS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 
+// A module-level constant so the default prop is referentially stable. A fresh `[]` literal would
+// be a new array on every render, re-running the effect and rebuilding every building each time.
+const EMPTY_STALE_STATS: readonly string[] = Object.freeze([])
+
 /**
  * The folded incident chip. Its wording lives in {@link incidentSummaryLabel} beside the projection
  * it describes, because on a phone this chip may be the whole blocking probe a reader sees, and what
@@ -152,7 +156,7 @@ export function DatabaseCityViewport({
   liveStatus,
   feedState,
   incidents,
-  statsDecay = false,
+  staleStatsObjectIds = EMPTY_STALE_STATS,
   liveQueries = null,
   families,
   onVehicleRoster,
@@ -221,7 +225,10 @@ export function DatabaseCityViewport({
   useEffect(() => sceneRef.current?.setRoute(route), [route])
   useEffect(() => sceneRef.current?.setSelected(selectedId), [selectedId])
   useEffect(() => sceneRef.current?.setSelectedRoad(selectedRoadId), [selectedRoadId])
-  useEffect(() => sceneRef.current?.setStatsDecay(statsDecay), [statsDecay])
+  useEffect(
+    () => sceneRef.current?.setStaleStatsObjects(staleStatsObjectIds),
+    [staleStatsObjectIds],
+  )
   useEffect(() => sceneRef.current?.setLayers(layers), [layers])
   useEffect(() => sceneRef.current?.setViewMode(viewMode), [viewMode])
   useEffect(() => sceneRef.current?.setIncidents(incidents?.markers ?? []), [incidents])

@@ -50,6 +50,28 @@ export interface DatabaseCityIndex {
   directActivity: DatabaseCityDirectActivity
 }
 
+/**
+ * How stale one object's statistics are.
+ *
+ * `oldestLastUpdated` is the freshness of the object's **stalest** statistic, so an object is only
+ * as fresh as its worst one. It is null when no statistic on the object has ever been updated —
+ * which is why `neverUpdatedCount` is separate. A never-built statistic is not an old measurement,
+ * and collapsing the two reports a never-analysed object as fresh.
+ *
+ * `unreadableCount` counts statistics whose properties could not be read at all, because
+ * `sys.dm_db_stats_properties` returns no row rather than raising when the caller lacks permission.
+ * That is missing evidence, not staleness, and must not be rendered as either.
+ */
+export interface DatabaseCityStatisticsAge {
+  oldestLastUpdated: string | null
+  statisticsCount: number
+  neverUpdatedCount: number
+  unreadableCount: number
+  modificationCounter: string | null
+  status: MeasurementStatus
+  reason: string | null
+}
+
 export interface DatabaseCityObject {
   objectId: string
   schemaId: string
@@ -75,6 +97,12 @@ export interface DatabaseCityObject {
   indexes: DatabaseCityIndex[]
   directActivity: DatabaseCityDirectActivity
   attributedExposure: DatabaseCityAttributedExposure
+
+  /**
+   * Statistics freshness for this object. Optional because an archive written before the probe
+   * existed has none: `undefined` means nobody measured it, which is not the same as fresh.
+   */
+  statistics?: DatabaseCityStatisticsAge | null
 }
 
 export interface DatabaseCitySchema {
