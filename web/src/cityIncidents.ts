@@ -594,5 +594,5 @@ export const SEVERITY_LABELS: Record<IncidentSeverity, string> = {
   blocked: 'Blocked waiter',
   waiting: 'Waiting',
   cycle: 'Wait cycle',
-  deadlock: 'Recorded deadlock',
+  deadlock: 'Car crash (recorded deadlock)',
 }

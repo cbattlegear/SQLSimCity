@@ -870,7 +870,7 @@ export function createDatabaseCityScene(
     blocked: { glyph: '⚠', color: '#e8b13a', ink: '#231704' },
     waiting: { glyph: '⚠', color: '#e8b13a', ink: '#231704' },
     cycle: { glyph: '⚠', color: '#e8b13a', ink: '#231704' },
-    deadlock: { glyph: '✖', color: '#e4483c', ink: '#f7e9e7' },
+    deadlock: { glyph: '💥', color: '#e4483c', ink: '#f7e9e7' },
   }
 
   const INCIDENT_PIN_PX = 96
