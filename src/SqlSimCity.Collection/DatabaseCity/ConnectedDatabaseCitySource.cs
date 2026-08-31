@@ -154,7 +154,7 @@ public sealed class ConnectedDatabaseCitySource(
             {
                 return new DatabaseCityStatisticsAgeV1(
                     null, 0, 0, 0, null, MeasurementStatus.Known,
-                    "This object carries no non-hypothetical statistics.");
+                    "This object carries no non-hypothetical statistics.", 0);
             }
 
             return new DatabaseCityStatisticsAgeV1(
@@ -166,7 +166,8 @@ public sealed class ConnectedDatabaseCitySource(
                 MeasurementStatus.Known,
                 row.UnreadableCount > 0
                     ? $"{row.UnreadableCount.ToString(CultureInfo.InvariantCulture)} of {row.StatisticsCount.ToString(CultureInfo.InvariantCulture)} statistics could not be read and are excluded from the age."
-                    : null);
+                    : null,
+                row.PastAutoUpdateThresholdCount);
         }
         var schemas = selectedGroups
             .Select(group => group.First())

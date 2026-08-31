@@ -3,10 +3,8 @@ import type { DatabaseCityObject } from './databaseCityContracts'
 import type { IncidentProjection } from './cityIncidents'
 import type { CityRoute, RouteStop } from './cityRoute'
 import {
-  DEFAULT_STATS_STALE_DAYS,
   LARGE_MISSING_INDEX_IMPACT_PERCENT,
   projectCityDisasters,
-  statsStaleDaysFromSearch,
 } from './cityDisasters'
 
 function incidents(overrides: Partial<IncidentProjection> = {}): IncidentProjection {
@@ -108,26 +106,10 @@ function statistics(
     modificationCounter: '0',
     status: 'Known',
     reason: null,
+    pastAutoUpdateThresholdCount: 0,
     ...overrides,
   }
 }
-
-const NOW = Date.parse('2026-01-10T00:00:00Z')
-
-describe('statsStaleDaysFromSearch', () => {
-  it('defaults to one week', () => {
-    expect(statsStaleDaysFromSearch('')).toBe(DEFAULT_STATS_STALE_DAYS)
-  })
-
-  it('accepts a positive override', () => {
-    expect(statsStaleDaysFromSearch('?statsStaleDays=14')).toBe(14)
-  })
-
-  it('rejects zero and non-numeric values', () => {
-    expect(statsStaleDaysFromSearch('?statsStaleDays=0')).toBe(DEFAULT_STATS_STALE_DAYS)
-    expect(statsStaleDaysFromSearch('?statsStaleDays=abc')).toBe(DEFAULT_STATS_STALE_DAYS)
-  })
-})
 
 describe('projectCityDisasters', () => {
   it('maps retained deadlocks to car crashes', () => {
@@ -137,8 +119,6 @@ describe('projectCityDisasters', () => {
       }),
       route: null,
       objects: [],
-      search: '',
-      now: NOW,
     })
 
     expect(projection.items.find(item => item.key === 'car-crash')?.headline).toContain('2 car crash')
@@ -149,8 +129,6 @@ describe('projectCityDisasters', () => {
       incidents: incidents(),
       route: route({ stops: [stop({ warnings: ['SpillToTempDb: level 2'] })] }),
       objects: [],
-      search: '',
-      now: NOW,
     })
 
     expect(projection.items.some(item => item.key === 'water-main-break')).toBe(true)
@@ -166,8 +144,6 @@ describe('projectCityDisasters', () => {
       incidents: incidents(),
       route: route({ stops: [stop({ warnings: ['NoJoinPredicate'] })] }),
       objects: [],
-      search: '',
-      now: NOW,
     })
 
     expect(projection.items.some(item => item.key === 'water-main-break')).toBe(true)
@@ -178,8 +154,6 @@ describe('projectCityDisasters', () => {
       incidents: incidents(),
       route: route({ stops: [stop({ warnings: ['spilltotempdb: level 2'] })] }),
       objects: [],
-      search: '',
-      now: NOW,
     })
 
     expect(projection.items.some(item => item.key === 'water-main-break')).toBe(true)
@@ -198,8 +172,6 @@ describe('projectCityDisasters', () => {
         missingIndexes: [],
       }),
       objects: [],
-      search: '',
-      now: NOW,
     })
 
     expect(projection.items.some(item => item.key === 'building-fire')).toBe(false)
@@ -221,8 +193,6 @@ describe('projectCityDisasters', () => {
         ],
       }),
       objects: [],
-      search: '',
-      now: NOW,
     })
 
     const fire = projection.items.find(item => item.key === 'building-fire')
@@ -246,67 +216,99 @@ describe('projectCityDisasters', () => {
         ],
       }),
       objects: [],
-      search: '',
-      now: NOW,
     })
 
     expect(projection.items.some(item => item.key === 'building-fire')).toBe(false)
     expect(projection.fireObjectIds).toEqual([])
   })
 
-  it('weathers only the objects whose own statistics are stale', () => {
+  it('weathers only the objects whose own statistics are past the auto-update threshold', () => {
     const projection = projectCityDisasters({
       incidents: incidents(),
       route: null,
       objects: [
-        cityObject({ objectId: 'stale', statistics: statistics({ oldestLastUpdated: '2026-01-01T00:00:00Z' }) }),
-        cityObject({ objectId: 'fresh', statistics: statistics({ oldestLastUpdated: '2026-01-09T00:00:00Z' }) }),
+        cityObject({
+          objectId: 'due',
+          statistics: statistics({ pastAutoUpdateThresholdCount: 1, modificationCounter: '4501' }),
+        }),
+        cityObject({
+          objectId: 'current',
+          statistics: statistics({ pastAutoUpdateThresholdCount: 0, modificationCounter: '12' }),
+        }),
       ],
-      search: '?statsStaleDays=7',
-      now: NOW,
     })
 
     expect(projection.items.some(item => item.key === 'stats-decay')).toBe(true)
-    expect(projection.staleStatsObjectIds).toEqual(['stale'])
+    expect(projection.staleStatsObjectIds).toEqual(['due'])
   })
 
   /**
-   * The threshold is a boundary, not a range: exactly at it is not yet stale.
+   * The rule this replaced was an age threshold, which disagrees with the engine in both directions.
+   * A statistic built long ago against a table nothing has modified since is exactly right, and the
+   * engine will not rebuild it however old it gets.
    */
-  it('treats an object exactly at the threshold as fresh', () => {
+  it('does not weather an old statistic the engine has no reason to rebuild', () => {
     const projection = projectCityDisasters({
       incidents: incidents(),
       route: null,
       objects: [
-        cityObject({ objectId: 'edge', statistics: statistics({ oldestLastUpdated: '2026-01-03T00:00:00Z' }) }),
+        cityObject({
+          objectId: 'old-but-correct',
+          statistics: statistics({
+            oldestLastUpdated: '2019-01-01T00:00:00Z',
+            pastAutoUpdateThresholdCount: 0,
+          }),
+        }),
       ],
-      search: '?statsStaleDays=7',
-      now: NOW,
     })
 
+    expect(projection.items.some(item => item.key === 'stats-decay')).toBe(false)
     expect(projection.staleStatsObjectIds).toEqual([])
   })
 
   /**
-   * A statistic that has never been updated reports a null timestamp, which `MIN` skips. Treating
-   * that null as freshness would report a never-analysed object as up to date.
+   * The other direction: freshly built and already owed an update, which the age rule called fresh.
    */
-  it('treats a never-updated statistic as stale rather than as fresh', () => {
+  it('weathers a recently built statistic whose table has been modified past the threshold', () => {
+    const projection = projectCityDisasters({
+      incidents: incidents(),
+      route: null,
+      objects: [
+        cityObject({
+          objectId: 'new-but-churned',
+          statistics: statistics({
+            oldestLastUpdated: '2026-01-09T23:00:00Z',
+            pastAutoUpdateThresholdCount: 2,
+          }),
+        }),
+      ],
+    })
+
+    expect(projection.staleStatsObjectIds).toEqual(['new-but-churned'])
+  })
+
+  /**
+   * A never-updated statistic is not by itself evidence that an update is owed: nothing has modified
+   * the table, so there is nothing to rebuild from. It reaches the threshold count on its own once
+   * modifications accumulate, which is where the decision belongs.
+   */
+  it('does not weather a never-updated statistic that is not past its threshold', () => {
     const projection = projectCityDisasters({
       incidents: incidents(),
       route: null,
       objects: [
         cityObject({
           objectId: 'never',
-          statistics: statistics({ oldestLastUpdated: null, neverUpdatedCount: 1 }),
+          statistics: statistics({
+            oldestLastUpdated: null,
+            neverUpdatedCount: 1,
+            pastAutoUpdateThresholdCount: 0,
+          }),
         }),
       ],
-      search: '?statsStaleDays=7',
-      now: NOW,
     })
 
-    expect(projection.staleStatsObjectIds).toEqual(['never'])
-    expect(projection.items.find(item => item.key === 'stats-decay')?.detail).toContain('never been built')
+    expect(projection.staleStatsObjectIds).toEqual([])
   })
 
   it('does not weather an object that carries no statistics at all', () => {
@@ -319,10 +321,33 @@ describe('projectCityDisasters', () => {
           statistics: statistics({ statisticsCount: 0, oldestLastUpdated: null }),
         }),
       ],
-      search: '?statsStaleDays=7',
-      now: NOW,
     })
 
+    expect(projection.staleStatsObjectIds).toEqual([])
+  })
+
+  /**
+   * An archive written before the threshold was measured carries no count at all. That is missing
+   * evidence, and reading it as a measured zero would report every object in an old archive as
+   * current — the same conflation the null statistics block already guards against.
+   */
+  it('reports nothing for an archive that never measured the threshold', () => {
+    const projection = projectCityDisasters({
+      incidents: incidents(),
+      route: null,
+      objects: [
+        cityObject({
+          objectId: 'older-archive',
+          statistics: statistics({ pastAutoUpdateThresholdCount: undefined, modificationCounter: '9999999' }),
+        }),
+        cityObject({
+          objectId: 'older-archive-null',
+          statistics: statistics({ pastAutoUpdateThresholdCount: null }),
+        }),
+      ],
+    })
+
+    expect(projection.items.some(item => item.key === 'stats-decay')).toBe(false)
     expect(projection.staleStatsObjectIds).toEqual([])
   })
 
@@ -337,8 +362,6 @@ describe('projectCityDisasters', () => {
       incidents: incidents(),
       route: null,
       objects: [cityObject({ objectId: 'unmeasured', statistics: undefined })],
-      search: '?statsStaleDays=7',
-      now: NOW,
     })
 
     expect(projection.items.some(item => item.key === 'stats-decay')).toBe(false)
@@ -360,8 +383,6 @@ describe('projectCityDisasters', () => {
           }),
         }),
       ],
-      search: '?statsStaleDays=7',
-      now: NOW,
     })
 
     expect(projection.staleStatsObjectIds).toEqual([])

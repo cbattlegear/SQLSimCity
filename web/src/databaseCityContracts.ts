@@ -61,6 +61,12 @@ export interface DatabaseCityIndex {
  * `unreadableCount` counts statistics whose properties could not be read at all, because
  * `sys.dm_db_stats_properties` returns no row rather than raising when the caller lacks permission.
  * That is missing evidence, not staleness, and must not be rendered as either.
+ *
+ * `pastAutoUpdateThresholdCount` is how many of the object's statistics have taken more
+ * modifications than the engine's own `AUTO_UPDATE_STATISTICS` recompilation threshold for their
+ * cardinality, and is the only field here that says a statistic *should* be updated.
+ * `oldestLastUpdated` does not — an untouched table's year-old statistic is still exactly right. It
+ * is null when the archive predates the measurement, which is missing evidence, not a measured zero.
  */
 export interface DatabaseCityStatisticsAge {
   oldestLastUpdated: string | null
@@ -70,6 +76,7 @@ export interface DatabaseCityStatisticsAge {
   modificationCounter: string | null
   status: MeasurementStatus
   reason: string | null
+  pastAutoUpdateThresholdCount?: number | null
 }
 
 export interface DatabaseCityObject {

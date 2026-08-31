@@ -27,13 +27,20 @@ public sealed record DatabaseCityIndexUsageRow(
 /// <param name="UnreadableCount">
 /// Statistics whose properties could not be read, which is missing evidence rather than staleness.
 /// </param>
+/// <param name="PastAutoUpdateThresholdCount">
+/// Statistics whose modification counter has passed the engine's own AUTO_UPDATE_STATISTICS
+/// recompilation threshold for their cardinality. This is the measured answer to "should this be
+/// updated"; age is not, because a statistic built long ago against a table nothing has modified
+/// since is still exactly right. Unreadable statistics contribute nothing to it.
+/// </param>
 public sealed record DatabaseCityStatisticsAgeRow(
     int ObjectId,
     DateTimeOffset? OldestLastUpdated,
     int StatisticsCount,
     int NeverUpdatedCount,
     int UnreadableCount,
-    string? ModificationCounter);
+    string? ModificationCounter,
+    int PastAutoUpdateThresholdCount);
 
 /// <param name="TotalObjects">
 /// Every object the inventory probe would return across all pages, unbounded by the keyset, or

@@ -165,7 +165,9 @@ public sealed class SqlClientDatabaseCityProbeExecutor(
                             Convert.ToInt32(reader["statistics_count"], CultureInfo.InvariantCulture),
                             Convert.ToInt32(reader["never_updated_count"], CultureInfo.InvariantCulture),
                             Convert.ToInt32(reader["unreadable_count"], CultureInfo.InvariantCulture),
-                            NullableUnsigned(reader["max_modification_counter"])));
+                            NullableUnsigned(reader["max_modification_counter"]),
+                            Convert.ToInt32(
+                                reader["past_auto_update_threshold_count"], CultureInfo.InvariantCulture)));
                     }
                     return (IReadOnlyList<DatabaseCityStatisticsAgeRow>)collected;
                 },

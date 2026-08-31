@@ -599,7 +599,6 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
       incidents,
       route,
       objects: visibleObjects,
-      search: window.location.search,
     }),
     [incidents, route, visibleObjects],
   )
@@ -883,7 +882,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
                 </li>
               ))}
             </ul>
-            <small>Stats decay threshold: {disasters.staleStatsDays} day(s) (set with <code>statsStaleDays</code>).</small>
+            <small>Run-down buildings are objects with at least one statistic past SQL Server's own AUTO_UPDATE_STATISTICS threshold — 500 modifications up to 500 rows, then MIN(500 + 0.20n, SQRT(1000n)).</small>
           </div>
         )}
       </div>

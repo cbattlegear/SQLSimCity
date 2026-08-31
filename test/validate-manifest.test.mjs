@@ -1760,3 +1760,73 @@ describe('regression: tempdb.usage bounds its per-session and per-task rows and 
     assert.match(probe().resultContract, /visible_task_count/i);
   });
 });
+
+
+describe('regression: city.statistics_age_page decides staleness by modification threshold, not age', () => {
+  const probe = () => probeById('city.statistics_age_page');
+  const source = () => readProbeSource(probe());
+  // Comments are stripped because the header explains the is_hypothetical trap in prose, and a
+  // guard that read that explanation as a violation of it would fire on the fixed file.
+  const code = () => stripSqlComments(source());
+
+  /**
+   * Fails against the state this replaced. `is_hypothetical` is a column of sys.indexes; sys.stats
+   * has no such column, so `stat.is_hypothetical` failed the whole batch with "Invalid column name"
+   * and the probe returned nothing at all against a real instance. Every test that reads this probe
+   * as source text passed the entire time.
+   */
+  test('does not read is_hypothetical off sys.stats, which has no such column', () => {
+    assert.doesNotMatch(
+      code(),
+      /\bstat\.is_hypothetical\b/i,
+      'sys.stats has no is_hypothetical column; reading it there fails the batch at runtime',
+    );
+    assert.match(
+      code(),
+      /FROM\s+sys\.indexes\s+AS\s+\w+[\s\S]{0,300}?\.is_hypothetical\s*=\s*1/i,
+      'hypothetical statistics must be excluded through the hypothetical index that owns them',
+    );
+  });
+
+  test('exposes a per-object count of statistics past the auto-update recompilation threshold', () => {
+    assert.match(
+      code(),
+      /AS\s+past_auto_update_threshold_count/i,
+      'the probe must report whether a statistic should be updated, which age does not measure',
+    );
+    assert.match(
+      code(),
+      /modification_counter\s*>\s*\w+\.recompilation_threshold/i,
+      'the count must compare the modification counter against the threshold, not against a date',
+    );
+  });
+
+  /**
+   * The compatibility level 130+ rule, which is the one the engine applies to anything this probe
+   * can reach. Both branches are asserted because MIN of the two is the whole point: keeping only
+   * `500 + 0.20n` silently restores the pre-2016 rule and reports large tables as current long
+   * after the engine has rebuilt them.
+   */
+  test('computes the compatibility level 130+ threshold, including the SQRT branch', () => {
+    assert.match(code(), /<=\s*500\s+THEN\s+500\.0E0/i, 'a table of 500 rows or fewer floors at 500 modifications');
+    assert.match(code(), /500\.0E0\s*\+\s*\(\s*0\.20E0\s*\*\s*\w+\.rows\s*\)/i);
+    assert.match(
+      code(),
+      /SQRT\(\s*1000\.0E0\s*\*\s*\w+\.rows\s*\)/i,
+      'the decreasing SQRT(1000 * n) branch is what makes large tables update more often',
+    );
+  });
+
+  test('leaves an unreadable statistic out of the threshold count rather than assuming it is stale', () => {
+    assert.match(
+      code(),
+      /WHEN\s+\w+\.rows\s+IS\s+NOT\s+NULL\s*[\s\S]{0,120}?modification_counter\s*>/i,
+      'a statistic whose properties could not be read has no measurable threshold',
+    );
+  });
+
+  test('manifest result contract documents the threshold rather than only the age', () => {
+    assert.match(probe().resultContract, /past_auto_update_threshold_count/i);
+    assert.match(probe().resultContract, /SQRT\(1000n\)|SQRT\(1,000n\)/i);
+  });
+});

@@ -2,9 +2,6 @@ import type { DatabaseCityObject } from './databaseCityContracts'
 import type { IncidentProjection } from './cityIncidents'
 import type { CityRoute } from './cityRoute'
 
-export const DEFAULT_STATS_STALE_DAYS = 7
-export const STATS_STALE_DAYS_PARAM = 'statsStaleDays'
-
 /**
  * How much of the optimizer's own estimated saving a suggested index must promise before the
  * building it names is treated as on fire.
@@ -39,12 +36,11 @@ export interface CityDisaster {
 }
 
 export interface CityDisasterProjection {
-  readonly staleStatsDays: number
   readonly items: readonly CityDisaster[]
   /**
-   * Objects whose statistics are stale enough to weather the building. Per object rather than a
-   * whole-city wash, because staleness is measured per object and a city-wide flag would weather
-   * buildings whose statistics were rebuilt an hour ago.
+   * Objects carrying at least one statistic the engine's own AUTO_UPDATE_STATISTICS threshold says
+   * should be updated. Per object rather than a whole-city wash, because the threshold is evaluated
+   * per statistic and a city-wide flag would weather buildings whose statistics are exactly right.
    */
   readonly staleStatsObjectIds: readonly string[]
   /** Objects the optimizer asked for an index on, weighted by its own estimated impact. */
@@ -55,16 +51,11 @@ export function projectCityDisasters({
   incidents,
   route,
   objects,
-  search,
-  now = Date.now(),
 }: {
   incidents: IncidentProjection
   route: CityRoute | null
   objects: readonly DatabaseCityObject[]
-  search: string
-  now?: number
 }): CityDisasterProjection {
-  const staleStatsDays = statsStaleDaysFromSearch(search)
   const items: CityDisaster[] = []
   const fireObjectIds: string[] = []
 
@@ -111,35 +102,42 @@ export function projectCityDisasters({
     }
   }
 
-  const stale = staleStatsObjects(objects, staleStatsDays, now)
-  if (stale.ids.length > 0) {
+  const stale = staleStatsObjectIds(objects)
+  if (stale.length > 0) {
     items.push({
       key: 'stats-decay',
-      headline: `${stale.ids.length} building(s) look run-down`,
-      detail: stale.neverUpdated
-        ? `Statistics on ${stale.ids.length} object(s) are older than the ${staleStatsDays}-day threshold, or have never been built at all.`
-        : `Statistics on ${stale.ids.length} object(s) were last updated more than ${staleStatsDays} day(s) ago.`,
+      headline: `${stale.length} building(s) look run-down`,
+      detail:
+        `${stale.length} object(s) carry at least one statistic that has taken more modifications ` +
+        `than SQL Server's own AUTO_UPDATE_STATISTICS recompilation threshold for its cardinality ` +
+        `— 500 modifications up to 500 rows, then MIN(500 + 0.20n, SQRT(1000n)). That is the ` +
+        `engine's own definition of a statistic worth rebuilding, not a claim about age.`,
     })
   }
 
-  return { staleStatsDays, items, staleStatsObjectIds: stale.ids, fireObjectIds }
+  return { items, staleStatsObjectIds: stale, fireObjectIds }
 }
 
 /**
- * Objects whose statistics are stale, and whether any of them are stale because they were never
- * built rather than because they are old.
+ * Objects carrying at least one statistic the engine would consider out of date.
+ *
+ * Measured by modification counter against the AUTO_UPDATE_STATISTICS recompilation threshold rather
+ * than by age, because the two disagree in both directions: a statistic built a year ago against a
+ * table nothing has modified since is still exactly right, and one built this morning against a
+ * table bulk-loaded since is not. Age was the old rule and weathered the first case for free.
  *
  * An object with no measurement is skipped entirely. Absent statistics mean the probe never ran — an
  * archive from an older build, or a denied permission — and weathering a building on that basis
- * would render missing evidence as a finding.
+ * would render missing evidence as a finding. `pastAutoUpdateThresholdCount` being null or absent is
+ * the same thing one field down: an archive written before the threshold was measured, which is not
+ * a measured zero.
+ *
+ * A never-updated statistic is deliberately not weathering on its own. It is not evidence that an
+ * update is owed — a statistic on a table nothing has modified has nothing to rebuild from — and it
+ * becomes visible here through the threshold as soon as modifications actually accumulate.
  */
-function staleStatsObjects(
-  objects: readonly DatabaseCityObject[],
-  staleStatsDays: number,
-  now: number,
-): { ids: string[]; neverUpdated: boolean } {
+function staleStatsObjectIds(objects: readonly DatabaseCityObject[]): string[] {
   const ids: string[] = []
-  let neverUpdated = false
   for (const object of objects) {
     const statistics = object.statistics
     if (!statistics || statistics.status !== 'Known') continue
@@ -147,25 +145,13 @@ function staleStatsObjects(
     // and weathering it would make "small and untouched" look like "neglected".
     if (statistics.statisticsCount === 0) continue
 
-    if (statistics.neverUpdatedCount > 0) {
-      neverUpdated = true
-      ids.push(object.objectId)
-      continue
-    }
-
-    const age = ageInDays(statistics.oldestLastUpdated, now)
-    if (age !== null && age > staleStatsDays) ids.push(object.objectId)
+    // Absent or null is an archive written before the threshold was measured. It reads as "not
+    // past the threshold" rather than falling back to age or to the raw modification counter,
+    // because neither can be compared to a threshold that was never computed.
+    const past = statistics.pastAutoUpdateThresholdCount ?? 0
+    if (past > 0) ids.push(object.objectId)
   }
-  return { ids, neverUpdated }
-}
-
-export function statsStaleDaysFromSearch(search: string): number {
-  const raw = new URLSearchParams(search).get(STATS_STALE_DAYS_PARAM)
-  if (raw === null) return DEFAULT_STATS_STALE_DAYS
-  const parsed = Number(raw)
-  if (!Number.isFinite(parsed)) return DEFAULT_STATS_STALE_DAYS
-  const whole = Math.floor(parsed)
-  return whole >= 1 ? whole : DEFAULT_STATS_STALE_DAYS
+  return ids
 }
 
 /**
@@ -180,13 +166,4 @@ function warningKind(warning: string): string {
 
 function formatImpact(value: number | null): string {
   return value === null ? '?' : Math.round(value).toString()
-}
-
-function ageInDays(observedAt: string | null, now: number): number | null {
-  if (observedAt === null) return null
-  const then = Date.parse(observedAt)
-  if (!Number.isFinite(then)) return null
-  const days = (now - then) / (24 * 60 * 60 * 1000)
-  if (!Number.isFinite(days) || days < 0) return null
-  return Math.floor(days)
 }

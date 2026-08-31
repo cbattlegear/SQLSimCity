@@ -909,7 +909,7 @@
         }
       ],
       "resultSets": 1,
-      "resultContract": "One row per object carrying at least one non-hypothetical statistic, for at most @TopN parent objects selected by object_id > @AfterObjectId. oldest_last_updated is the stalest statistic on the object and is null when none has ever been updated; never_updated_count and unreadable_count separate 'never built' and 'could not be read' from staleness.",
+      "resultContract": "One row per object carrying at least one non-hypothetical statistic, for at most @TopN parent objects selected by object_id > @AfterObjectId. oldest_last_updated is the stalest statistic on the object and is null when none has ever been updated; never_updated_count and unreadable_count separate 'never built' and 'could not be read' from staleness. past_auto_update_threshold_count counts statistics whose modification_counter has passed the compatibility level 130+ AUTO_UPDATE_STATISTICS recompilation threshold for their own cardinality -- 500 modifications at n <= 500, else MIN(500 + 0.20n, SQRT(1000n)) -- which is a measurement of whether a statistic should be updated rather than of how old it is.",
       "relativeCost": "low"
     },
     {

@@ -100,6 +100,15 @@ public sealed record DatabaseCitySchemaV1(
 /// SELECT on the statistics object. That is missing evidence, not evidence of freshness, and callers
 /// must not treat it as either fresh or stale.
 /// </para>
+/// <para>
+/// <see cref="PastAutoUpdateThresholdCount"/> is how many of the object's statistics have taken more
+/// modifications than the engine's own <c>AUTO_UPDATE_STATISTICS</c> recompilation threshold for
+/// their cardinality, and is the only field here that says a statistic <em>should</em> be updated.
+/// <see cref="OldestLastUpdated"/> does not: a statistic built a year ago against a table nothing has
+/// modified since is still exactly right, and a statistic built this morning against a table that has
+/// since been bulk-loaded is not. It is <see langword="null"/> when the measurement predates this
+/// field -- an archive written by an older build -- which is missing evidence and not a measured zero.
+/// </para>
 /// </summary>
 public sealed record DatabaseCityStatisticsAgeV1(
     DateTimeOffset? OldestLastUpdated,
@@ -108,7 +117,8 @@ public sealed record DatabaseCityStatisticsAgeV1(
     int UnreadableCount,
     string? ModificationCounter,
     MeasurementStatus Status,
-    string? Reason);
+    string? Reason,
+    int? PastAutoUpdateThresholdCount = null);
 
 public sealed record DatabaseCityObjectV1(
     string ObjectId,
