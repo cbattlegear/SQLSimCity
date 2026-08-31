@@ -3,7 +3,20 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { directActivityWidth } from './databaseCity'
 import type { DatabaseCityObject, DatabaseCityQueryFamily } from './databaseCityContracts'
 import { ARTERIAL_WIDTH, streetPitch, streetRoute, type CityLot, type CityPlan, type StreetClass } from './cityPlan'
-import { buildBuildingGeometry, buildingColor, mapBuildingColor, mixColor, neighborhoodTint } from './cityBuildings'
+import {
+  BUILDING_TRIM_COLOR,
+  BUILDING_WINDOW_COLOR,
+  BUILDING_WINDOW_EMISSIVE,
+  WEATHERED_TRIM_COLOR,
+  WEATHERED_WINDOW_COLOR,
+  WEATHERED_WINDOW_EMISSIVE,
+  buildBuildingGeometry,
+  buildingColor,
+  mapBuildingColor,
+  neighborhoodTint,
+  weatheredBuildingColor,
+  weatheredMapBuildingColor,
+} from './cityBuildings'
 import { assignQueryRoutes } from './cityQueryTraffic'
 import { ROAD_WIDTH, type RoadTraffic } from './cityTraffic'
 import type { WorkloadTraffic } from './cityWorkloadTraffic'
@@ -512,12 +525,24 @@ export function createDatabaseCityScene(
   const materials = {
     unknown: new THREE.MeshBasicMaterial({ color: 0x6e7d88, wireframe: true }),
     window: new THREE.MeshStandardMaterial({
-      color: 0xd8e8f4,
-      emissive: 0x2f4f6a,
+      color: BUILDING_WINDOW_COLOR,
+      emissive: BUILDING_WINDOW_EMISSIVE,
       emissiveIntensity: 1,
       roughness: 0.25,
     }),
-    trim: new THREE.MeshStandardMaterial({ color: 0x93a1ae, roughness: 0.6 }),
+    /*
+     * The same fenestration on a building whose statistics the engine is owed an update on: boarded
+     * over and unlit. Its own material rather than a per-building clone, because every weathered
+     * building boards up the same way and one shared material keeps the draw call count where it was.
+     */
+    weatheredWindow: new THREE.MeshStandardMaterial({
+      color: WEATHERED_WINDOW_COLOR,
+      emissive: WEATHERED_WINDOW_EMISSIVE,
+      emissiveIntensity: 1,
+      roughness: 0.92,
+    }),
+    trim: new THREE.MeshStandardMaterial({ color: BUILDING_TRIM_COLOR, roughness: 0.6 }),
+    weatheredTrim: new THREE.MeshStandardMaterial({ color: WEATHERED_TRIM_COLOR, roughness: 0.85 }),
     index: new THREE.MeshStandardMaterial({ color: 0x68d6c1, roughness: 0.5 }),
     unknownIndex: new THREE.MeshBasicMaterial({ color: 0x82919d, wireframe: true }),
     exposure: new THREE.MeshStandardMaterial({ color: 0xe2a957, emissive: 0x3a2400, roughness: 0.55 }),
@@ -2826,9 +2851,12 @@ export function createDatabaseCityScene(
      * Staleness is measured per object, so a single flag would weather buildings whose statistics
      * were rebuilt an hour ago just because some other table's were not — which reads as a claim
      * about those buildings that the evidence does not make.
+     *
+     * Three parts of the building change together — facade, glazing and trim — because a single
+     * colour blend on the body alone was measured against a real instance and could not be seen.
+     * See the weathering block in `cityBuildings.ts` for what each cue is doing.
      */
-    const weatheredBuildingColor = (color: number, objectId: string): number =>
-      staleStatsObjectIds.has(objectId) ? mixColor(color, 0x4f4a45, 0.35) : color
+    const weathered = (objectId: string): boolean => staleStatsObjectIds.has(objectId)
     /*
      * Shadow casting is capped rather than universal.
      *
@@ -2855,8 +2883,11 @@ export function createDatabaseCityScene(
       const character = cityPlan.terrain.characters.get(lot.districtId)
       const geometry = buildBuildingGeometry(lot, character)
       const tint = tints.get(lot.districtId)
-      const bodyColor = weatheredBuildingColor(buildingColor(lot.archetype, character, tint), object.objectId)
-      const mapColor = weatheredBuildingColor(mapBuildingColor(lot.archetype, MAP_PALETTE.building, tint), object.objectId)
+      const isWeathered = weathered(object.objectId)
+      const cleanBodyColor = buildingColor(lot.archetype, character, tint)
+      const cleanMapColor = mapBuildingColor(lot.archetype, MAP_PALETTE.building, tint)
+      const bodyColor = isWeathered ? weatheredBuildingColor(cleanBodyColor) : cleanBodyColor
+      const mapColor = isWeathered ? weatheredMapBuildingColor(cleanMapColor) : cleanMapColor
       const body = new THREE.Mesh(
         track(geometry.body),
         known
@@ -2873,14 +2904,20 @@ export function createDatabaseCityScene(
       pickable.push(body)
 
       if (known && geometry.windows) {
-        const windows = new THREE.Mesh(track(geometry.windows), materials.window)
+        const windows = new THREE.Mesh(
+          track(geometry.windows),
+          isWeathered ? materials.weatheredWindow : materials.window,
+        )
         windows.userData.objectId = object.objectId
         group.add(windows)
       } else if (geometry.windows) {
         geometry.windows.dispose()
       }
       if (known && geometry.trim) {
-        const trim = new THREE.Mesh(track(geometry.trim), materials.trim)
+        const trim = new THREE.Mesh(
+          track(geometry.trim),
+          isWeathered ? materials.weatheredTrim : materials.trim,
+        )
         trim.userData.objectId = object.objectId
         group.add(trim)
       } else if (geometry.trim) {

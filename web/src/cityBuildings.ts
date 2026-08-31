@@ -809,3 +809,80 @@ export function mapBuildingColor(archetype: BuildingArchetype, plate: number, ti
   if (tint === undefined || archetype === 'vacant') return plate
   return tintPreservingLuma(plate, tint, MAP_NEIGHBORHOOD_TINT_WEIGHT)
 }
+
+/** Rec. 709 relative luminance of a packed sRGB colour, on the same 0-255 scale as its channels. */
+export function relativeLuma(color: number): number {
+  return luma(color)
+}
+
+/*
+ * How a building whose statistics the engine is owed an update on is drawn.
+ *
+ * The first version of this was a single 35% blend of the body colour toward a mid grey, and
+ * measured against a real instance it was invisible: a stale tower stood beside two fresh ones and
+ * no reader could pick it out, because the neighbourhood tint already spans a wider range than the
+ * blend moved the facade. Windows, trim and roof all stayed pristine, so the only thing that changed
+ * was a fraction of one of the several colours a building is made of.
+ *
+ * What follows is deliberately not a stronger version of the same single cue. Three separate parts
+ * of the building change together, so the read survives distance, a low sun and a dark district:
+ * the facade takes on grime, the glazing goes out, and the trim dulls. Any one of them alone is a
+ * shade; all three at once is a derelict building.
+ *
+ * It stays an honest per-object claim. Nothing here is drawn from a threshold anyone tuned by eye —
+ * an object is weathered exactly when the engine's own AUTO_UPDATE_STATISTICS threshold has been
+ * passed on at least one of its statistics, and never otherwise.
+ */
+
+/** Soot and dirt: warm, very dark and nearly neutral, so the blend both darkens and desaturates. */
+const WEATHERED_GRIME = 0x2e2a25
+
+/**
+ * How much grime reaches a facade.
+ *
+ * Past half, which is what makes it a different building rather than a darker one. The facade
+ * palette is only a style, so there is nothing measured to preserve here — unlike
+ * {@link tintPreservingLuma}, which exists precisely to protect that palette's value structure from
+ * the neighbourhood hue. Weathering is the one blend that is *supposed* to spend brightness.
+ */
+const WEATHERED_BODY_WEIGHT = 0.58
+
+/**
+ * The same on the basemap, held back a little.
+ *
+ * Map plates carry the neighbourhood, and a plate blended as hard as a lit facade lands on the same
+ * near-black whatever schema it belongs to, which trades one reading for another. This is still far
+ * past the point of being obvious on paper.
+ */
+const WEATHERED_MAP_WEIGHT = 0.46
+
+/** Lit glazing: the pale cold glass every healthy building on the map is fenestrated with. */
+export const BUILDING_WINDOW_COLOR = 0xd8e8f4
+/** The light behind that glass. */
+export const BUILDING_WINDOW_EMISSIVE = 0x2f4f6a
+/** Clean trim: the light grey ledges and parapets. */
+export const BUILDING_TRIM_COLOR = 0x93a1ae
+
+/**
+ * Boarded windows.
+ *
+ * Not "dark glass", which at a distance is indistinguishable from glass in shadow, and not black,
+ * which would merge the fenestration into the grimy facade and leave a featureless slab. Weathered
+ * plywood is *lighter* than the dirty body it sits in, so the window grid stays visible while
+ * reading as plainly not glass — a warm, flat, dead pattern where every neighbour has a cold, lit one.
+ */
+export const WEATHERED_WINDOW_COLOR = 0x6f5c44
+/** Boards emit nothing. The lights being out is half of what makes the building read as abandoned. */
+export const WEATHERED_WINDOW_EMISSIVE = 0x000000
+/** Trim that has not been painted in a long time. */
+export const WEATHERED_TRIM_COLOR = 0x5c564c
+
+/** The grimed facade of a building whose statistics are past the engine's update threshold. */
+export function weatheredBuildingColor(color: number): number {
+  return mixColor(color, WEATHERED_GRIME, WEATHERED_BODY_WEIGHT)
+}
+
+/** The same building's flattened plate on the basemap. */
+export function weatheredMapBuildingColor(plate: number): number {
+  return mixColor(plate, WEATHERED_GRIME, WEATHERED_MAP_WEIGHT)
+}
