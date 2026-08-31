@@ -1,5 +1,6 @@
-import { useEffect, useId, useRef, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import type { MapViewMode } from './mapStyle'
+import { enterKioskFullscreen, kioskChrome, leaveKioskFullscreen, shouldLeaveKiosk } from './kioskMode'
 
 /**
  * Shell primitives for the map-first layout.
@@ -11,12 +12,117 @@ import type { MapViewMode } from './mapStyle'
 
 export type { MapViewMode }
 
-export function MapShell({ sidebar, children }: { sidebar: ReactNode; children: ReactNode }) {
+export function MapShell({ sidebar, children, kiosk = false }: {
+  sidebar: ReactNode
+  children: ReactNode
+  /** Kiosk mode: the rail is folded away and the stage takes the whole shell. See `kioskMode.ts`. */
+  kiosk?: boolean
+}) {
   return (
-    <div className="map-shell">
-      <div className="map-sidebar">{sidebar}</div>
+    <div className={`map-shell${kiosk ? ' is-kiosk' : ''}`}>
+      {/*
+        * Hidden by the stylesheet rather than unmounted.
+        *
+        * `display: none` takes the rail out of the tab order and off the accessibility tree, so a
+        * collapsed sidebar is genuinely gone for a keyboard or a screen reader. Unmounting would do
+        * that too, and would also throw away everything the rail is holding -- the address search
+        * term, which drawer is open, the plan finder's results -- and pay to rebuild the whole
+        * address book on the way back out. Leaving is meant to be as cheap as entering.
+        */}
+      <div className={`map-sidebar${kiosk ? ' is-collapsed' : ''}`}>{sidebar}</div>
       <div className="map-stage">{children}</div>
     </div>
+  )
+}
+
+/**
+ * Kiosk mode's state, and the browser fullscreen it tries to bring with it.
+ *
+ * The pure half is in `kioskMode.ts` and tested there; what is left here is the wiring that cannot
+ * be, since `web/` has no React testing library. Fullscreen is best effort — if the browser refuses
+ * it, the rail still collapses and the map still takes the window.
+ */
+export function useKioskMode(): { kiosk: boolean; toggleKiosk: () => void } {
+  const [kiosk, setKiosk] = useState(false)
+  /** Whether *our* request for fullscreen succeeded, which is what makes an exit ours to follow. */
+  const tookFullscreen = useRef(false)
+
+  useEffect(() => {
+    if (!kiosk) return
+    const onFullscreenChange = () => {
+      if (!shouldLeaveKiosk({
+        tookFullscreen: tookFullscreen.current,
+        fullscreenElement: document.fullscreenElement,
+      })) return
+      tookFullscreen.current = false
+      setKiosk(false)
+    }
+    /*
+     * Escape is handled here only for the case where fullscreen was never granted. With fullscreen
+     * the browser consumes Escape itself, before any listener, and `fullscreenchange` above is the
+     * signal instead -- so this must not fire then, or a single press would be read twice.
+     */
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && document.fullscreenElement == null) setKiosk(false)
+    }
+    document.addEventListener('fullscreenchange', onFullscreenChange)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('fullscreenchange', onFullscreenChange)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [kiosk])
+
+  // Navigating away mid-kiosk must not leave the browser fullscreen behind on whatever renders next.
+  useEffect(() => () => {
+    if (tookFullscreen.current) void leaveKioskFullscreen(document)
+  }, [])
+
+  const toggleKiosk = useCallback(() => {
+    if (kiosk) {
+      tookFullscreen.current = false
+      setKiosk(false)
+      void leaveKioskFullscreen(document)
+      return
+    }
+    setKiosk(true)
+    /*
+     * Requested from the click, not from an effect. A fullscreen request is only granted while the
+     * browser still considers itself inside a user gesture, and a state update defers past that.
+     */
+    void enterKioskFullscreen(document, document.documentElement).then(took => {
+      tookFullscreen.current = took
+    })
+  }, [kiosk])
+
+  return { kiosk, toggleKiosk }
+}
+
+/**
+ * The full-screen toggle, pinned above the view switch in the map's bottom-left corner.
+ *
+ * Drawn as an inline SVG rather than a glyph: the obvious characters for this (`⛶`, `⤢`) are missing
+ * from enough system fonts to render as tofu, and the control would then be a blank square.
+ */
+export function KioskToggle({ active, onToggle }: { active: boolean; onToggle: () => void }) {
+  const { label, pressed } = kioskChrome(active)
+  return (
+    <button
+      type="button"
+      className={`kiosk-toggle${active ? ' is-active' : ''}`}
+      onClick={onToggle}
+      aria-pressed={pressed}
+      aria-label={label}
+      title={label}
+    >
+      <svg className="kiosk-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        {active ? (
+          <path d="M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6" />
+        ) : (
+          <path d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6" />
+        )}
+      </svg>
+    </button>
   )
 }
 

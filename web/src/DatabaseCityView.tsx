@@ -37,7 +37,7 @@ import { buildAddressBook, queryAddressId, type AddressEntry } from './addressBo
 import { familyOnMap, placedObjectIds, splitQueryFamiliesByMap } from './queryFamilyMapping'
 import { resolveSidebarMode } from './sidebarMode'
 import { CityLoadingScreen } from './CityLoadingScreen'
-import { MapShell, SidebarHeader, StatusChip, ViewModeTile, type MapViewMode } from './MapShell'
+import { KioskToggle, MapShell, SidebarHeader, StatusChip, useKioskMode, ViewModeTile, type MapViewMode } from './MapShell'
 import { incidentDemandsAttention, incidentSummaryLabel, projectIncidents } from './cityIncidents'
 import {
   drawersHoldOpenRegion,
@@ -111,6 +111,8 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
     new URLSearchParams(window.location.search).get('object'))
   const [selectedRoadId, setSelectedRoadId] = useState<string | null>(null)
   const [addressTerm, setAddressTerm] = useState('')
+  /** Kiosk mode: the sidebar folds away and the map takes the window. See `kioskMode.ts`. */
+  const { kiosk, toggleKiosk } = useKioskMode()
   /*
    * Which one of the rail's four disclosure regions is open.
    *
@@ -1103,7 +1105,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
   )
 
   return (
-    <MapShell sidebar={sidebar}>
+    <MapShell sidebar={sidebar} kiosk={kiosk}>
       {/*
         * Up for the whole walk, not just its ends.
         *
@@ -1162,6 +1164,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
       )}
 
       <ViewModeTile mode={viewMode} onChange={onViewModeChange} />
+      <KioskToggle active={kiosk} onToggle={toggleKiosk} />
       {banners}
     </MapShell>
   )

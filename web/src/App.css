@@ -33,6 +33,32 @@
   isolation: isolate;
 }
 
+/*
+ * Kiosk mode: the rail folds away and the stage takes the whole shell.
+ *
+ * Both track sizes are reset, not just the columns, because the shell is a two-column grid on a wide
+ * screen and a two-*row* grid at <=860px. Overriding one leaves the other's second track in place and
+ * the map keeps a 42% hole where the sheet used to be.
+ *
+ * Written here beside the base rules rather than at the end of the file, which is where a narrow
+ * override would have to go: the extra class outranks every plain `.map-shell` rule in the
+ * stylesheet, media query or not, so source order does not decide this one.
+ */
+.map-shell.is-kiosk {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+/*
+ * Deliberately a class on the rail, not `.map-shell.is-kiosk .map-sidebar`.
+ *
+ * `ownRule()` in `mobileLayout.test.ts` matches its selector preceded by start-or-whitespace, so a
+ * descendant selector ending in `.map-sidebar` becomes the last thing every `.map-sidebar` assertion
+ * in that file resolves to. Written that way this rule silently retargeted the desktop rail's
+ * `overflow: hidden` guard at `display: none` -- a real failure, and the quiet version of it would
+ * have been an assertion that kept passing while describing the wrong rule.
+ */
+.map-sidebar.is-collapsed { display: none; }
+
 .sidebar-header {
   flex: none;
   padding: 14px 16px 12px;
@@ -1053,6 +1079,50 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
   text-align: center;
 }
 
+/*
+ * The full-screen toggle, stacked directly above the view switch.
+ *
+ * Bottom-left rather than the top-right corner a web map would usually use, because that corner is
+ * already the overlay tray's and the two would sit on each other. `bottom` clears the 74px tile at
+ * `bottom: 14px` with 8px between them, so the pair reads as one column of map chrome; both numbers
+ * shrink together in the narrow block below, where the tile is 56px.
+ */
+.kiosk-toggle {
+  position: absolute;
+  z-index: 2;
+  bottom: 96px;
+  left: 14px;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #33455a;
+  background: rgba(13, 22, 32, 0.92);
+  color: #dbe7f0;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .45);
+}
+.kiosk-toggle:hover { border-color: #72f4c4; color: #8be7ce; }
+/* Matches the pressed treatment `.hud-results button[aria-pressed='true']` already uses. */
+.kiosk-toggle.is-active { border-color: #72f4c4; background: #0f2029; color: #8be7ce; }
+/*
+ * 21px, not the 17px this started at. The compress glyph is four elbows pointing inward, and
+ * below ~20px the gaps between them close up and the whole thing reads as a plus sign -- measured
+ * side by side against five other geometries at the real 34px button size, all of which failed the
+ * same way. The expand glyph is legible either way, so both sizes move together to keep the two
+ * states from jumping.
+ */
+.kiosk-icon {
+  width: 21px;
+  height: 21px;
+  /* `currentColor` so the hover and active colours above reach the glyph without repeating them. */
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: square;
+}
+
 .map-controls {
   position: absolute;
   z-index: 2;
@@ -1928,6 +1998,8 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
 @media (max-width: 900px) {
   .view-mode-tile { width: 56px; height: 56px; bottom: 10px; left: 10px; }
   .view-mode-label { padding: 2px 0; font-size: .58rem; }
+  /* Keeps the 8px gap over the tile, which is 56px here, and grows to a comfortable tap target. */
+  .kiosk-toggle { width: 38px; height: 38px; bottom: 74px; left: 10px; }
 
   .hud-bottom-right { bottom: 10px; right: 10px; gap: 6px; }
   .hud-compass { justify-self: end; padding: 5px 9px; font-size: .64rem; }
