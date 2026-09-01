@@ -222,12 +222,39 @@ the real instruction is buried in the noise.
 
 Do not weaken `--locked-mode` in CI to get around this. It is a supply-chain control.
 
+## A negative descriptor is a permanent answer unless the cache is stamped
+
+Query text is normalized once per `query_text_id` and the *result* is cached — including a
+`Missing` result. That cache is deliberately excluded from plan-cache eviction (a `Missing`
+descriptor is the record of *why* there is no text, so discarding it would re-ask the source for
+something it already refused). The consequence is easy to miss: **improving `SqlTextNormalizer`
+changes nothing on any instance that has already run.** Every text the old normalizer rejected is
+on disk as a rejection, and the read is a hit, so the new code is never reached.
+
+That is not hypothetical. Query Store records a parameterized statement as its sp_executesql
+parameter declaration followed by the statement — `(@P0 int)SELECT ...` — which no T-SQL parser
+accepts as a batch. On an Azure SQL database driven by any ORM or prepared-statement client that is
+nearly the whole workload: measured against a live instance, **167 of 172 query families had no
+text at all**, which empties the plan finder, strips the labels off the city's query traffic, and
+leaves families split by query hash that normalized text would have merged.
+
+So `TextDescriptorKind` carries a version, and it feeds *both* the record kind and the logical kind
+hashed into the record id. The id is what retires a record — `ReadJsonAsync` is keyed by id and
+never looks at the kind — so restamping only the record kind leaves it readable, and a test that
+restamps the kind to prove retirement passes against a broken implementation. Mint the legacy id
+to test this, and mutate `Id(TextDescriptorKind, …)` back to the literal to confirm the guard binds.
+
+Bump the stamp whenever the normalizer changes what it accepts or how it renders what it accepts,
+and add the old value to `SupersededTextDescriptorKinds`. That list exists because retiring by id
+makes the old records unreachable, and an unreachable record that no kind list names is storage
+nothing can ever reclaim.
+
 ## Validation commands
 
 ```powershell
 dotnet build SqlSimCity.slnx -c Release        # 0 warnings expected
-dotnet test SqlSimCity.slnx -c Release         # 1,367 tests
-npm test                                       # 626 probe-catalog tests
+dotnet test SqlSimCity.slnx -c Release         # 1,505 tests
+npm test                                       # 647 probe-catalog tests
 cd web; npm ci; npm run build; npm test -- --run   # 1,069 tests / 54 files
 npm run typecheck
 ```

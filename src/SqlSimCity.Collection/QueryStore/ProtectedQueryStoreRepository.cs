@@ -46,20 +46,49 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     internal const string NormalizedPlanChunkKind = "query-store-normalized-plan-chunk";
 
     /// <summary>
+    /// The kind of a cached query text descriptor, carrying the version of the normalizer that
+    /// produced it. Both the record kind and the logical kind hashed into the record id carry it,
+    /// so bumping this retires every descriptor an earlier normalizer wrote: the id no longer
+    /// resolves, the read is a clean miss, and the text is normalized again from the source.
+    ///
+    /// Without the stamp a <c>Missing</c> descriptor is permanent. The descriptor cache records
+    /// *why* there is no text and is never evicted, so a text the normalizer once rejected is
+    /// never offered to it again — and improving the normalizer changes nothing on an instance
+    /// that has already run, because every rejection it would now accept is already on disk. That
+    /// is the defect this stamp exists for: recognizing Query Store's sp_executesql parameter
+    /// declaration prefix would otherwise only help stores that had never been written to.
+    ///
+    /// Bump it whenever <see cref="SqlTextNormalizer"/> changes what it accepts or how it renders
+    /// what it accepts.
+    /// </summary>
+    internal const string TextDescriptorKind = "query-store-text-descriptor-v2";
+
+    /// <summary>
+    /// Descriptor kinds this type no longer writes. Unlike the current kind, these are evictable:
+    /// bumping <see cref="TextDescriptorKind"/> makes every record written under an older stamp
+    /// unreachable, and an unreachable record that nothing can reclaim is storage leaked for the
+    /// life of the store. They carry no answer that is still consulted, so evicting them costs a
+    /// re-normalization at worst.
+    /// </summary>
+    internal static readonly IReadOnlyList<string> SupersededTextDescriptorKinds =
+        ["query-store-text-descriptor"];
+
+    /// <summary>
     /// The record kinds written only when something is hydrated on demand -- the plan cache.
     /// Background collection never writes them: raw query text and Showplan XML land here when a
     /// request asks for a family or a plan, and the normalized plan is derived from that XML.
     /// Named here, at the one place they are minted, so a size measurement of the cache cannot
     /// drift from what the cache actually is.
     ///
-    /// Text descriptors are deliberately excluded. They are small, they are written on the same
-    /// request path, and a <c>Missing</c> or <c>Restricted</c> descriptor is the record of *why*
-    /// there is no text -- discarding it to reclaim space would cause the source to be asked
-    /// again for something it already refused.
+    /// Text descriptors written under the current stamp are deliberately excluded. They are small,
+    /// they are written on the same request path, and a <c>Missing</c> or <c>Restricted</c>
+    /// descriptor is the record of *why* there is no text -- discarding it to reclaim space would
+    /// cause the source to be asked again for something it already refused. Descriptors under a
+    /// superseded stamp are included, because nothing can read them.
     /// </summary>
     public static readonly IReadOnlyList<string> PlanCacheRecordKinds =
         [RawQueryTextKind, RawShowplanKind, NormalizedPlanKind, NormalizedPlanChunkKind,
-         .. SupersededNormalizedPlanKinds];
+         .. SupersededNormalizedPlanKinds, .. SupersededTextDescriptorKinds];
 
     private readonly IProtectedRecordReadSession? _session;
 
@@ -182,12 +211,13 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     public Task StoreTextDescriptorAsync(
         string databaseId, string queryTextId, QueryTextDescriptorV1 descriptor,
         DateTimeOffset capturedAt, CancellationToken cancellationToken = default) =>
-        PutJsonAsync(Id("text-descriptor", databaseId, queryTextId),
-            "query-store-text-descriptor", capturedAt, StorageResolution.Detail, descriptor, cancellationToken);
+        PutJsonAsync(Id(TextDescriptorKind, databaseId, queryTextId),
+            TextDescriptorKind, capturedAt, StorageResolution.Detail, descriptor, cancellationToken);
 
     public Task<QueryTextDescriptorV1?> ReadTextDescriptorAsync(
         string databaseId, string queryTextId, CancellationToken cancellationToken = default) =>
-        ReadJsonAsync<QueryTextDescriptorV1>(Id("text-descriptor", databaseId, queryTextId), cancellationToken);
+        ReadJsonAsync<QueryTextDescriptorV1>(
+            Id(TextDescriptorKind, databaseId, queryTextId), cancellationToken);
 
     public Task StoreNormalizedFactAsync<T>(
         string databaseId, string factId, DateTimeOffset capturedAt,

@@ -118,7 +118,7 @@ public sealed class QueryStorePublishCostTests : IDisposable
         var usage = await store.MeasureUsageAsync();
 
         var cacheBytes = usage.StoredBytesForKinds(ProtectedQueryStoreRepository.PlanCacheRecordKinds);
-        var descriptorBytes = usage.StoredBytesForKinds(["query-store-text-descriptor"]);
+        var descriptorBytes = usage.StoredBytesForKinds(["query-store-text-descriptor-v2"]);
         Assert.Equal(0, descriptorBytes);
         // Everything the store gained since the snapshot came from hydration, so the named kinds
         // have to account for all of it. Rename a kind constant without updating the set and this

@@ -1,5 +1,8 @@
 using System.Numerics;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using SqlSimCity.Collection.QueryStore;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
@@ -412,6 +415,74 @@ public sealed class ProtectedQueryStoreHistoryTests
             13, typeof(ShowplanNodeV1).GetConstructors().Single().GetParameters().Length);
         Assert.Equal(
             13, typeof(NormalizedShowplanV1).GetConstructors().Single().GetParameters().Length);
+    }
+
+    /// <summary>
+    /// A descriptor recording that text could not be normalized is never evicted and is read back
+    /// in place of asking the source again, so improving the normalizer changes nothing on a store
+    /// that already holds the rejection. The stamp in the record id is what retires it.
+    /// </summary>
+    [Fact]
+    public async Task ATextDescriptorWrittenUnderASupersededStampIsNotReadBack()
+    {
+        var store = new MemoryProtectedStore();
+        var repository = new ProtectedQueryStoreRepository(store);
+        await repository.StoreTextDescriptorAsync("db", "text-1", Rejected, Now);
+
+        Assert.NotNull(await repository.ReadTextDescriptorAsync("db", "text-1"));
+
+        var legacy = new MemoryProtectedStore();
+        var legacyRepository = new ProtectedQueryStoreRepository(legacy);
+        WriteLegacyTextDescriptor(legacy, "text-descriptor", "query-store-text-descriptor", "db", "text-1");
+
+        Assert.Null(await legacyRepository.ReadTextDescriptorAsync("db", "text-1"));
+    }
+
+    [Fact]
+    public async Task SupersededTextDescriptorsAreStillMeasuredAsCacheAndStillEvictable()
+    {
+        var store = new MemoryProtectedStore();
+        var repository = new ProtectedQueryStoreRepository(store);
+        await repository.StoreTextDescriptorAsync("db", "kept", Rejected, Now);
+
+        Assert.Equal(
+            0,
+            (await store.MeasureUsageAsync())
+                .StoredBytesForKinds(ProtectedQueryStoreRepository.PlanCacheRecordKinds));
+
+        foreach (var superseded in ProtectedQueryStoreRepository.SupersededTextDescriptorKinds)
+            WriteLegacyTextDescriptor(store, "text-descriptor", superseded, "db", superseded);
+
+        var usage = await store.MeasureUsageAsync();
+        Assert.True(
+            usage.StoredBytesForKinds(ProtectedQueryStoreRepository.PlanCacheRecordKinds) > 0,
+            "a descriptor no stamp can read is storage nothing can reclaim");
+
+        var eviction = await repository.EnforcePlanCacheQuotaAsync(usage, 1);
+
+        Assert.True(eviction.EvictedRecords > 0);
+        Assert.NotNull(await repository.ReadTextDescriptorAsync("db", "kept"));
+    }
+
+    private static QueryTextDescriptorV1 Rejected => new(
+        QueryTextAvailability.Missing, null, null,
+        "SQL text could not be safely normalized by ScriptDom.");
+
+    /// <summary>
+    /// Mints the record id exactly as an earlier build did, so the test exercises the mechanism
+    /// that actually retires a descriptor: the read is keyed by the id hash alone, which the
+    /// logical kind feeds, so restamping only the record kind would leave it readable.
+    /// </summary>
+    private static void WriteLegacyTextDescriptor(
+        MemoryProtectedStore store, string logicalKind, string recordKind,
+        string databaseId, string queryTextId)
+    {
+        var opaque = SHA256.HashData(
+            Encoding.UTF8.GetBytes($"{logicalKind}\n{databaseId}\n{queryTextId}"));
+        var id = new ProtectedRecordId($"qs:{Convert.ToHexString(opaque).ToLowerInvariant()}");
+        store.Records[id.Value] = new ProtectedRecord(
+            id, recordKind, Now, StorageResolution.Detail,
+            JsonSerializer.SerializeToUtf8Bytes(Rejected));
     }
 
     private static ProtectedRecord[] NormalizedPlanManifests(MemoryProtectedStore store) =>
