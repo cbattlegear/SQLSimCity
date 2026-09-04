@@ -274,11 +274,6 @@ export interface ArchiveInfo {
   capabilities: string[]
   archiveBytes: number
   entryCount: number
-  archivedFindings?: {
-    mode: string
-    engineVersion: string
-    ruleVersions: Record<string, string>
-  } | null
 }
 
 export interface EdgeSourceInfo {
