@@ -2,6 +2,9 @@ import type { EdgeConfidence } from './contracts'
 import type { DatabaseCityObject, DatabaseCityQueryFamily, QueryAttributionConfidence } from './databaseCityContracts'
 import { FACILITY_LABELS, type FacilityKind } from './cityInfrastructure'
 import { confidencePattern, type RoadPattern } from './cityTraffic'
+import {
+  familyTrafficMeasurement, trafficBasis, trafficBasisLabel, trafficCoverageNote, type TrafficBasis,
+} from './cityTrafficWindow'
 
 /**
  * Turns captured Query Store wait categories into **wait lanes**: measured traffic from a building to
@@ -9,9 +12,10 @@ import { confidencePattern, type RoadPattern } from './cityTraffic'
  *
  * A building-to-building road answers "which objects are named together". A wait lane answers a
  * different question — "where did the time go" — so it is a separate lane rather than another road
- * grade. Encoded channels:
+ * grade. The scene no longer draws these lanes; their records feed evidence and hover text.
+ * The retained lane-rendering metadata describes these channels:
  *
- * - **width**  = captured wait milliseconds on that lane, on the same documented log2 scale roads use.
+ * - **width**  = captured wait milliseconds on a documented log2 scale (roads have constant width).
  * - **colour** = which facility the lane ends at, so the destination stays readable when lanes cross.
  * - **pattern** = the contributing families' attribution confidence, the same channel roads use.
  *
@@ -169,9 +173,8 @@ export const LANE_COLORS: Readonly<Record<FacilityKind, number>> = {
 
 export const MIN_LANE_WIDTH = 1.6
 /**
- * Deliberately shallower than {@link ROAD_WIDTH_PER_DOUBLING}: a road counts executions, but a lane
- * accumulates milliseconds over the whole Query Store retention window, which spans far more orders
- * of magnitude. A shallower step spends the same width budget across a much wider honest range.
+ * Accumulated milliseconds span many orders of magnitude. Road width no longer encodes a number;
+ * this independent scale remains on the lane records for consumers that display them.
  */
 export const LANE_WIDTH_PER_DOUBLING = 0.3
 export const MAX_LANE_WIDTH = 9
@@ -265,13 +268,18 @@ export interface FacilityTraffic {
   /** How many of the supplied families carried any wait-category evidence. */
   readonly measuredFamilyCount: number
   readonly familyCount: number
+  readonly basis: TrafficBasis
+  /** Missing or malformed category evidence, not measured zero. */
+  readonly unknownFamilyIds: readonly string[]
+  /** Known waits whose category breakdown is unavailable, separate from category-labelled totals. */
+  readonly unclassifiedWaitMilliseconds: string
   /** Always-shown disclosure of what this layer does and does not claim. */
   readonly note: string
 }
 
 /**
  * Lane width in world units. Every doubling of captured wait milliseconds adds
- * {@link LANE_WIDTH_PER_DOUBLING}, matching how road width scales captured executions, until
+ * {@link LANE_WIDTH_PER_DOUBLING}, independently of constant road width, until
  * {@link LANE_WIDTH_SATURATION_MILLISECONDS}, past which width is clamped and the exact figure is
  * only available as text.
  */
@@ -299,6 +307,8 @@ export interface FacilityShare {
   readonly waitMilliseconds: string
   /** Fraction of this object's attributed waiting, in 0..1. */
   readonly share: number
+  readonly partial?: boolean
+  readonly windowMinutes?: number | null
 }
 
 /**
@@ -335,6 +345,8 @@ export function facilityShares(objectId: string, traffic: FacilityTraffic): Faci
       label: entry.label,
       waitMilliseconds: entry.milliseconds.toString(),
       share: Number(entry.milliseconds) / Number(overall),
+      partial: traffic.unknownFamilyIds.length > 0,
+      windowMinutes: traffic.basis.kind === 'recent' ? traffic.basis.window?.windowMinutes ?? null : undefined,
     }))
     .sort((left, right) => right.share - left.share || left.facility.localeCompare(right.facility))
 }
@@ -347,10 +359,14 @@ export function facilityShares(objectId: string, traffic: FacilityTraffic): Faci
  */
 export function facilityMixLabel(shares: readonly FacilityShare[]): string | null {
   if (shares.length === 0) return null
-  return shares
+  const label = shares
     .slice(0, 3)
     .map(entry => `${entry.label.toLocaleLowerCase()} ${Math.round(entry.share * 100)}%`)
     .join(', ')
+  const window = shares[0].windowMinutes
+  return label
+    + (window !== undefined ? ` (recent${window === null ? '' : ` ${window} min`})` : '')
+    + (shares.some(share => share.partial) ? ' — partial captured categories' : '')
 }
 
 const CONFIDENCE_RANK: Readonly<Record<QueryAttributionConfidence, number>> = {
@@ -368,6 +384,7 @@ const CONFIDENCE_RANK: Readonly<Record<QueryAttributionConfidence, number>> = {
 export function projectFacilityTraffic(
   families: readonly DatabaseCityQueryFamily[],
   objects: readonly Pick<DatabaseCityObject, 'objectId'>[],
+  basis: TrafficBasis = trafficBasis(families),
 ): FacilityTraffic {
   const loaded = new Set(objects.map(object => object.objectId))
   const lanes = new Map<string, MutableLane>()
@@ -376,9 +393,26 @@ export function projectFacilityTraffic(
   const shared = new Map<string, bigint>()
   const unattributed = new Map<string, bigint>()
   let measuredFamilyCount = 0
+  let quietFamilyCount = 0
+  let unclassifiedWait = 0n
+  const unknownFamilyIds: string[] = []
 
   for (const family of families) {
-    const captured = categoryTotals(family)
+    const sample = familyTrafficMeasurement(family, basis)
+    if (sample.quiet) quietFamilyCount += 1
+    const captured = categoryTotals(sample.categories)
+    const categorySum = captured.reduce((sum, entry) => sum + entry.milliseconds, 0n)
+    const malformed = sample.categories
+      && Object.values(sample.categories).some(value => toBigInt(value) === null)
+    const unavailable = basis.kind === 'recent'
+      ? !sample.covered || !!malformed || sample.waitMilliseconds !== categorySum
+        || (!sample.quiet && sample.categories === null)
+      : captured.length === 0
+    if (unavailable) {
+      unknownFamilyIds.push(family.familyId)
+      unclassifiedWait += sample.waitMilliseconds ?? 0n
+      continue
+    }
     if (captured.length === 0) continue
     measuredFamilyCount += 1
 
@@ -447,14 +481,14 @@ export function projectFacilityTraffic(
 
   return {
     lanes: [...lanes.entries()]
-      .map(([laneId, lane]) => finish(laneId, lane))
+      .map(([laneId, lane]) => finish(laneId, lane, basis, unknownFamilyIds.length > 0))
       .sort(
         (left, right) =>
           compareDescending(left.waitMilliseconds, right.waitMilliseconds) ||
           left.laneId.localeCompare(right.laneId),
       ),
     sharedLanes: [...sharedLanes.entries()]
-      .map(([laneId, lane]) => finishShared(laneId, lane))
+      .map(([laneId, lane]) => finishShared(laneId, lane, basis, unknownFamilyIds.length > 0))
       .sort(
         (left, right) =>
           compareDescending(left.waitMilliseconds, right.waitMilliseconds) ||
@@ -468,7 +502,16 @@ export function projectFacilityTraffic(
     unattributed: sortTotals(unattributed),
     measuredFamilyCount,
     familyCount: families.length,
-    note: describe(measuredFamilyCount, families.length, sharedLanes.size),
+    basis,
+    unknownFamilyIds,
+    unclassifiedWaitMilliseconds: String(unclassifiedWait),
+    note: `${trafficCoverageNote(families, basis)} `
+      + (quietFamilyCount > 0 && quietFamilyCount === families.length
+        ? 'All covered families report no executions and no waits, so no facility traffic is drawn.'
+        : describe(measuredFamilyCount, families.length, sharedLanes.size))
+      + (unknownFamilyIds.length > 0
+        ? ` Partial category evidence: ${unknownFamilyIds.length} families are unknown; ${unclassifiedWait.toLocaleString()} measured wait ms have no usable breakdown.`
+        : ''),
   }
 }
 
@@ -491,7 +534,7 @@ interface MutableSharedLane {
   confidence: QueryAttributionConfidence
 }
 
-function finishShared(laneId: string, lane: MutableSharedLane): SharedFacilityLane {
+function finishShared(laneId: string, lane: MutableSharedLane, basis: TrafficBasis, partial: boolean): SharedFacilityLane {
   const categories = sortTotals(lane.categories)
   const label = FACILITY_LABELS[lane.facility]
   const saturated = lane.milliseconds > BigInt(LANE_WIDTH_SATURATION_MILLISECONDS)
@@ -512,6 +555,7 @@ function finishShared(laneId: string, lane: MutableSharedLane): SharedFacilityLa
     confidence: lane.confidence,
     categories,
     rationale:
+      `${trafficBasisLabel(basis)}. ${partial ? 'Partial category evidence; unknown families are excluded, not zero. ' : ''}` +
       `${lane.milliseconds.toLocaleString()} captured wait ms to the ${label} from query family ` +
       `${lane.familyId}, which names ${lane.namedObjectCount} objects ` +
       `(${categories.map(total => `${total.category} ${BigInt(total.waitMilliseconds).toLocaleString()} ms`).join(', ')}). ` +
@@ -528,7 +572,7 @@ function finishShared(laneId: string, lane: MutableSharedLane): SharedFacilityLa
   }
 }
 
-function finish(laneId: string, lane: MutableLane): FacilityLane {
+function finish(laneId: string, lane: MutableLane, basis: TrafficBasis, partial: boolean): FacilityLane {
   const categories = sortTotals(lane.categories)
   const familyIds = [...lane.familyIds].sort()
   const label = FACILITY_LABELS[lane.facility]
@@ -549,6 +593,7 @@ function finish(laneId: string, lane: MutableLane): FacilityLane {
     categories,
     familyIds,
     rationale:
+      `${trafficBasisLabel(basis)}. ${partial ? 'Partial category evidence; unknown families are excluded, not zero. ' : ''}` +
       `${lane.milliseconds.toLocaleString()} captured wait ms to the ${label} from ` +
       `${familyIds.length} query family/families naming only this object ` +
       `(${categories.map(total => `${total.category} ${BigInt(total.waitMilliseconds).toLocaleString()} ms`).join(', ')}). ` +
@@ -581,9 +626,8 @@ function describe(measured: number, total: number, sharedLaneCount: number): str
 }
 
 function categoryTotals(
-  family: DatabaseCityQueryFamily,
+  source: Readonly<Record<string, string>> | null,
 ): Array<{ category: string; milliseconds: bigint }> {
-  const source = family.waitMillisecondsByCategory
   if (!source) return []
   const totals: Array<{ category: string; milliseconds: bigint }> = []
   for (const [category, value] of Object.entries(source)) {

@@ -4,6 +4,7 @@ import {
   HEAVY_DELAY_MS_PER_EXECUTION,
   MODERATE_DELAY_MS_PER_EXECUTION,
   SEVERE_DELAY_MS_PER_EXECUTION,
+  gradeRoads,
 } from './cityTraffic'
 import {
   assignWorkloadTraffic,
@@ -13,6 +14,7 @@ import {
 import type {
   DatabaseCityObject,
   DatabaseCityQueryFamily,
+  DatabaseCityRecentActivity,
   DatabaseCitySchema,
   DatabaseCityWaitAttribution,
 } from './databaseCityContracts'
@@ -110,6 +112,17 @@ function family(
 }
 
 const plan = planCity(sampleCity(), options())
+
+function recent(overrides: Partial<DatabaseCityRecentActivity> = {}): DatabaseCityRecentActivity {
+  const wait = overrides.totalWaitMilliseconds ?? '0'
+  return {
+    windowMinutes: 15, windowStart: '2024-05-01T00:45:00Z', windowEnd: '2024-05-01T01:00:00Z',
+    covered: true, executionCount: '0', totalDurationMicroseconds: '0', totalWaitMilliseconds: '0',
+    waitAttribution: { objects: [], unattributedWaitMilliseconds: wait, plansRead: 0, rationale: 'No usable plan' },
+    waitMillisecondsByCategory: { CPU: wait },
+    rationale: 'test', ...overrides,
+  }
+}
 
 describe('congestionFromDelay', () => {
   it('grades an unrouted street as unknown rather than free-flowing', () => {
@@ -245,7 +258,7 @@ describe('assignWorkloadTraffic', () => {
     ])
     expect(traffic.trips.get('f1')!.stops).toHaveLength(3)
     // Leg one: 4500 + 2700/2. Leg two: 2700/2 + 1800. Together they are the apportioned 9000.
-    const legWaits = new Set([...traffic.streets.values()].map(street => Math.round(street.waitMilliseconds)))
+    const legWaits = new Set([...traffic.streets.values()].map(street => Math.round(street.waitMilliseconds!)))
     expect(legWaits.has(5850)).toBe(true)
     expect(legWaits.has(3150)).toBe(true)
     expect(5850 + 3150).toBe(9000)
@@ -334,5 +347,128 @@ describe('assignWorkloadTraffic', () => {
     ])
     expect(traffic.note).toContain('measured')
     expect(traffic.note).toContain('SQL Server has no streets')
+  })
+
+  const endpoints = ['object:dbo:100', 'object:rep:300']
+  const oldHot = family('old-hot', endpoints, '1000', '1000000',
+    attribution([[endpoints[0], 0.9, '900000'], [endpoints[1], 0.1, '100000']]))
+  const roadFor = (families: DatabaseCityQueryFamily[]) => gradeRoads([{
+    routeId: 'road', fromObjectId: endpoints[0], toId: endpoints[1],
+    kind: 'ObjectReference', confidence: 'Confirmed', rationale: 'test', evidence,
+  }], families)[0]
+
+  it('makes old-hot recent-zero streets quiet without removing their historical trips', () => {
+    const historical = assignWorkloadTraffic(plan, [oldHot])
+    const families = [{ ...oldHot, recentActivity: recent() }]
+    const current = assignWorkloadTraffic(plan, families)
+    expect(current.streets.size).toBeGreaterThan(0)
+    expect(current.trips.get('old-hot')!.stops).toEqual(historical.trips.get('old-hot')!.stops)
+    expect(current.trips.get('old-hot')!.edgeIds).toEqual(historical.trips.get('old-hot')!.edgeIds)
+    expect(current.trips.get('old-hot')!.points).toEqual(historical.trips.get('old-hot')!.points)
+    expect(current.trips.get('old-hot')!.waitMilliseconds).toBe(0)
+    for (const street of current.streets.values()) {
+      expect(street.executions).toBe(1000)
+      expect(street.measuredExecutions).toBe(0)
+      expect(street.waitMilliseconds).toBe(0)
+      expect(street.delayPerExecution).toBe(0)
+      expect(street.grade).toBe(roadFor(families).grade)
+    }
+  })
+
+  it('uses recent measured waits and runtime allocation without changing retained visit order', () => {
+    const families = [{
+      ...oldHot, recentActivity: recent({
+        executionCount: '2', totalWaitMilliseconds: '120',
+        waitAttribution: attribution([[endpoints[0], 0.1, '12'], [endpoints[1], 0.9, '108']]),
+      }),
+    }]
+    const current = assignWorkloadTraffic(plan, families)
+    expect(current.trips.get('old-hot')!.stops[0]).toBe(endpoints[0])
+    for (const street of current.streets.values()) {
+      expect(street.waitMilliseconds).toBe(120)
+      expect(street.measuredExecutions).toBe(2)
+      expect(street.delayPerExecution).toBe(60)
+      expect(street.grade).toBe(roadFor(families).grade)
+    }
+  })
+
+  it('does not rescale retained allocation when recent waits lack their own split', () => {
+    const traffic = assignWorkloadTraffic(plan, [{
+      ...oldHot, recentActivity: recent({ executionCount: '100', totalWaitMilliseconds: '10' }),
+    }])
+    expect(traffic.streets.size).toBeGreaterThan(0)
+    for (const street of traffic.streets.values()) {
+      expect(street.grade).toBe('unknown')
+      expect(street.waitMilliseconds).toBeNull()
+      expect(street.delayPerExecution).toBeNull()
+    }
+    expect(traffic.note).toContain('no usable wait placement')
+  })
+
+  it('does not call executions with zero waits quiet without a recent placement model', () => {
+    const traffic = assignWorkloadTraffic(plan, [{
+      ...oldHot, recentActivity: recent({ executionCount: '10' }),
+    }])
+    for (const street of traffic.streets.values()) expect(street.grade).toBe('unknown')
+  })
+
+  it('keeps shared streets unknown when a covered quiet family hides a missing contributor', () => {
+    const traffic = assignWorkloadTraffic(plan, [
+      { ...oldHot, recentActivity: recent() },
+      { ...oldHot, familyId: 'missing' },
+    ])
+    const missingEdges = traffic.trips.get('missing')!.edgeIds
+    const sharedEdges = traffic.trips.get('old-hot')!.edgeIds.filter(id => missingEdges.includes(id))
+    expect(sharedEdges.length).toBeGreaterThan(0)
+    for (const id of sharedEdges) {
+      const street = traffic.streets.get(id)!
+      expect(street.grade).toBe('unknown')
+      expect(street.measuredExecutions).toBeNull()
+      expect(street.waitMilliseconds).toBeNull()
+      expect(street.rationale).toContain('1 of 2')
+    }
+  })
+
+  it('uses the global recent basis even when only an unroutable family publishes it', () => {
+    const traffic = assignWorkloadTraffic(plan, [
+      oldHot,
+      { ...family('publisher', [], '1'), recentActivity: recent() },
+    ])
+    expect(traffic.streets.size).toBeGreaterThan(0)
+    for (const street of traffic.streets.values()) expect(street.grade).toBe('unknown')
+    expect(traffic.basis.kind).toBe('recent')
+  })
+
+  it.each(['bad', '-1', '', '0x10'])('does not grade malformed recent executions %j as zero', value => {
+    const traffic = assignWorkloadTraffic(plan, [{
+      ...oldHot, recentActivity: recent({ executionCount: value }),
+    }])
+    expect(traffic.streets.size).toBeGreaterThan(0)
+    for (const street of traffic.streets.values()) {
+      expect(street.grade).toBe('unknown')
+      expect(street.measuredExecutions).toBeNull()
+    }
+  })
+
+  it.each(['0', '10'])('keeps runtime-covered executions %s unknown when both recent wait records are null', executionCount => {
+    const traffic = assignWorkloadTraffic(plan, [{
+      ...oldHot, recentActivity: recent({
+        executionCount, totalWaitMilliseconds: '0', waitAttribution: null, waitMillisecondsByCategory: null,
+      }),
+    }])
+    expect(traffic.streets.size).toBeGreaterThan(0)
+    for (const street of traffic.streets.values()) {
+      expect(street.grade).toBe('unknown')
+      expect(street.waitMilliseconds).toBeNull()
+      expect(street.delayPerExecution).toBeNull()
+    }
+  })
+
+  it('leaves legacy recent zero counters unknown when both optional wait records are omitted', () => {
+    const traffic = assignWorkloadTraffic(plan, [{
+      ...oldHot, recentActivity: recent({ waitAttribution: undefined, waitMillisecondsByCategory: undefined }),
+    }])
+    expect(traffic.streets.size).toBeGreaterThan(0)
+    for (const street of traffic.streets.values()) expect(street.grade).toBe('unknown')
   })
 })

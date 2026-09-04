@@ -338,6 +338,7 @@ describe('the recent traffic window', () => {
   function recent(
     overrides: Partial<NonNullable<DatabaseCityQueryFamily['recentActivity']>> = {},
   ): NonNullable<DatabaseCityQueryFamily['recentActivity']> {
+    const wait = overrides.totalWaitMilliseconds ?? '0'
     return {
       windowMinutes: 15,
       windowStart: '2024-05-01T00:45:00Z',
@@ -346,6 +347,8 @@ describe('the recent traffic window', () => {
       executionCount: '0',
       totalDurationMicroseconds: '0',
       totalWaitMilliseconds: '0',
+      waitAttribution: { objects: [], unattributedWaitMilliseconds: wait, plansRead: 0, rationale: 'No usable plan' },
+      waitMillisecondsByCategory: { CPU: wait },
       rationale: 'test',
       ...overrides,
     }
@@ -442,6 +445,109 @@ describe('the recent traffic window', () => {
 
     expect(road.grade).toBe('severe')
   })
+
+  it('keeps an old-hot road quiet when its covered recent execution and wait totals are zero', () => {
+    const [road] = gradeRoads([hot], [family({
+      familyId: 'old-hot', objectIds: ['a', 'b'], executionCount: '1000',
+      totalWaitMilliseconds: '1000000', recentActivity: recent(),
+    })])
+    expect(road.grade).toBe('free')
+    expect(road.delayPerExecution).toBe(0)
+    expect(road.recentExecutions).toBe(0)
+    expect(road.executions).toBe(1000)
+  })
+
+  it('chooses recent globally even when only an unrelated road publishes a window', () => {
+    const [road] = gradeRoads([hot], [
+      family({ familyId: 'archive', objectIds: ['a', 'b'], executionCount: '1', totalWaitMilliseconds: '1000' }),
+      family({ familyId: 'publisher', objectIds: ['x', 'y'], recentActivity: recent() }),
+    ])
+    expect(road.grade).toBe('unknown')
+    expect(road.recentExecutions).toBeNull()
+    expect(road.waitShare).toBeNull()
+    expect(road.rationale).toContain('0 of 1')
+  })
+
+  it('does not grade a covered quiet subset free while a contributing family lacks coverage', () => {
+    const [road] = gradeRoads([hot], [
+      family({ familyId: 'quiet', objectIds: ['a', 'b'], recentActivity: recent() }),
+      family({ familyId: 'missing', objectIds: ['a', 'b'], executionCount: '1000' }),
+    ])
+    expect(road.grade).toBe('unknown')
+    expect(road.delayPerExecution).toBeNull()
+    expect(road.recentExecutions).toBeNull()
+    expect(road.rationale).toContain('1 of 2')
+    expect(road.rationale).toContain('Partial')
+  })
+
+  it.each(['', 'bad', '-1', 'NaN', 'Infinity', '0x10', '1.5'])(
+    'never converts malformed recent waiting %j into a free road',
+    value => {
+      const [road] = gradeRoads([hot], [family({
+        familyId: 'malformed', objectIds: ['a', 'b'],
+        recentActivity: recent({ executionCount: '100', totalWaitMilliseconds: value }),
+      })])
+      expect(road.grade).toBe('unknown')
+      expect(road.delayPerExecution).toBeNull()
+    },
+  )
+
+  it('does not combine executions and waits from different windows or horizons', () => {
+    const [road] = gradeRoads([hot], [family({
+      familyId: 'recent', objectIds: ['a', 'b'], executionCount: '10000',
+      totalWaitMilliseconds: '900000', totalDurationMicroseconds: '9000000000',
+      recentActivity: recent({
+        executionCount: '2', totalWaitMilliseconds: '120', totalDurationMicroseconds: '240000',
+      }),
+    })])
+    expect(road.grade).toBe('severe')
+    expect(road.delayPerExecution).toBe(60)
+    expect(road.waitShare).toBe(0.5)
+  })
+
+  it('qualifies mismatched-window contributors as missing rather than summing their totals', () => {
+    const [road] = gradeRoads([hot], [
+      family({ familyId: 'new', objectIds: ['a', 'b'], recentActivity: recent() }),
+      family({
+        familyId: 'old', objectIds: ['a', 'b'],
+        recentActivity: recent({ windowStart: '2024-05-01T00:30:00Z', windowEnd: '2024-05-01T00:45:00Z' }),
+      }),
+    ])
+    expect(road.grade).toBe('unknown')
+    expect(road.rationale).toContain('1 of 2')
+  })
+
+  it.each(['0', '10'])('never grades runtime-covered executions %s free when recent wait capture is explicitly null', executionCount => {
+    const [road] = gradeRoads([hot], [family({
+      familyId: 'runtime-only', objectIds: ['a', 'b'],
+      recentActivity: recent({
+        executionCount, totalWaitMilliseconds: '0',
+        waitAttribution: null, waitMillisecondsByCategory: null,
+      }),
+    })])
+    expect(road.grade).toBe('unknown')
+    expect(road.delayPerExecution).toBeNull()
+    expect(road.waitShare).toBeNull()
+    expect(road.rationale).toContain('missing capture')
+  })
+
+  it('keeps legacy recent counters without wait metadata unknown, not free', () => {
+    const [road] = gradeRoads([hot], [family({
+      familyId: 'legacy-window', objectIds: ['a', 'b'],
+      recentActivity: recent({ waitAttribution: undefined, waitMillisecondsByCategory: undefined }),
+    })])
+    expect(road.grade).toBe('unknown')
+    expect(road.delayPerExecution).toBeNull()
+  })
+
+  it('grades captured whole-family waits even when no recent plan can place them', () => {
+    const [road] = gradeRoads([hot], [family({
+      familyId: 'captured-unplaced', objectIds: ['a', 'b'],
+      recentActivity: recent({ executionCount: '2', totalWaitMilliseconds: '120' }),
+    })])
+    expect(road.grade).toBe('severe')
+    expect(road.delayPerExecution).toBe(60)
+  })
 })
 
 describe('describeTrafficWindow', () => {
@@ -453,6 +559,8 @@ describe('describeTrafficWindow', () => {
     executionCount: '4',
     totalDurationMicroseconds: '0',
     totalWaitMilliseconds: '0',
+    waitAttribution: { objects: [], unattributedWaitMilliseconds: '0', plansRead: 0, rationale: 'No usable plan' },
+    waitMillisecondsByCategory: { CPU: '0' },
     rationale: 'test',
   }
 
@@ -489,7 +597,7 @@ describe('describeTrafficWindow', () => {
     expect(disclosure.detail).toContain('unmeasured, not clear')
   })
 
-  it('does not date the traffic before the city has re-read itself', () => {
+  it('does not invent an observation time when workload evidence supplies none', () => {
     const disclosure = describeTrafficWindow(
       [family({ familyId: 'qf:1', recentActivity: covered })],
       null,
@@ -498,5 +606,56 @@ describe('describeTrafficWindow', () => {
 
     expect(disclosure.detail).toContain('every 30 seconds')
     expect(disclosure.detail).not.toContain('last read at')
+    expect(disclosure.detail).toContain('Workload observation time unknown')
+  })
+
+  it('labels the workload observation separately from HTTP polling cadence', () => {
+    const observedAt = '2024-04-30T19:12:00Z'
+    const disclosure = describeTrafficWindow(
+      [family({ familyId: 'qf:1', recentActivity: covered })], observedAt, 30_000,
+    )
+    expect(disclosure.detail).toContain(`Workload observed at ${new Date(observedAt).toLocaleString()}`)
+    expect(disclosure.detail).toContain('polling is not a measurement timestamp')
+    expect(disclosure.detail).not.toContain('last read at')
+  })
+
+  it.each(['archive', 'edge'] as const)('describes %s traffic as a captured window with no live cadence', mode => {
+    const observedAt = '2024-05-01T01:00:00Z'
+    const disclosure = describeTrafficWindow(
+      [family({ familyId: 'qf:1', recentActivity: covered })], observedAt, 30_000, mode,
+    )
+    expect(disclosure.headline).toContain('captured 15-minute window')
+    expect(disclosure.detail).toContain(`This ${mode} snapshot does not refresh automatically`)
+    expect(disclosure.detail).toContain(`window ends at ${new Date(covered.windowEnd).toLocaleString()}`)
+    expect(disclosure.detail).toContain('not at the current time')
+    expect(disclosure.detail).not.toContain('every 30 seconds')
+    expect(disclosure.detail).not.toContain('last 15 minutes')
+    expect(disclosure.headline).not.toContain('last 15 minutes')
+  })
+
+  it('does not promise live blocking or polling for an uncovered archived window', () => {
+    const disclosure = describeTrafficWindow(
+      [family({ familyId: 'qf:1', recentActivity: { ...covered, covered: false } })],
+      null, 30_000, 'archive',
+    )
+    expect(disclosure.headline).toContain('captured 15-minute window')
+    expect(disclosure.detail).toContain('unmeasured, not clear')
+    expect(disclosure.detail).not.toContain('Live blocking')
+    expect(disclosure.detail).not.toContain('every 30 seconds')
+  })
+
+  it('keeps legacy archives explicitly historical and static', () => {
+    const disclosure = describeTrafficWindow([family({ familyId: 'qf:1' })], null, 30_000, 'archive')
+    expect(disclosure.headline).toContain('retained history')
+    expect(disclosure.detail).toContain('snapshot does not refresh automatically')
+    expect(disclosure.detail).toContain('Workload observation time unknown')
+  })
+
+  it('does not render a malformed observation timestamp as an observation', () => {
+    const disclosure = describeTrafficWindow(
+      [family({ familyId: 'qf:1', recentActivity: covered })], 'bad timestamp', 30_000,
+    )
+    expect(disclosure.detail).toContain('Workload observation time unknown')
+    expect(disclosure.detail).not.toContain('Invalid Date')
   })
 })

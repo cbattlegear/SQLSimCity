@@ -1,5 +1,9 @@
 import type { EdgeConfidence } from './contracts'
 import type { DatabaseCityQueryFamily, DatabaseCityRoute } from './databaseCityContracts'
+import {
+  familyTrafficMeasurement, trafficBasis, trafficCoverageNote, trafficDelay, trafficInteger,
+  type TrafficBasis,
+} from './cityTrafficWindow'
 
 /**
  * Turns co-reference edges into roads carrying a GPS-style congestion colour.
@@ -101,15 +105,15 @@ export interface RoadTraffic {
   readonly width: number
   readonly grade: CongestionGrade
   readonly color: number
-  /** Total executions of families naming both endpoints, or null when none were captured. */
+  /** Retained executions of families naming both endpoints; geography, not the recent denominator. */
   readonly executions: number | null
-  /** Captured wait time as a share of captured duration, or null when unmeasured. */
+  /** Wait / duration in the grading window, or null when any contributor is unmeasured. */
   readonly waitShare: number | null
   /** Mean captured wait milliseconds per captured execution — what the colour is graded from. */
   readonly delayPerExecution: number | null
   /**
-   * Executions inside the recent traffic window, or null when nothing was captured in it. Distinct
-   * from {@link executions}, which is the retained total across the whole horizon.
+   * Executions inside the recent traffic window, or null for incomplete coverage. A covered zero
+   * stays zero. Distinct from {@link executions}, the retained total across the whole horizon.
    */
   readonly recentExecutions: number | null
   /** Width of the recent traffic window in minutes, or null when the page published none. */
@@ -140,9 +144,11 @@ export function roadVolume(
     if (!family.objectIds.includes(route.fromObjectId)) continue
     if (!family.objectIds.includes(route.toId)) continue
     familyIds.push(family.familyId)
-    executions += toNumber(family.executionCount) ?? 0
+    const count = trafficInteger(family.executionCount)
+    if (count === null) executions = Number.NaN
+    else executions += Number(count)
   }
-  return familyIds.length === 0 ? { executions: null, familyIds } : { executions, familyIds }
+  return { executions: familyIds.length === 0 || !Number.isFinite(executions) ? null : executions, familyIds }
 }
 
 /**
@@ -153,21 +159,21 @@ export function roadVolume(
  * No longer what the colour is graded from — see {@link roadDelay} — but still reported per road,
  * because "half of this road's time went on waiting" answers something the ratio does not.
  */
-export function waitShare(families: readonly DatabaseCityQueryFamily[]): number | null {
-  let waitMs = 0
-  let durationMs = 0
-  let sawDuration = false
+export function waitShare(
+  families: readonly DatabaseCityQueryFamily[],
+  basis: TrafficBasis = trafficBasis(families),
+): number | null {
+  let waitMs = 0n
+  let durationUs = 0n
   for (const family of families) {
-    const wait = toNumber(family.totalWaitMilliseconds)
-    const duration = toNumber(family.totalDurationMicroseconds)
-    if (wait !== null) waitMs += wait
-    if (duration !== null) {
-      durationMs += duration / 1000
-      sawDuration = true
-    }
+    const sample = familyTrafficMeasurement(family, basis)
+    if (sample.waitMilliseconds === null || sample.durationMicroseconds === null) return null
+    waitMs += sample.waitMilliseconds
+    durationUs += sample.durationMicroseconds
   }
-  if (!sawDuration || durationMs <= 0) return null
-  return waitMs / durationMs
+  if (durationUs <= 0n) return null
+  const share = Number(waitMs) / (Number(durationUs) / 1000)
+  return Number.isFinite(share) ? share : null
 }
 
 /**
@@ -175,68 +181,68 @@ export function waitShare(families: readonly DatabaseCityQueryFamily[]): number 
  *
  * This is the same ratio the aggregate street load is graded by, so a road ribbon and the street it
  * runs along are coloured by one rule rather than by two that happen to share a palette. Null when
- * no family reported waiting or none reported executions: an unmeasured ratio is not a zero one.
+ * any family is unmeasured or none reported executions. This standalone helper describes history;
+ * gradeRoads selects the city-wide recent basis before considering the families on one road.
  */
 export function roadDelay(families: readonly DatabaseCityQueryFamily[]): number | null {
-  let waitMs = 0
-  let executions = 0
-  let sawWait = false
+  let waitMs = 0n
+  let executions = 0n
   for (const family of families) {
-    const wait = toNumber(family.totalWaitMilliseconds)
-    const count = toNumber(family.executionCount)
-    if (wait !== null) {
-      waitMs += wait
-      sawWait = true
-    }
-    if (count !== null) executions += count
+    const wait = trafficInteger(family.totalWaitMilliseconds)
+    const count = trafficInteger(family.executionCount)
+    if (wait === null || count === null) return null
+    waitMs += wait
+    executions += count
   }
-  if (!sawWait || executions <= 0) return null
-  return waitMs / executions
+  return trafficDelay(executions, waitMs)
 }
 
 /**
  * Mean wait milliseconds per execution inside the recent traffic window.
  *
- * Returns `null` for the delay whenever the window was published but nothing overlapped it, which
- * grades `unknown`. That is deliberately not `free`: a road nobody captured and a road nobody drove
- * are different claims, and only the second one is green.
- *
- * `published` is false when no matched family carries a window at all — an archive or a fixture page
- * built before it existed. Callers fall back to the retained totals there rather than greying out a
- * city that has perfectly good evidence of a different kind.
+ * A covered subset never stands for the whole road. Callers grading a subset must supply the basis
+ * selected from the whole city so a missing family cannot fall back to retained history.
  */
-export function recentRoadDelay(families: readonly DatabaseCityQueryFamily[]): {
+export function recentRoadDelay(
+  families: readonly DatabaseCityQueryFamily[],
+  basis: TrafficBasis = trafficBasis(families),
+): {
   delay: number | null
   published: boolean
   covered: boolean
+  complete: boolean
+  coveredFamilyCount: number
+  familyCount: number
   executions: number | null
   windowMinutes: number | null
 } {
-  let published = false
-  let covered = false
-  let waitMs = 0
-  let executions = 0
-  let windowMinutes: number | null = null
+  let coveredFamilyCount = 0
+  let waitMs = 0n
+  let executions = 0n
   for (const family of families) {
-    const recent = family.recentActivity
-    if (!recent) continue
-    published = true
-    if (windowMinutes === null) windowMinutes = recent.windowMinutes
-    if (!recent.covered) continue
-    covered = true
-    waitMs += toNumber(recent.totalWaitMilliseconds) ?? 0
-    executions += toNumber(recent.executionCount) ?? 0
+    const sample = familyTrafficMeasurement(family, basis)
+    if (!sample.covered) continue
+    coveredFamilyCount += 1
+    waitMs += sample.waitMilliseconds!
+    executions += sample.executions!
   }
-  if (!published) return { delay: null, published: false, covered: false, executions: null, windowMinutes: null }
-  if (!covered) return { delay: null, published: true, covered: false, executions: null, windowMinutes }
-  // Covered with no executions is a measured quiet street, not an unmeasured one, so it grades free
-  // rather than unknown. Query Store only writes a bucket when something ran, so this is rare.
-  return { delay: executions > 0 ? waitMs / executions : 0, published: true, covered: true, executions, windowMinutes }
+  const published = basis.kind === 'recent'
+  const complete = published && families.length > 0 && coveredFamilyCount === families.length
+  return {
+    delay: complete ? trafficDelay(executions, waitMs, true) : null,
+    published,
+    covered: published && coveredFamilyCount > 0,
+    complete,
+    coveredFamilyCount: published ? coveredFamilyCount : 0,
+    familyCount: families.length,
+    executions: complete && Number.isFinite(Number(executions)) ? Number(executions) : null,
+    windowMinutes: basis.window?.windowMinutes ?? null,
+  }
 }
 
 /** The ladder itself. Shared by the co-reference roads and by the aggregate street load. */
 export function congestionFromDelay(delay: number | null): CongestionGrade {
-  if (delay === null || !Number.isFinite(delay)) return 'unknown'
+  if (delay === null || !Number.isFinite(delay) || delay < 0) return 'unknown'
   if (delay >= SEVERE_DELAY_MS_PER_EXECUTION) return 'severe'
   if (delay >= HEAVY_DELAY_MS_PER_EXECUTION) return 'heavy'
   if (delay >= MODERATE_DELAY_MS_PER_EXECUTION) return 'moderate'
@@ -264,12 +270,13 @@ export function gradeRoads(
   liveBlocking: readonly LiveBlockingEdge[] = [],
 ): RoadTraffic[] {
   const blockedKeys = new Set(liveBlocking.filter(edge => edge.blockedSessionCount > 0).map(edge => edge.objectKey))
+  const basis = trafficBasis(families)
   return routes.map(route => {
     const { executions, familyIds } = roadVolume(route, families)
     const matched = families.filter(family => familyIds.includes(family.familyId))
-    const share = waitShare(matched)
+    const share = waitShare(matched, basis)
     const retainedDelay = roadDelay(matched)
-    const recent = recentRoadDelay(matched)
+    const recent = recentRoadDelay(matched, basis)
     // The window wins wherever it exists, including when it is empty: a street that carried nothing
     // in the last quarter of an hour is not congested now, whatever the day's totals say. Only a
     // page that never published a window falls back to those totals.
@@ -309,28 +316,27 @@ function describe(
 ): string {
   const volume =
     executions === null
-      ? 'No captured query family names both endpoints, so no traffic volume is claimed.'
-      : `${executions.toLocaleString()} captured execution(s) across ${familyCount} query family/families.`
+      ? familyCount === 0
+        ? 'No captured query family names both endpoints, so no traffic volume is claimed.'
+        : `Retained execution volume is unavailable for ${familyCount} contributing query families.`
+      : `${executions.toLocaleString()} captured execution(s) across ${familyCount} query family/families (retained history).`
+  const coverage = recent.published && !recent.complete
+    ? ` Partial or missing capture in the recent window: ${recent.coveredFamilyCount} of ${recent.familyCount} families have usable runtime and wait capture; missing capture is unknown, not a clear road.`
+    : ''
   if (blocked) {
-    return `${volume} Graded ${CONGESTION_LABELS[grade].toLowerCase()} because a live lock wait resolves to an endpoint of this road.`
+    return `${volume}${coverage} Graded ${CONGESTION_LABELS[grade].toLowerCase()} because a live lock wait resolves to an endpoint of this road.`
   }
-  if (recent.published && !recent.covered) {
-    return `${volume} Nothing was captured in the last ${recent.windowMinutes} minutes, so no current congestion grade is claimed — that is missing capture, not a clear road.`
+  if (recent.published && !recent.complete) {
+    return `${volume}${coverage} No current congestion grade is claimed.`
   }
   if (delay === null) {
     return `${volume} Captured waiting per execution is unavailable, so no congestion grade is claimed.`
   }
   const shareText = share === null ? '' : `, ${(share * 100).toFixed(1)}% of captured duration`
   if (recent.published) {
-    return `${(recent.executions ?? 0).toLocaleString()} execution(s) in the last ${recent.windowMinutes} minutes, ${delay.toFixed(2)} ms of waiting each — ${CONGESTION_LABELS[grade].toLowerCase()}. ${volume}`
+    return `${(recent.executions ?? 0).toLocaleString()} execution(s) in the last ${recent.windowMinutes} minutes, ${delay.toFixed(2)} ms of waiting each — ${CONGESTION_LABELS[grade].toLowerCase()}. ${volume} Recent figures are whole-family totals, not a per-building allocation.`
   }
   return `${volume} ${delay.toFixed(2)} ms of captured waiting per execution${shareText} — ${CONGESTION_LABELS[grade].toLowerCase()}.`
-}
-
-function toNumber(value: string | null | undefined): number | null {
-  if (value === null || value === undefined || value.trim() === '') return null
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : null
 }
 
 export interface TrafficWindowDisclosure {
@@ -346,35 +352,41 @@ export interface TrafficWindowDisclosure {
  * The colours changed meaning: they used to be the whole retained history and are now the last few
  * minutes of it. A map that quietly swapped one for the other would be reporting a different claim
  * under an unchanged legend, so the legend has to say which one it is -- including the awkward case
- * where the window is published and empty, which is grey rather than green and looks like a fault
- * unless it is explained.
+ * where the window is published but capture is missing. That is grey, unlike a covered zero.
+ *
+ * `observedAt` is the workload evidence timestamp, never the time an HTTP request completed.
+ * Archive and edge sources show captured windows, not a promise to refresh or a reading of now.
  */
 export function describeTrafficWindow(
   families: readonly DatabaseCityQueryFamily[],
-  refreshedAt: string | null,
+  observedAt: string | null,
   refreshIntervalMs: number,
+  sourceMode: 'live' | 'archive' | 'edge' = 'live',
 ): TrafficWindowDisclosure {
-  let published = false
-  let covered = false
-  let windowMinutes: number | null = null
-  for (const family of families) {
-    const recent = family.recentActivity
-    if (!recent) continue
-    published = true
-    if (windowMinutes === null) windowMinutes = recent.windowMinutes
-    if (recent.covered) covered = true
-  }
+  const staticSource = sourceMode !== 'live'
+  const basis = trafficBasis(families)
+  const { published, covered, windowMinutes } = recentRoadDelay(families, basis)
+  const coverage = trafficCoverageNote(families, basis, !staticSource)
 
   const seconds = Math.max(1, Math.round(refreshIntervalMs / 1000))
-  const cadence = refreshedAt === null
-    ? `The city re-reads itself every ${seconds} seconds.`
-    : `The city re-reads itself every ${seconds} seconds; last read at ${new Date(refreshedAt).toLocaleTimeString()}.`
+  const observation = observedAt !== null && Number.isFinite(Date.parse(observedAt))
+    ? `Workload observed at ${new Date(observedAt).toLocaleString()}.`
+    : 'Workload observation time unknown.'
+  const cadence = staticSource
+    ? `This ${sourceMode} snapshot does not refresh automatically. ${observation}`
+    : `The city checks for updates every ${seconds} seconds; polling is not a measurement timestamp. ${observation}`
+  const period = staticSource
+    ? windowMinutes === null ? 'the captured window' : `the captured ${windowMinutes}-minute window`
+    : windowMinutes === null ? 'the recent window' : `the last ${windowMinutes} minutes`
+  const windowEnd = staticSource && basis.window
+    ? ` The captured window ends at ${new Date(basis.window.windowEnd).toLocaleString()}, not at the current time.`
+    : ''
 
   if (!published) {
     return {
       headline: 'Road colour is the whole retained history.',
       detail: 'This page published no recent-activity window, so the colours are cumulative totals '
-        + 'over everything Query Store still retains rather than a reading of current traffic.',
+        + `over everything Query Store still retains rather than a reading of current traffic. ${cadence}`,
       windowMinutes: null,
       covered: false,
     }
@@ -382,18 +394,19 @@ export function describeTrafficWindow(
 
   if (!covered) {
     return {
-      headline: `Query Store captured nothing in the last ${windowMinutes} minutes.`,
-      detail: `Every road is drawn grey: unmeasured, not clear. ${cadence}`,
+      headline: `Query Store captured nothing usable in ${period}.`,
+      detail: `Traffic in this window is unmeasured, not clear.${staticSource ? '' : ' Live blocking can still override it.'} ${coverage} ${cadence}${windowEnd}`,
       windowMinutes,
       covered: false,
     }
   }
 
   return {
-    headline: `Road colour is wait per execution over the last ${windowMinutes} minutes.`,
+    headline: `Road colour is wait per execution over ${period}.`,
     detail: 'Query Store buckets its runtime statistics into intervals, so a bucket overlapping the '
       + 'window is counted whole rather than pro-rated -- it never said how the work was spread '
-      + `inside it. Roads no interval covered are grey, not green. ${cadence}`,
+      + 'inside it. Missing or partial coverage stays unknown, not green. Street placement requires '
+      + `a recent plan/runtime-weighted wait split; absent splits stay unplaced, never rescaled from history. ${coverage} ${cadence}${windowEnd}`,
     windowMinutes,
     covered: true,
   }

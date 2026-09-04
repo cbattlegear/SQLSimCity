@@ -2,11 +2,13 @@ import type {
   DatabaseCityObjectWaitShare,
   DatabaseCityPage,
   DatabaseCityQueryFamily,
+  DatabaseCityRecentActivity,
   DatabaseCityRoute,
   DatabaseCitySchema,
   DatabaseCityWaitAttribution,
   QueryAttributionConfidence,
 } from './databaseCityContracts'
+import { sameTrafficWindow, trafficInteger, validWaitAttribution } from './cityTrafficWindow'
 
 /**
  * Folds a later bounded object page onto everything already loaded.
@@ -104,6 +106,7 @@ function foldFamily(
     confidence: mergedConfidence(objectIds, previous, next),
     waitAttribution: mergeWaitAttribution(
       previous.waitAttribution, next.waitAttribution, next.totalWaitMilliseconds),
+    recentActivity: mergeRecentActivity(previous.recentActivity, next.recentActivity),
     // Keep the newest page's prose but, when an earlier page resolved objects this page could not,
     // add a sentence so the server's "named no object on this page" wording cannot silently
     // contradict a set that now spans several pages. Rebuilt from `next.rationale` every fold, so a
@@ -111,6 +114,32 @@ function foldFamily(
     rationale: namedOffNewestPage
       ? `${next.rationale} Earlier pages resolved objects this page did not, so the merged set spans more than the newest page named.`
       : next.rationale,
+  }
+}
+
+function mergeRecentActivity(
+  previous: DatabaseCityRecentActivity | null | undefined,
+  next: DatabaseCityRecentActivity | null | undefined,
+): DatabaseCityRecentActivity | null | undefined {
+  if (!previous || !next || !sameTrafficWindow(previous, next)
+    || previous.covered !== next.covered
+    || previous.executionCount !== next.executionCount
+    || previous.totalDurationMicroseconds !== next.totalDurationMicroseconds
+    || previous.totalWaitMilliseconds !== next.totalWaitMilliseconds
+    || previous.waitMillisecondsByCategory === null || next.waitMillisecondsByCategory === null) return next
+  const total = trafficInteger(next.totalWaitMilliseconds)
+  const earlierAllocation = validWaitAttribution(previous.waitAttribution, total)
+  const newerAllocation = validWaitAttribution(next.waitAttribution, total)
+  // Missing wait capture or allocation on the newer page must remain missing. In particular, an
+  // earlier captured zero cannot overwrite the backend's explicit null wait-capture marker.
+  if (!earlierAllocation || !newerAllocation) return next
+  return {
+    ...next,
+    waitAttribution: mergeWaitAttribution(
+      earlierAllocation,
+      newerAllocation,
+      next.totalWaitMilliseconds,
+    ),
   }
 }
 
@@ -160,15 +189,15 @@ function mergeWaitAttribution(
   const shares = new Map<string, DatabaseCityObjectWaitShare>()
   for (const share of previous.objects) shares.set(share.objectId, share)
   for (const share of next.objects) shares.set(share.objectId, share)
-  const unioned = [...shares.values()]
+  const unioned = [...shares.values()].sort((a, b) => a.objectId.localeCompare(b.objectId))
 
-  let total: bigint
+  const total = trafficInteger(totalWaitMilliseconds)
+  if (total === null) return next
   let sum = 0n
-  try {
-    total = BigInt(totalWaitMilliseconds)
-    for (const share of unioned) sum += BigInt(share.waitMilliseconds)
-  } catch {
-    return next
+  for (const share of unioned) {
+    const milliseconds = trafficInteger(share.waitMilliseconds)
+    if (milliseconds === null) return next
+    sum += milliseconds
   }
   if (sum > total) return next
 

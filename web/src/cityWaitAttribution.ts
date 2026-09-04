@@ -1,11 +1,14 @@
 import type { DatabaseCityQueryFamily, DatabaseCityWaitAttribution } from './databaseCityContracts'
+import {
+  familyTrafficMeasurement, trafficBasis, trafficCoverageNote, trafficInteger, type TrafficBasis,
+} from './cityTrafficWindow'
 
 /**
  * Collecting the wait time each building was apportioned, across every ranked query family.
  *
  * The measurement being spread is Query Store's: one wait total per query family. The spreading is
  * the optimizer's estimated cost share for the objects that family's plans read. So a building's
- * figure here is **measured milliseconds divided by a modelled ratio** — real time, placed by an
+ * figure here is **measured milliseconds multiplied by a modelled ratio** — real time, placed by an
  * estimate. That is a different claim from the strict attributed exposure a building already
  * carries, which is only ever assigned when a family named that object and nothing else, and it must
  * never be presented as though it were the same thing.
@@ -33,32 +36,33 @@ export interface WaitAttributionTotals {
   readonly measured: bigint
   /** Families that carried an apportionment at all. */
   readonly apportioned: number
+  readonly basis: TrafficBasis
+  /** These families have no usable wait measurement; they are excluded, not counted as zero. */
+  readonly unknownFamilyIds: readonly string[]
   readonly note: string
 }
 
 function parse(value: string | null | undefined): bigint {
-  if (value === null || value === undefined) return 0n
-  try {
-    const parsed = BigInt(value.trim())
-    return parsed < 0n ? 0n : parsed
-  } catch {
-    return 0n
-  }
+  return trafficInteger(value) ?? 0n
 }
 
 /** The attribution a family carries, or null when it carries none. */
 export function familyAttribution(
   family: DatabaseCityQueryFamily,
+  basis: TrafficBasis = trafficBasis([family]),
 ): DatabaseCityWaitAttribution | null {
-  const attribution = family.waitAttribution
+  const attribution = familyTrafficMeasurement(family, basis).attribution
   if (!attribution) return null
   return attribution.objects.length === 0 ? null : attribution
 }
 
 /** Apportioned wait milliseconds per object for one family. Empty when nothing was apportioned. */
-export function familyWaitByObject(family: DatabaseCityQueryFamily): Map<string, bigint> {
+export function familyWaitByObject(
+  family: DatabaseCityQueryFamily,
+  basis: TrafficBasis = trafficBasis([family]),
+): Map<string, bigint> {
   const waits = new Map<string, bigint>()
-  const attribution = familyAttribution(family)
+  const attribution = familyAttribution(family, basis)
   if (!attribution) return waits
   for (const entry of attribution.objects) {
     const milliseconds = parse(entry.waitMilliseconds)
@@ -68,10 +72,10 @@ export function familyWaitByObject(family: DatabaseCityQueryFamily): Map<string,
   return waits
 }
 
-/** The estimated cost share a family's plans placed on each object it reads. */
+/** Historical plan shares fix visit order. Recent runtime weights must never move the geography. */
 export function familyCostShares(family: DatabaseCityQueryFamily): Map<string, number> {
   const shares = new Map<string, number>()
-  const attribution = familyAttribution(family)
+  const attribution = family.waitAttribution
   if (!attribution) return shares
   for (const entry of attribution.objects) {
     if (!Number.isFinite(entry.estimatedCostShare)) continue
@@ -87,17 +91,24 @@ export function familyCostShares(family: DatabaseCityQueryFamily): Map<string, n
 export function attributedWaits(
   families: readonly DatabaseCityQueryFamily[],
   drawnObjectIds?: ReadonlySet<string>,
+  basis: TrafficBasis = trafficBasis(families),
 ): WaitAttributionTotals {
   const byObject = new Map<string, { milliseconds: bigint; familyIds: string[] }>()
   let unattributed = 0n
   let measured = 0n
   let apportioned = 0
+  const unknownFamilyIds: string[] = []
 
   for (const family of families) {
-    measured += parse(family.totalWaitMilliseconds)
-    const attribution = family.waitAttribution
+    const sample = familyTrafficMeasurement(family, basis)
+    if (sample.waitMilliseconds === null) {
+      unknownFamilyIds.push(family.familyId)
+      continue
+    }
+    measured += sample.waitMilliseconds
+    const attribution = sample.attribution
     if (!attribution) {
-      unattributed += parse(family.totalWaitMilliseconds)
+      unattributed += sample.waitMilliseconds
       continue
     }
 
@@ -133,7 +144,10 @@ export function attributedWaits(
     unattributed,
     measured,
     apportioned,
-    note: describe(totals.size, apportioned, families.length, unattributed, measured),
+    basis,
+    unknownFamilyIds,
+    note: `${trafficCoverageNote(families, basis)} ${describe(totals.size, apportioned, families.length, unattributed, measured)}`
+      + (unknownFamilyIds.length > 0 ? ' Totals describe only measured contributors; unknown waits are not zero.' : ''),
   }
 }
 
@@ -146,7 +160,7 @@ function describe(
 ): string {
   if (families === 0) return 'No ranked query family was captured for this page, so no wait time is placed.'
   if (apportioned === 0) {
-    return 'No compiled plan carried a cost estimate for these families, so their measured wait time is not placed on any building.'
+    return 'No usable wait split in this window was supplied for these families, so their measured wait time is not placed on any building.'
   }
   const share = measured > 0n ? Number((unattributed * 1000n) / measured) / 10 : 0
   return (

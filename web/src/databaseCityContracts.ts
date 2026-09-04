@@ -213,7 +213,8 @@ export interface DatabaseCityQueryFamily {
   /**
    * What this family did inside the recent traffic window, which is what street colour is graded
    * from. Absent on a page built before the window existed — an archive, or a fixture — and there
-   * the retained totals are all there is, so grading falls back to them rather than to grey.
+   * the retained totals are all there is. Historical fallback is allowed only when no family in
+   * the city publishes a recent window; a missing family in a recent city remains unknown.
    */
   recentActivity?: DatabaseCityRecentActivity | null
 }
@@ -221,10 +222,10 @@ export interface DatabaseCityQueryFamily {
 /**
  * A query family's activity inside the recent traffic window.
  *
- * `covered` is the field that matters. It is false when no retained Query Store interval overlapped
- * the window at all, and every count below is then zero — which is "nothing was captured here", not
- * "this street is quiet". Rendering the two the same is the easiest way to make the map claim a road
- * is clear when it was never measured.
+ * `covered` reports runtime coverage only. It is false when no retained Query Store runtime interval
+ * overlapped the window. Wait capture is separate: null wait attribution/categories mean some
+ * overlapping work had no usable wait capture, even if `totalWaitMilliseconds` is zero. Neither
+ * missing runtime nor missing wait capture establishes a quiet street.
  *
  * Counts are summed from intervals that *overlap* the window, not ones contained by it, because
  * Query Store's current interval is still open and holds the live traffic. They are therefore not
@@ -239,6 +240,14 @@ export interface DatabaseCityRecentActivity {
   executionCount: string
   totalDurationMicroseconds: string
   totalWaitMilliseconds: string
+  /**
+   * Recent plan/runtime-weighted split only. Null means incomplete wait capture; a non-null split
+   * with no objects and the whole remainder means captured waits whose plans could not be placed.
+   * Optional on older payloads. Never rescale a retained split to fill this in.
+   */
+  waitAttribution?: DatabaseCityWaitAttribution | null
+  /** Recent captured categories; null means incomplete wait capture, never measured zero. */
+  waitMillisecondsByCategory?: Record<string, string> | null
   rationale: string
 }
 

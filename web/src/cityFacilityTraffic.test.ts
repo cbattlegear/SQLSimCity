@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Evidence } from './contracts'
-import type { DatabaseCityQueryFamily } from './databaseCityContracts'
+import type { DatabaseCityQueryFamily, DatabaseCityRecentActivity } from './databaseCityContracts'
 import {
   LANE_COLORS,
   LANE_WIDTH_PER_DOUBLING,
@@ -43,6 +43,99 @@ function family(
 }
 
 const objects = [{ objectId: 'a' }, { objectId: 'b' }]
+
+function recent(overrides: Partial<DatabaseCityRecentActivity> = {}): DatabaseCityRecentActivity {
+  const wait = overrides.totalWaitMilliseconds ?? '0'
+  return {
+    windowMinutes: 15, windowStart: '2024-05-01T00:45:00Z', windowEnd: '2024-05-01T01:00:00Z',
+    covered: true, executionCount: '0', totalDurationMicroseconds: '0', totalWaitMilliseconds: '0',
+    waitAttribution: { objects: [], unattributedWaitMilliseconds: wait, plansRead: 0, rationale: 'No usable plan' },
+    waitMillisecondsByCategory: { CPU: wait },
+    rationale: 'test', ...overrides,
+  }
+}
+
+describe('recent facility traffic', () => {
+  it('uses recent categories, never the retained facility mix', () => {
+    const traffic = projectFacilityTraffic([family({
+      familyId: 'f1', objectIds: ['a'], waitMillisecondsByCategory: { Lock: '1000000' },
+      recentActivity: recent({
+        executionCount: '10', totalWaitMilliseconds: '20', waitMillisecondsByCategory: { CPU: '20' },
+      }),
+    })], objects)
+    expect(traffic.lanes).toHaveLength(1)
+    expect(traffic.lanes[0].facility).toBe('cpu')
+    expect(traffic.lanes[0].waitMilliseconds).toBe('20')
+    expect(traffic.lanes[0].rationale).toContain('Recent window')
+    expect(facilityMixLabel(facilityShares('a', traffic))).toContain('recent 15 min')
+  })
+
+  it('leaves an old-hot family quiet when its covered recent executions and waits are zero', () => {
+    const traffic = projectFacilityTraffic([family({
+      familyId: 'f1', objectIds: ['a'], waitMillisecondsByCategory: { Lock: '1000000' },
+      recentActivity: recent(),
+    })], objects)
+    expect(traffic.lanes).toHaveLength(0)
+    expect(traffic.unknownFamilyIds).toEqual([])
+    expect(traffic.unclassifiedWaitMilliseconds).toBe('0')
+  })
+
+  it('keeps missing recent categories unclassified exactly, never borrowing the retained breakdown', () => {
+    const traffic = projectFacilityTraffic([family({
+      familyId: 'f1', objectIds: ['a'], waitMillisecondsByCategory: { Lock: '1000000' },
+      recentActivity: recent({
+        executionCount: '1', totalWaitMilliseconds: '9007199254740993', waitMillisecondsByCategory: undefined,
+      }),
+    })], objects)
+    expect(traffic.lanes).toHaveLength(0)
+    expect(traffic.unknownFamilyIds).toEqual(['f1'])
+    expect(traffic.unclassifiedWaitMilliseconds).toBe('9007199254740993')
+    expect(traffic.note).toContain('unknown')
+  })
+
+  it('globally excludes missing windows and qualifies the remaining category mix as partial', () => {
+    const traffic = projectFacilityTraffic([
+      family({ familyId: 'missing', objectIds: ['a'], waitMillisecondsByCategory: { Lock: '1000000' } }),
+      family({
+        familyId: 'covered', objectIds: ['a'], recentActivity: recent({
+          executionCount: '1', totalWaitMilliseconds: '10', waitMillisecondsByCategory: { CPU: '10' },
+        }),
+      }),
+    ], objects)
+    expect(traffic.lanes).toHaveLength(1)
+    expect(traffic.lanes[0].facility).toBe('cpu')
+    expect(traffic.unknownFamilyIds).toEqual(['missing'])
+    expect(facilityMixLabel(facilityShares('a', traffic))).toContain('partial captured categories')
+    expect(traffic.lanes[0].rationale).toContain('Partial category evidence')
+  })
+
+  it.each([{ CPU: 'bad' }, { CPU: '-1' }, { CPU: '5' }, { CPU: '20' }])(
+    'does not turn malformed or partial recent categories into a complete breakdown: %j',
+    categories => {
+      const traffic = projectFacilityTraffic([family({
+        familyId: 'f1', objectIds: ['a'], recentActivity: recent({
+          executionCount: '1', totalWaitMilliseconds: '10', waitMillisecondsByCategory: categories,
+        }),
+      })], objects)
+      expect(traffic.lanes).toHaveLength(0)
+      expect(traffic.unclassifiedWaitMilliseconds).toBe('10')
+      expect(traffic.unknownFamilyIds).toEqual(['f1'])
+    },
+  )
+
+  it.each(['0', '10'])('does not call runtime-covered executions %s quiet when wait capture is null', executionCount => {
+    const traffic = projectFacilityTraffic([family({
+      familyId: 'runtime-only', objectIds: ['a'],
+      recentActivity: recent({
+        executionCount, totalWaitMilliseconds: '0', waitAttribution: null, waitMillisecondsByCategory: null,
+      }),
+    })], objects)
+    expect(traffic.unknownFamilyIds).toEqual(['runtime-only'])
+    expect(traffic.lanes).toHaveLength(0)
+    expect(traffic.note).toContain('unknown')
+    expect(traffic.note).not.toContain('All covered families report no executions and no waits')
+  })
+})
 
 describe('routeWaitCategory', () => {
   it('routes resource waits to the facility that owns the resource', () => {
@@ -466,4 +559,3 @@ describe('facilityMixLabel', () => {
     expect(facilityMixLabel([])).toBeNull()
   })
 })
-

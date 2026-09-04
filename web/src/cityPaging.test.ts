@@ -4,6 +4,7 @@ import type {
   DatabaseCityObject,
   DatabaseCityPage,
   DatabaseCityQueryFamily,
+  DatabaseCityRecentActivity,
   DatabaseCityRoute,
   DatabaseCitySchema,
   DatabaseCityWaitAttribution,
@@ -128,6 +129,112 @@ function page(overrides: Partial<DatabaseCityPage> = {}): DatabaseCityPage {
     ...overrides,
   }
 }
+
+function recent(overrides: Partial<DatabaseCityRecentActivity> = {}): DatabaseCityRecentActivity {
+  return {
+    windowMinutes: 15, windowStart: '2024-05-01T00:45:00Z', windowEnd: '2024-05-01T01:00:00Z',
+    covered: true, executionCount: '2', totalDurationMicroseconds: '1000', totalWaitMilliseconds: '100',
+    rationale: 'test', ...overrides,
+  }
+}
+
+describe('paging recent attribution', () => {
+  const total = '900719925474099312345'
+  const first = page({ topQueryFamilies: [family('f1', ['a'], {
+    waitAttribution: waitAttribution([['a', '30']], '90', 1),
+    recentActivity: recent({
+      totalWaitMilliseconds: total,
+      waitAttribution: waitAttribution([['a', '9007199254740993']], total, 2),
+      waitMillisecondsByCategory: { Lock: total },
+    }),
+  })] })
+  const second = page({ topQueryFamilies: [family('f1', ['b'], {
+    waitAttribution: waitAttribution([['b', '40']], '90', 1),
+    recentActivity: recent({
+      totalWaitMilliseconds: total,
+      waitAttribution: waitAttribution([['b', '9007199254740997']], total, 3),
+      waitMillisecondsByCategory: { Lock: total },
+    }),
+  })] })
+
+  it('merges recent object shares separately with exact BigInt remainder and no doubled categories', () => {
+    const merged = mergeCityPage(first, second).topQueryFamilies[0]
+    const split = merged.recentActivity!.waitAttribution!
+    expect(split.objects.map(share => share.objectId)).toEqual(['a', 'b'])
+    expect(split.objects.map(share => share.waitMilliseconds)).toEqual(['9007199254740993', '9007199254740997'])
+    expect(split.unattributedWaitMilliseconds).toBe(String(BigInt(total) - 18014398509481990n))
+    expect(split.objects.reduce((sum, share) => sum + BigInt(share.waitMilliseconds), 0n)
+      + BigInt(split.unattributedWaitMilliseconds)).toBe(BigInt(total))
+    expect(split.plansRead).toBe(3)
+    expect(merged.waitAttribution!.unattributedWaitMilliseconds).toBe('20')
+    expect(merged.recentActivity!.waitMillisecondsByCategory).toEqual({ Lock: total })
+  })
+
+  it('is idempotent and order-independent for recent shares', () => {
+    const once = mergeCityPage(first, second)
+    const repeated = mergeCityPage(once, second)
+    const reversed = mergeCityPage(second, first)
+    expect(repeated.topQueryFamilies[0].recentActivity).toEqual(once.topQueryFamilies[0].recentActivity)
+    expect(reversed.topQueryFamilies[0].recentActivity!.waitAttribution)
+      .toEqual(once.topQueryFamilies[0].recentActivity!.waitAttribution)
+  })
+
+  it.each([
+    { windowStart: '2024-05-01T01:00:00Z', windowEnd: '2024-05-01T01:15:00Z' },
+    { windowMinutes: 30 },
+    { windowStart: 'malformed' },
+    { executionCount: '5' },
+    { totalDurationMicroseconds: '2000' },
+    { covered: false },
+  ])('never combines recent allocations from different windows or runtime weights: %j', change => {
+    const newer = {
+      ...second,
+      topQueryFamilies: [{
+        ...second.topQueryFamilies[0],
+        recentActivity: { ...second.topQueryFamilies[0].recentActivity!, ...change },
+      }],
+    }
+    const merged = mergeCityPage(first, newer).topQueryFamilies[0]
+    expect(merged.recentActivity!.waitAttribution!.objects.map(share => share.objectId)).toEqual(['b'])
+    expect(merged.objectIds).toEqual(['a', 'b'])
+  })
+
+  it('does not reuse an earlier split when the next page publishes no recent window', () => {
+    const merged = mergeCityPage(first, page({ topQueryFamilies: [family('f1', ['b'])] }))
+    expect(merged.topQueryFamilies[0].recentActivity).toBeUndefined()
+  })
+
+  it('refuses recent unions larger than the same-window measurement', () => {
+    const a = page({ topQueryFamilies: [family('f1', ['a'], {
+      recentActivity: recent({ waitAttribution: waitAttribution([['a', '80']], '100', 1) }),
+    })] })
+    const b = page({ topQueryFamilies: [family('f1', ['b'], {
+      recentActivity: recent({ waitAttribution: waitAttribution([['b', '80']], '100', 1) }),
+    })] })
+    const merged = mergeCityPage(a, b).topQueryFamilies[0].recentActivity!.waitAttribution!
+    expect(merged.objects.map(share => share.objectId)).toEqual(['b'])
+    expect(merged.unattributedWaitMilliseconds).toBe('20')
+  })
+
+  it.each([null, undefined])('preserves a newer missing recent wait capture marker: %s', missing => {
+    const captured = page({ topQueryFamilies: [family('f1', ['a'], {
+      recentActivity: recent({
+        executionCount: '0', totalWaitMilliseconds: '0',
+        waitAttribution: waitAttribution([['a', '0']], '0', 1),
+        waitMillisecondsByCategory: {},
+      }),
+    })] })
+    const unmeasured = page({ topQueryFamilies: [family('f1', ['b'], {
+      recentActivity: recent({
+        executionCount: '0', totalWaitMilliseconds: '0',
+        waitAttribution: missing, waitMillisecondsByCategory: missing,
+      }),
+    })] })
+    const merged = mergeCityPage(captured, unmeasured).topQueryFamilies[0].recentActivity!
+    expect(merged.waitAttribution).toBe(missing)
+    expect(merged.waitMillisecondsByCategory).toBe(missing)
+  })
+})
 
 describe('mergeCityPage', () => {
   it('keeps the routes an earlier page carried when a later page carries none', () => {

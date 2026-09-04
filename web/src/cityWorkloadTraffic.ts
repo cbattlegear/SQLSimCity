@@ -3,6 +3,10 @@ import { dedupePoints, nearestIntersectionId, type CityPlan } from './cityPlan'
 import type { DatabaseCityQueryFamily } from './databaseCityContracts'
 import { familyCostShares, familyWaitByObject } from './cityWaitAttribution'
 import { CONGESTION_COLORS, congestionFromDelay, type CongestionGrade } from './cityTraffic'
+import {
+  familyTrafficMeasurement, trafficBasis, trafficCoverageNote,
+  type FamilyTrafficMeasurement, type TrafficBasis,
+} from './cityTrafficWindow'
 
 /**
  * Building the city's traffic map out of the workload itself.
@@ -16,12 +20,12 @@ import { CONGESTION_COLORS, congestionFromDelay, type CongestionGrade } from './
  * Two quantities accumulate per street, and they are kept apart on purpose because they answer
  * different questions and are measured differently:
  *
- * - **executions** — Query Store's captured execution count for every family whose drawn journey uses
- *   this street, summed. Measured, and nothing else. It is reported, not drawn: street width is a
- *   constant now, for the reason given on {@link ROAD_WIDTH}.
+ * - **measuredExecutions** — executions in the city-wide traffic window. The separate retained
+ *   `executions` fixes route assignment and label ordering, not the colour denominator.
  * - **wait milliseconds** — the wait time apportioned to the buildings at each end of the leg. The
  *   milliseconds are measured; which building they were placed on is the optimizer's estimated cost
- *   share; and spreading them along a route is this module's model. Colour comes from the ratio of
+ *   share weighted by runtime from that same window; spreading them along a route is this module's
+ *   model. No recent split means unplaced, not retained waits rescaled. Colour comes from the ratio of
  *   the two, which is the mean waiting a single execution carried over this street.
  *
  * There is deliberately no single blended "traffic score". Executions are a count and waits are a
@@ -39,20 +43,23 @@ import { CONGESTION_COLORS, congestionFromDelay, type CongestionGrade } from './
 
 export interface StreetLoad {
   readonly edgeId: number
-  /** Captured executions routed over this street. */
+  /** Retained executions, used only for stable geography and label priority. */
   readonly executions: number
+  /** Grading denominator in the selected window; null for incomplete capture. */
+  readonly measuredExecutions: number | null
   /**
-   * Apportioned wait milliseconds the journeys crossing this street carried. Like `executions`, this
+   * Apportioned wait milliseconds the journeys crossing this street carried. Like `measuredExecutions`, this
    * is a per-traversal intensity rather than a divisible share: a street is charged the whole wait of
-   * every leg that crosses it, so summing this across streets is meaningless. The two fields divide
-   * cleanly into each other, which is the only use it is put to.
+   * every leg that crosses it, so summing this across streets is meaningless. These same-window fields divide
+   * cleanly into each other. Null means missing capture or placement, never zero wait.
    */
-  readonly waitMilliseconds: number
+  readonly waitMilliseconds: number | null
   /** Mean waiting one execution carried over this street, or null when nothing routed here. */
   readonly delayPerExecution: number | null
   readonly grade: CongestionGrade
   readonly color: number
   readonly points: ReadonlyArray<{ x: number; z: number }>
+  readonly rationale: string
 }
 
 /** One family's journey through the buildings it reads, drawn only when that family is selected. */
@@ -63,7 +70,8 @@ export interface FamilyTrip {
   readonly edgeIds: readonly number[]
   readonly points: Array<{ x: number; z: number }>
   readonly executions: number
-  readonly waitMilliseconds: number
+  readonly measuredExecutions: number | null
+  readonly waitMilliseconds: number | null
 }
 
 export interface WorkloadTraffic {
@@ -76,6 +84,7 @@ export interface WorkloadTraffic {
   readonly resident: readonly string[]
   /** Families whose buildings could not be placed on the street network. */
   readonly unroutable: readonly string[]
+  readonly basis: TrafficBasis
   readonly note: string
 }
 
@@ -85,6 +94,7 @@ const EMPTY: WorkloadTraffic = {
   busiest: 0,
   resident: [],
   unroutable: [],
+  basis: { kind: 'retained', window: null },
   note: 'No ranked query family could be routed through this page, so no traffic is drawn.',
 }
 
@@ -154,6 +164,15 @@ export function assignWorkloadTraffic(
   families: readonly DatabaseCityQueryFamily[],
 ): WorkloadTraffic {
   if (families.length === 0) return EMPTY
+  const basis = trafficBasis(families)
+  const coverageNote = trafficCoverageNote(families, basis)
+  const unplaced = families.filter(family => {
+    const sample = familyTrafficMeasurement(family, basis)
+    return !sample.quiet && !sample.attribution?.objects.length
+  }).length
+  const allocationNote = unplaced > 0
+    ? ` ${unplaced} families have no usable wait placement in this window; their street contribution is unknown, not zero.`
+    : ''
 
   const nodeByObject = new Map<string, number | null>()
   const nodeFor = (objectId: string): number | null => {
@@ -173,7 +192,12 @@ export function assignWorkloadTraffic(
   }
 
   const demands: TravelDemand[] = []
-  const routed = new Map<number, { family: DatabaseCityQueryFamily; stops: string[]; waits: Map<string, bigint> }>()
+  const routed = new Map<number, {
+    family: DatabaseCityQueryFamily
+    stops: string[]
+    waits: Map<string, bigint>
+    sample: FamilyTrafficMeasurement
+  }>()
   const resident: string[] = []
   const unroutable: string[] = []
 
@@ -204,13 +228,18 @@ export function assignWorkloadTraffic(
       return
     }
 
-    routed.set(index, { family, stops, waits: familyWaitByObject(family) })
+    routed.set(index, {
+      family, stops, waits: familyWaitByObject(family, basis), sample: familyTrafficMeasurement(family, basis),
+    })
     const nodeIds = stops.map(objectId => nodeFor(objectId)!)
     for (const demand of tourDemands(String(index), nodeIds, executions)) demands.push(demand)
   })
 
   if (demands.length === 0) {
-    return { ...EMPTY, resident, unroutable, note: note(0, 0, resident.length, unroutable.length) }
+    return {
+      ...EMPTY, resident, unroutable, basis,
+      note: `${coverageNote}${allocationNote} ${note(0, 0, resident.length, unroutable.length)}`,
+    }
   }
 
   const assignment = assignTraffic(plan.graph, plan.roadProperties, demands)
@@ -224,6 +253,9 @@ export function assignWorkloadTraffic(
 
   const executionsByEdge = new Map<number, number>()
   const waitByEdge = new Map<number, number>()
+  const measuredExecutionsByEdge = new Map<number, number | null>()
+  const unknownEdges = new Set<number>()
+  const familiesByEdge = new Map<number, Set<number>>()
   const tripEdges = new Map<number, number[]>()
   const tripPoints = new Map<number, Array<{ x: number; z: number }>>()
 
@@ -249,10 +281,24 @@ export function assignWorkloadTraffic(
       return wait / adjacentLegs
     }
     const legWait = shareOf(legIndex) + shareOf(legIndex + 1)
+    const sample = entry.sample
+    const placed = sample.quiet || !!sample.attribution?.objects.length
+    const known = sample.covered && placed
+      && (legWait > 0 || sample.waitMilliseconds === 0n
+        || sample.attribution?.unattributedWaitMilliseconds === '0')
 
     for (const edgeId of trip.route.edgeIds) {
       executionsByEdge.set(edgeId, (executionsByEdge.get(edgeId) ?? 0) + trip.trips)
       waitByEdge.set(edgeId, (waitByEdge.get(edgeId) ?? 0) + legWait)
+      const previousCount = measuredExecutionsByEdge.get(edgeId)
+      const count = sample.executions === null ? null : Number(sample.executions)
+      measuredExecutionsByEdge.set(edgeId,
+        previousCount === null || count === null || !Number.isFinite(count)
+          ? null : (previousCount ?? 0) + count)
+      if (!known) unknownEdges.add(edgeId)
+      const contributors = familiesByEdge.get(edgeId) ?? new Set<number>()
+      contributors.add(index)
+      familiesByEdge.set(edgeId, contributors)
     }
 
     const edges = tripEdges.get(index) ?? []
@@ -270,18 +316,26 @@ export function assignWorkloadTraffic(
   for (const [edgeId, executions] of executionsByEdge) {
     const edge = edgeById.get(edgeId)
     if (!edge || executions <= 0) continue
-    const waitMilliseconds = waitByEdge.get(edgeId) ?? 0
-    const delayPerExecution = waitMilliseconds / executions
-    const grade = waitMilliseconds > 0 ? congestionFromDelay(delayPerExecution) : 'unknown'
+    const measuredExecutions = measuredExecutionsByEdge.get(edgeId) ?? null
+    const waitMilliseconds = unknownEdges.has(edgeId) ? null : waitByEdge.get(edgeId) ?? 0
+    const delayPerExecution = waitMilliseconds === null || measuredExecutions === null
+      ? null
+      : measuredExecutions > 0 ? waitMilliseconds / measuredExecutions
+        : waitMilliseconds === 0 && basis.kind === 'recent' ? 0 : null
+    const grade = congestionFromDelay(delayPerExecution)
     busiest = Math.max(busiest, executions)
     streets.set(edgeId, {
       edgeId,
       executions,
+      measuredExecutions,
       waitMilliseconds,
-      delayPerExecution: waitMilliseconds > 0 ? delayPerExecution : null,
+      delayPerExecution,
       grade,
       color: CONGESTION_COLORS[grade],
       points: edge.points,
+      rationale: trafficCoverageNote([...familiesByEdge.get(edgeId)!].map(index => families[index]), basis)
+        + (unknownEdges.has(edgeId) ? ' Missing wait placement keeps this street unknown; covered contributors cannot stand for the whole street.' : '')
+        + ' Geography uses retained executions; colour divides same-window modelled wait placement by same-window executions.',
     })
   }
 
@@ -305,7 +359,8 @@ export function assignWorkloadTraffic(
         { x: last.accessX, z: last.accessZ },
       ]),
       executions: toNumber(entry.family.executionCount),
-      waitMilliseconds,
+      measuredExecutions: entry.sample.executions === null ? null : Number(entry.sample.executions),
+      waitMilliseconds: entry.sample.quiet || entry.sample.attribution?.objects.length ? waitMilliseconds : null,
     })
   }
 
@@ -315,7 +370,8 @@ export function assignWorkloadTraffic(
     busiest,
     resident,
     unroutable,
-    note: note(streets.size, trips.size, resident.length, unroutable.length),
+    basis,
+    note: `${coverageNote}${allocationNote} ${note(streets.size, trips.size, resident.length, unroutable.length)}`,
   }
 }
 
@@ -328,11 +384,11 @@ function note(streets: number, trips: number, resident: number, unroutable: numb
   }
   const parts = [
     `${trips.toLocaleString()} ranked query families are driven through the buildings their plans read, ` +
-    `once per captured execution, loading ${streets.toLocaleString()} streets.`,
+    `using retained executions for stable geography across ${streets.toLocaleString()} streets.`,
   ]
   if (resident > 0) {
     parts.push(
-      `${resident.toLocaleString()} more reach only one building here and make no journey; their wait still lands on that building.`,
+      `${resident.toLocaleString()} more make no retained journey here; any measured wait placement remains with their buildings.`,
     )
   }
   if (unroutable > 0) {
