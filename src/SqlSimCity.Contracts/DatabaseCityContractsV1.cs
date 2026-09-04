@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace SqlSimCity.Contracts.V1;
 
 public enum DatabaseCityMetric { Cpu, Duration, Reads, Executions }
@@ -334,4 +336,26 @@ public sealed record DatabaseCityPageV1(
     IReadOnlyList<DatabaseCityQueryFamilyV1> TopQueryFamilies,
     DatabaseCityWorkloadAggregateV1 OtherWorkload,
     IReadOnlyList<DatabaseCityRouteV1> Routes,
-    EvidenceV1 Evidence);
+    EvidenceV1 Evidence)
+{
+    private string? _queryStoreDatabaseId = DatabaseId;
+
+    [JsonIgnore]
+    public bool HasQueryStoreDatabaseId { get; private init; }
+
+    /// <summary>
+    /// The authoritative Query Store database namespace, separate from the full city identity.
+    /// Null means the source could not establish a binding. Legacy omission offers an exact city-ID
+    /// candidate only; adapters may prove a different namespace from captured family associations.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public string? QueryStoreDatabaseId
+    {
+        get => _queryStoreDatabaseId;
+        init
+        {
+            _queryStoreDatabaseId = value;
+            HasQueryStoreDatabaseId = true;
+        }
+    }
+}

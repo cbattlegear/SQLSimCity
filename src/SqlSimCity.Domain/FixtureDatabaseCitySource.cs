@@ -96,7 +96,10 @@ public sealed class FixtureDatabaseCitySource : IDatabaseCitySource
             topFamilies,
             workload.Other,
             BuildRoutes(),
-            FixtureEvidence));
+            FixtureEvidence)
+        {
+            QueryStoreDatabaseId = "sales",
+        });
     }
 
     private static DatabaseCityPageV1 UnavailablePage(
@@ -119,7 +122,10 @@ public sealed class FixtureDatabaseCitySource : IDatabaseCitySource
         return new DatabaseCityPageV1(
             "1.0", summary.DatabaseId, summary.Name, metric, pageSize, null,
             knownEmpty ? "0" : null,
-            [], [], [], other, [], evidence);
+            [], [], [], other, [], evidence)
+        {
+            QueryStoreDatabaseId = null,
+        };
     }
 
     private static IReadOnlyList<DatabaseCityObjectEvidence> BuildObjects()

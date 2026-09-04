@@ -39,6 +39,40 @@ public sealed class DatabaseCityTests : IClassFixture<WebApplicationFactory<ApiA
         Assert.Equal("no-store", detail.Headers.CacheControl?.ToString());
     }
 
+    [Fact]
+    public async Task FixtureCityPublishesAQueryableNamespaceWithoutRelabelingItsOwner()
+    {
+        const string owner = "fixture-target-primary/database/sales";
+        string? pageToken = null;
+        do
+        {
+            var cursor = pageToken is null ? string.Empty : $"&pageToken={Uri.EscapeDataString(pageToken)}";
+            using var response = await _client.GetAsync(
+                $"/api/v1/database-city/{Uri.EscapeDataString(owner)}?pageSize=2{cursor}");
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            Assert.Equal(owner, document.RootElement.GetProperty("databaseId").GetString());
+            Assert.Equal("sales", document.RootElement.GetProperty("queryStoreDatabaseId").GetString());
+            pageToken = document.RootElement.GetProperty("nextPageToken").GetString();
+        } while (pageToken is not null);
+
+        using var queries = JsonDocument.Parse(await _client.GetStringAsync(
+            "/api/v1/query-store/queries?databaseId=sales&metric=cpu&pageSize=10"));
+        var families = queries.RootElement.GetProperty("items").EnumerateArray().ToArray();
+        Assert.NotEmpty(families);
+        Assert.All(families, family => Assert.Equal("sales", family.GetProperty("databaseId").GetString()));
+    }
+
+    [Theory]
+    [InlineData("ledger")]
+    [InlineData("master")]
+    public async Task UnprovenFixtureNamespaceIsExplicitNull(string database)
+    {
+        using var document = JsonDocument.Parse(await _client.GetStringAsync(
+            $"/api/v1/database-city/fixture-target-primary%2Fdatabase%2F{database}?pageSize=10"));
+        Assert.Equal(JsonValueKind.Null, document.RootElement.GetProperty("queryStoreDatabaseId").ValueKind);
+    }
+
     [Theory]
     [InlineData("/api/v1/database-city/not%20valid?metric=cpu&pageSize=10")]
     [InlineData("/api/v1/database-city/fixture-target-primary%2Fdatabase%2Fsales?metric=decoration&pageSize=10")]

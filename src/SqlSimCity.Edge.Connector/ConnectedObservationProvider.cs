@@ -120,7 +120,7 @@ public sealed class ConnectedObservationProvider : IObservationProvider, IAsyncD
                 allowRawPayloadHydration: false);
             var cityExecutor = new SqlClientDatabaseCityProbeExecutor(
                 connectionFactory, options.Profile, catalog, timeProvider);
-            var citySource = new ConnectedDatabaseCitySource(state, cityExecutor);
+            var citySource = new ConnectedDatabaseCitySource(state, cityExecutor, targetId: options.Atlas.TargetId);
             return new ConnectedObservationProvider(
                 options,
                 state,
@@ -222,6 +222,7 @@ public sealed class ConnectedObservationProvider : IObservationProvider, IAsyncD
         }
         var city = await BuildDatabaseCityAsync(cancellationToken)
             .ConfigureAwait(false);
+        city = BindQueryStoreNamespaces(city, atlasResult.Snapshot, queryStore);
 
         return
         [
@@ -295,6 +296,37 @@ public sealed class ConnectedObservationProvider : IObservationProvider, IAsyncD
             await _querySource.GetStatusAsync(cancellationToken).ConfigureAwait(false),
             families,
             []);
+    }
+
+    private DatabaseCityObservationV1 BindQueryStoreNamespaces(
+        DatabaseCityObservationV1 city, AtlasSnapshotV1 atlas, QueryStoreObservationV1 queryStore)
+    {
+        var catalog = atlas.Databases.GroupBy(value => value.DatabaseId, StringComparer.Ordinal)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.Single(), StringComparer.Ordinal);
+        var names = atlas.Databases.ToLookup(value => value.Name, StringComparer.OrdinalIgnoreCase);
+        var namespaces = queryStore.Families.Select(value => value.Family.DatabaseId)
+            .Where(value => !string.IsNullOrWhiteSpace(value)).Distinct(StringComparer.Ordinal)
+            .ToLookup(value => value, StringComparer.OrdinalIgnoreCase);
+        return city with
+        {
+            Pages = city.Pages.Select(page =>
+            {
+                string? resolved = null;
+                if (atlas.Target.TargetId == _options.Atlas.TargetId &&
+                    catalog.TryGetValue(page.DatabaseId, out var database) &&
+                    names[database.Name].Count() == 1 &&
+                    (database.DatabaseId == $"{_options.Atlas.TargetId}/database/{Uri.EscapeDataString(database.Name)}" ||
+                     (database.DatabaseId.StartsWith($"{_options.Atlas.TargetId}/resource/", StringComparison.Ordinal) &&
+                      database.DatabaseId.Length > _options.Atlas.TargetId.Length + "/resource/".Length)))
+                {
+                    var candidates = namespaces[database.Name].ToArray();
+                    if (candidates.Length == 1)
+                        resolved = candidates[0];
+                }
+                return page with { QueryStoreDatabaseId = resolved };
+            }).ToArray(),
+        };
     }
 
     private async Task<DatabaseCityObservationV1> BuildDatabaseCityAsync(

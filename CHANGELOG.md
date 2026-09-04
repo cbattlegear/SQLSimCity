@@ -34,6 +34,10 @@ SimCity assets are included.
   observations instead of stopping capability collection. Azure SQL routing now treats field-based
   profiles and connection strings consistently. Optional `Atlas:Platform` selects the database
   context for private aliases or Managed Instance overrides without fabricating capability evidence.
+- City pages now publish an authoritative nullable Query Store database namespace separately from
+  their full city identity. Connected and fixture mappings are explicit; archive/edge adapters
+  preserve and redact the mapping consistently, resolving omitted legacy metadata only from
+  unambiguous captured identities. Unknown or conflicting bindings remain explicit null.
 
 ## [1.0.0] - 2026-08-28
 

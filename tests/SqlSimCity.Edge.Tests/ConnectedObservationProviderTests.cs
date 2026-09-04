@@ -64,8 +64,10 @@ public sealed class ConnectedObservationProviderTests
         }
     }
 
-    [Fact]
-    public async Task FakeConnectedCycleInvokesProductionCollectorsAndEmitsSanitizedFiveSections()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FakeConnectedCycleInvokesProductionCollectorsAndEmitsSanitizedFiveSections(bool alternateNamespaceCasing)
     {
         var now = new DateTimeOffset(2026, 8, 18, 7, 0, 0, TimeSpan.Zero);
         var time = new FakeTimeProvider(now);
@@ -91,15 +93,15 @@ public sealed class ConnectedObservationProviderTests
         var querySink = new ProtectedQueryStoreHistorySink(repository, queryStatus);
         var queryCollector = new IncrementalQueryStoreCollector(
             queryIncremental, querySink, options.QueryStore, time);
-        var querySource = new ConnectedQueryStoreHistorySource(
+        var querySource = new CountingQuerySource(new ConnectedQueryStoreHistorySource(
             repository,
             queryIncremental,
             new SecureShowplanParser(),
             queryStatus,
             time,
-            allowRawPayloadHydration: false);
+            allowRawPayloadHydration: false), alternateNamespaceCasing);
         var cityProbe = new FakeCityProbe(now);
-        var citySource = new ConnectedDatabaseCitySource(state, cityProbe);
+        var citySource = new ConnectedDatabaseCitySource(state, cityProbe, targetId: options.Atlas.TargetId);
         var owned = new TrackingDisposable();
         await using var provider = new ConnectedObservationProvider(
             options,
@@ -125,6 +127,8 @@ public sealed class ConnectedObservationProviderTests
         Assert.Equal(8, cityProbe.Calls);
         Assert.Equal(0, queryIncremental.RawTextCalls);
         Assert.Equal(0, queryIncremental.RawPlanCalls);
+        Assert.Equal(2, querySource.QueryReads);
+        Assert.Equal(2, querySource.FamilyReads);
         Assert.Equal(
             first.Select(value => value.Section),
             second.Select(value => value.Section));
@@ -145,11 +149,56 @@ public sealed class ConnectedObservationProviderTests
             QueryTextAvailability.Restricted,
             query.Families[0].Family.Text.Availability);
         Assert.Empty(query.Plans);
+        var city = Assert.IsType<DatabaseCityObservationV1>(
+            first.Single(value => value.Section == ObservationSection.DatabaseCity).Payload);
+        Assert.NotEmpty(city.Pages);
+        Assert.All(city.Pages, page =>
+        {
+            Assert.Equal("target-a/database/appdb", page.DatabaseId);
+            Assert.Equal(query.Families[0].Family.DatabaseId, page.QueryStoreDatabaseId);
+            Assert.Equal(alternateNamespaceCasing ? "APPDB" : "appdb", page.QueryStoreDatabaseId);
+            Assert.NotEqual(page.DatabaseId, page.QueryStoreDatabaseId);
+            Assert.Empty(page.TopQueryFamilies);
+        });
 
         await provider.DisposeAsync();
         Assert.True(owned.Disposed);
         await Assert.ThrowsAsync<ObjectDisposedException>(() =>
             provider.CollectAsync(time.GetUtcNow(), CancellationToken.None));
+    }
+
+    private sealed class CountingQuerySource(IQueryStoreHistorySource source, bool alternateNamespaceCasing) : IQueryStoreHistorySource
+    {
+        public int QueryReads { get; private set; }
+        public int FamilyReads { get; private set; }
+
+        public Task<PageV1<QueryFamilySummaryV1>> GetQueriesAsync(
+            string? databaseId, string metric, int pageSize, string? pageToken, CancellationToken cancellationToken)
+        {
+            QueryReads++;
+            return source.GetQueriesAsync(databaseId, metric, pageSize, pageToken, cancellationToken);
+        }
+        public async Task<QueryFamilyDetailV1?> GetFamilyAsync(string familyId, CancellationToken cancellationToken)
+        {
+            FamilyReads++;
+            var detail = await source.GetFamilyAsync(familyId, cancellationToken);
+            return !alternateNamespaceCasing || detail is null ? detail : detail with
+            {
+                Family = detail.Family with
+                {
+                    DatabaseId = detail.Family.DatabaseId.ToUpperInvariant(),
+                    PhysicalQueries = detail.Family.PhysicalQueries.Select(query =>
+                        query with { DatabaseId = query.DatabaseId.ToUpperInvariant() }).ToArray(),
+                },
+            };
+        }
+        public Task<NormalizedShowplanV1?> GetPlanAsync(string planId, CancellationToken cancellationToken) =>
+            source.GetPlanAsync(planId, cancellationToken);
+        public Task<PlanComparisonV1?> ComparePlansAsync(
+            string leftPlanId, string rightPlanId, CancellationToken cancellationToken) =>
+            source.ComparePlansAsync(leftPlanId, rightPlanId, cancellationToken);
+        public Task<QueryStoreCollectorStatusV1> GetStatusAsync(CancellationToken cancellationToken) =>
+            source.GetStatusAsync(cancellationToken);
     }
 
     private static ConnectedSourceOptions Options()

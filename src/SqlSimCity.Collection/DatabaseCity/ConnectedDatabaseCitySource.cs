@@ -11,7 +11,8 @@ public sealed class ConnectedDatabaseCitySource(
     IAtlasSnapshotSource atlasSource,
     IDatabaseCityProbeExecutor probeExecutor,
     QueryStoreCityAttribution? attribution = null,
-    int? topQueryFamilyCount = null) : IDatabaseCitySource
+    int? topQueryFamilyCount = null,
+    string? targetId = null) : IDatabaseCitySource
 {
     /// <summary>
     /// How many query families this source asks for per page.
@@ -69,9 +70,15 @@ public sealed class ConnectedDatabaseCitySource(
         if (pageSize is < 1 or > 50)
             throw new ArgumentOutOfRangeException(nameof(pageSize));
         var atlas = atlasSource.GetCurrent();
-        var database = atlas.Databases.SingleOrDefault(
-            item => item.DatabaseId.Equals(databaseId, StringComparison.Ordinal));
-        if (database is null)
+        var matches = atlas.Databases.Where(
+            item => item.DatabaseId.Equals(databaseId, StringComparison.Ordinal)).Take(2).ToArray();
+        if (matches.Length != 1)
+            return null;
+        var database = matches[0];
+        var boundTarget = targetId ?? atlas.Target.TargetId;
+        if (!string.Equals(atlas.Target.TargetId, boundTarget, StringComparison.Ordinal) ||
+            !BelongsToTarget(database, boundTarget) ||
+            atlas.Databases.Count(item => item.Name.Equals(database.Name, StringComparison.OrdinalIgnoreCase)) != 1)
             return null;
         var cursor = DecodeToken(pageToken, databaseId, metric, pageSize);
 
@@ -87,7 +94,10 @@ public sealed class ConnectedDatabaseCitySource(
         }
         catch (ProbeExecutionException ex)
         {
-            return UnavailablePage(database, metric, pageSize, Status(ex), ex.Reason);
+            return UnavailablePage(database, metric, pageSize, Status(ex), ex.Reason) with
+            {
+                QueryStoreDatabaseId = null,
+            };
         }
 
         var groups = probe.Inventory
@@ -284,7 +294,10 @@ public sealed class ConnectedDatabaseCitySource(
             joined?.OtherWorkload ??
                 new DatabaseCityWorkloadAggregateV1(null, null, null, null, null, null, workloadEvidence),
             joined?.Routes ?? [],
-            pageEvidence);
+            pageEvidence)
+        {
+            QueryStoreDatabaseId = targetId is null ? null : joined?.QueryStoreDatabaseId,
+        };
     }
 
     private static DatabaseCityQueryFamilyV1 ToContract(
@@ -340,9 +353,17 @@ public sealed class ConnectedDatabaseCitySource(
     /// </summary>
     private static Dictionary<string, string> DatabaseIdsByName(AtlasSnapshotV1 atlas) =>
         atlas.Databases
+            .Where(item => BelongsToTarget(item, atlas.Target.TargetId))
             .GroupBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
             .Where(group => group.Count() == 1)
             .ToDictionary(group => group.Key, group => group.First().DatabaseId, StringComparer.OrdinalIgnoreCase);
+
+    private static bool BelongsToTarget(DatabaseAtlasItemV1 database, string targetId) =>
+        database.DatabaseId.Equals(
+            $"{targetId}/database/{Uri.EscapeDataString(database.Name)}", StringComparison.Ordinal) ||
+        // Resource-backed Azure atlas identities are catalog bindings too, not name suffixes.
+        (database.DatabaseId.StartsWith($"{targetId}/resource/", StringComparison.Ordinal) &&
+         database.DatabaseId.Length > targetId.Length + "/resource/".Length);
 
     private static DatabaseCityPageV1 UnavailablePage(
         DatabaseAtlasItemV1 database,

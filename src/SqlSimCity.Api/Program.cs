@@ -144,7 +144,8 @@ if (acquisitionMode == AcquisitionMode.Fixture && atlasConnected)
         services.GetRequiredService<IAtlasSnapshotSource>(),
         services.GetRequiredService<IDatabaseCityProbeExecutor>(),
         services.GetService<QueryStoreCityAttribution>(),
-        builder.Configuration.GetValue<int?>("DatabaseCity:TopQueryFamilyCount")));
+        builder.Configuration.GetValue<int?>("DatabaseCity:TopQueryFamilyCount"),
+        atlasOptions.TargetId));
     builder.Services.AddHostedService<AtlasRefreshBackgroundService>();
     if (queryStoreConnected)
     {

@@ -11,6 +11,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Time.Testing;
 using SqlSimCity.Api;
 using SqlSimCity.Collection.Atlas;
+using SqlSimCity.Collection.DatabaseCity;
 using SqlSimCity.Collection.LiveIncidents;
 using SqlSimCity.Collection.Probes;
 using SqlSimCity.Contracts.V1;
@@ -29,6 +30,33 @@ public sealed class ConnectedCapabilitiesTests
     {
         Converters = { new JsonStringEnumConverter() },
     };
+
+    [Fact]
+    public async Task CompositionRootBindsCityNamespaceToItsConfiguredAtlasTarget()
+    {
+        await using var factory = Factory(new CapabilityProbes(), new FakeTimeProvider(ObservedAt))
+            .WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAtlasSnapshotSource>();
+                services.AddSingleton<IAtlasSnapshotSource, BoundCityAtlas>();
+                services.RemoveAll<IDatabaseCityProbeExecutor>();
+                services.AddSingleton<IDatabaseCityProbeExecutor, EmptyCityProbe>();
+                services.RemoveAll<IQueryStoreHistorySource>();
+                services.AddSingleton<IQueryStoreHistorySource, BoundCityQueries>();
+                services.AddSingleton<QueryStoreCityAttribution>();
+            }));
+        using var client = factory.CreateClient();
+        var page = await client.GetFromJsonAsync<DatabaseCityPageV1>(
+            "/api/v1/database-city/monitored-target%2Fdatabase%2Fapp?metric=cpu&pageSize=10", JsonOptions);
+        Assert.NotNull(page);
+        Assert.Equal("monitored-target/database/app", page.DatabaseId);
+        Assert.Equal("aPp", page.QueryStoreDatabaseId);
+        var queries = await client.GetFromJsonAsync<PageV1<QueryFamilySummaryV1>>(
+            "/api/v1/query-store/queries?databaseId=aPp&metric=cpu&pageSize=10", JsonOptions);
+        Assert.NotNull(queries);
+        Assert.NotEmpty(queries.Items);
+        Assert.All(queries.Items, family => Assert.Equal(page.QueryStoreDatabaseId, family.DatabaseId));
+    }
 
     [Theory]
     [InlineData(false)]
@@ -325,6 +353,49 @@ public sealed class ConnectedCapabilitiesTests
             string databaseName, AtlasProbeSelection selection, DateTimeOffset queryStoreWindowStart,
             DateTimeOffset queryStoreWindowEnd, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("No atlas database should be probed.");
+    }
+
+    private sealed class BoundCityAtlas : IAtlasSnapshotSource
+    {
+        public AtlasSnapshotV1 GetCurrent()
+        {
+            var fixture = new FixtureAtlasSnapshotSource().GetCurrent();
+            return fixture with
+            {
+                Target = fixture.Target with { TargetId = "monitored-target" },
+                Databases = [fixture.Databases[0] with { DatabaseId = "monitored-target/database/app", Name = "app" }],
+            };
+        }
+    }
+
+    private sealed class EmptyCityProbe : IDatabaseCityProbeExecutor
+    {
+        public Task<DatabaseCityProbePage> CollectPageAsync(
+            string databaseName, int afterObjectId, int topN, CancellationToken cancellationToken)
+        {
+            Assert.Equal("app", databaseName);
+            return Task.FromResult(new DatabaseCityProbePage([], [], DataStatus.Available, "test", ObservedAt, TotalObjects: "0"));
+        }
+    }
+
+    private sealed class BoundCityQueries : IQueryStoreHistorySource
+    {
+        public async Task<PageV1<QueryFamilySummaryV1>> GetQueriesAsync(
+            string? databaseId, string metric, int pageSize, string? pageToken, CancellationToken cancellationToken)
+        {
+            Assert.True(databaseId is "app" or "aPp");
+            var page = await new FixtureQueryStoreHistorySource().GetQueriesAsync(
+                "sales", metric, pageSize, pageToken, cancellationToken);
+            return page with { Items = page.Items.Select(family => family with { DatabaseId = "aPp" }).ToArray() };
+        }
+        public Task<QueryFamilyDetailV1?> GetFamilyAsync(string familyId, CancellationToken cancellationToken) =>
+            Task.FromResult<QueryFamilyDetailV1?>(null);
+        public Task<NormalizedShowplanV1?> GetPlanAsync(string planId, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("No plan detail was supplied.");
+        public Task<PlanComparisonV1?> ComparePlansAsync(string leftPlanId, string rightPlanId, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("No comparison should be requested.");
+        public Task<QueryStoreCollectorStatusV1> GetStatusAsync(CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Namespace resolution must not add a status read.");
     }
 
     private sealed class AuthenticationFailureConnectionFactory : ISqlConnectionFactory

@@ -138,6 +138,14 @@ Schemas are stable neighborhoods. Tables and indexed views are buildings sized b
 counts. Indexes are attached structures on their parent object. Direct index DMV activity and
 Query Store-attributed exposure use different evidence and visual styles.
 
+`DatabaseCityPageV1.QueryStoreDatabaseId` binds the city to its Query Store namespace without
+changing its full `DatabaseId` owner. Connected composition supplies the target identity and
+validates the catalog binding before publishing a namespace; a name suffix alone is never proof.
+Explicit `null` disables scoped plan search. For legacy archive/edge pages that omitted the field,
+adapters can prove an exact namespace or an unambiguous captured family-ID association across all
+pages. Competing city owners or conflicting namespaces remain unproven. Resolution happens before
+redaction, and the namespace is redacted exactly like `QueryFamily.DatabaseId`.
+
 #### Attributed and shared exposure
 
 Query Store measures one set of totals per query, not per object. A query that joins four tables has
@@ -271,7 +279,7 @@ from an object's stable id and carries no data claim; the in-app legend states t
 | Outlined amber roof-cap height | Query Store CPU of queries that also named other objects |
 | Index annex width | direct DMV operations on that index |
 | Road width | executions of query families naming both endpoints |
-| Road colour | captured wait share, graded low/medium/high, upgraded only by a resolved live lock |
+| Road colour | same-window milliseconds waited per execution; unknown without capture or placement evidence; qualified live blocking is a separate signal |
 | Route line pattern | co-reference confidence (confirmed / probable / unknown) |
 | Street traffic width | executions of every query family whose journey runs along that street |
 | Street traffic colour | apportioned wait milliseconds per execution on that street |

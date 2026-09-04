@@ -4,6 +4,7 @@ using System.Text.Json;
 using SqlSimCity.Collection.QueryStore;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
+using SqlSimCity.Domain.DatabaseCity;
 using SqlSimCity.Edge.Envelope;
 using SqlSimCity.Edge.Ingestion;
 
@@ -299,6 +300,8 @@ public sealed class EdgeAcquisitionSource :
         var nextOffset = offset + objects.Length;
         var sectionState = State(projection.Generation, ObservationSection.DatabaseCity);
         var imported = Import(page, sectionState);
+        if (!page.HasQueryStoreDatabaseId)
+            imported = imported with { QueryStoreDatabaseId = projection.LegacyCityNamespaces.GetValueOrDefault(page.DatabaseId) };
         return Task.FromResult<DatabaseCityPageV1?>(imported with
         {
             PageSize = pageSize,
@@ -328,13 +331,25 @@ public sealed class EdgeAcquisitionSource :
         }
     }
 
-    private static Projection Deserialize(PublishedEdgeGeneration generation) => new(
-        generation,
-        Read<AtlasObservationV1>(generation, ObservationSection.Atlas),
-        Read<CapabilitiesSnapshotV1>(generation, ObservationSection.Capabilities),
-        Read<QueryStoreObservationV1>(generation, ObservationSection.QueryStore),
-        Read<DatabaseCityObservationV1>(generation, ObservationSection.DatabaseCity),
-        Read<LiveIncidentResponseV1>(generation, ObservationSection.Live));
+    private static Projection Deserialize(PublishedEdgeGeneration generation)
+    {
+        var atlas = Read<AtlasObservationV1>(generation, ObservationSection.Atlas);
+        var queryStore = Read<QueryStoreObservationV1>(generation, ObservationSection.QueryStore);
+        var city = Read<DatabaseCityObservationV1>(generation, ObservationSection.DatabaseCity);
+        var namespaces = new DatabaseCityNamespaceResolver(
+            queryStore.Families.Select(value => value.Family),
+            atlas.Snapshot.Databases.Select(value => value.DatabaseId));
+        foreach (var page in city.Pages)
+            namespaces.Observe(page);
+        return new Projection(
+            generation, atlas,
+            Read<CapabilitiesSnapshotV1>(generation, ObservationSection.Capabilities),
+            queryStore, city,
+            Read<LiveIncidentResponseV1>(generation, ObservationSection.Live))
+        {
+            LegacyCityNamespaces = namespaces.GetMappings(),
+        };
+    }
 
     private static T Read<T>(PublishedEdgeGeneration generation, ObservationSection section) =>
         JsonSerializer.Deserialize<T>(generation.Sections[section].Content, EdgeJson.Options)
@@ -549,6 +564,9 @@ public sealed class EdgeAcquisitionSource :
         DatabaseCityObservationV1? DatabaseCity,
         LiveIncidentResponseV1? Live)
     {
+        public IReadOnlyDictionary<string, string> LegacyCityNamespaces { get; init; } =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+
         public static Projection Empty { get; } = new(null, null, null, null, null, null);
     }
 }

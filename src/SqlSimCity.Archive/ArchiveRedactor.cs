@@ -148,7 +148,13 @@ public sealed class ArchiveRedactor(bool includeProtectedIdentifiers)
         }).ToArray(),
     };
 
-    public DatabaseCityPageV1 Redact(DatabaseCityPageV1 page)
+    public DatabaseCityPageV1 Redact(DatabaseCityPageV1 page) =>
+        RedactCityPage(page, preserveMappingPresence: false);
+
+    internal DatabaseCityPageV1 RedactForNamespaceResolution(DatabaseCityPageV1 page) =>
+        RedactCityPage(page, preserveMappingPresence: true);
+
+    private DatabaseCityPageV1 RedactCityPage(DatabaseCityPageV1 page, bool preserveMappingPresence)
     {
         var replacements = new List<(string Value, string Replacement)>
         {
@@ -169,7 +175,7 @@ public sealed class ArchiveRedactor(bool includeProtectedIdentifiers)
                 .Aggregate(value, (current, pair) =>
                     current.Replace(pair.Value, pair.Replacement, StringComparison.Ordinal));
 
-        return page with
+        var redacted = page with
         {
             DatabaseId = Identifier(page.DatabaseId, "database"),
             DatabaseName = RequiredIdentifier(page.DatabaseName, "database"),
@@ -245,6 +251,10 @@ public sealed class ArchiveRedactor(bool includeProtectedIdentifiers)
             }).ToArray(),
             Evidence = page.Evidence with { Reason = Scrub(page.Evidence.Reason) },
         };
+        // The resolver must distinguish omission from explicit null; it ignores the omitted getter.
+        return preserveMappingPresence && !page.HasQueryStoreDatabaseId
+            ? redacted
+            : redacted with { QueryStoreDatabaseId = OptionalIdentifier(page.QueryStoreDatabaseId, "database") };
     }
 
     public LiveIncidentResponseV1 Redact(LiveIncidentResponseV1 response) => response.Snapshot is null

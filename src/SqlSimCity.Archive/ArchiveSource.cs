@@ -4,6 +4,7 @@ using System.Text;
 using SqlSimCity.Collection.QueryStore;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
+using SqlSimCity.Domain.DatabaseCity;
 
 namespace SqlSimCity.Archive;
 
@@ -35,14 +36,16 @@ public sealed partial class ArchiveSource :
     private readonly QueryStoreArchiveIndex _queryStoreIndex;
     private readonly DatabaseCitySummarySnapshotV1 _citySummaries;
     private readonly DatabaseCityArchiveIndex _cityIndex;
+    private readonly IReadOnlyDictionary<string, string> _legacyQueryStoreMappings;
 
     private ArchiveSource(ArchivePackage package)
     {
         _package = package;
         _redactor = new ArchiveRedactor(package.Manifest.Redaction.ProtectedIdentifiersIncluded);
         RequireFeatures(package.Manifest);
+        var sourceAtlas = ReadRequired<AtlasSnapshotV1>(AtlasSnapshotEntry);
         var archivedAtlas = _redactor.Redact(
-            ReadRequired<AtlasSnapshotV1>(AtlasSnapshotEntry),
+            sourceAtlas,
             package.Manifest.Target.DisplayAlias);
         _atlas = Import(archivedAtlas);
         _atlasStatus = ReadOptional<AtlasCollectorStatusV1>(AtlasStatusEntry) ??
@@ -68,13 +71,13 @@ public sealed partial class ArchiveSource :
                 new Dictionary<string, string>(StringComparer.Ordinal),
                 new Dictionary<string, string>(StringComparer.Ordinal),
                 new Dictionary<string, ArchivePageSeries>(StringComparer.Ordinal));
-        _citySummaries = Import(_redactor.Redact(
-            ReadOptional<DatabaseCitySummarySnapshotV1>(CitySummariesEntry) ??
-            new DatabaseCitySummarySnapshotV1("1.0", package.Manifest.CreatedAt, [])));
+        var sourceCities = ReadOptional<DatabaseCitySummarySnapshotV1>(CitySummariesEntry) ??
+            new DatabaseCitySummarySnapshotV1("1.0", package.Manifest.CreatedAt, []);
+        _citySummaries = Import(_redactor.Redact(sourceCities));
         _cityIndex = ReadOptional<DatabaseCityArchiveIndex>(CityIndexEntry) ??
             new DatabaseCityArchiveIndex(
                 new Dictionary<string, IReadOnlyDictionary<string, ArchivePageSeries>>(StringComparer.Ordinal));
-        ValidateIndexes();
+        _legacyQueryStoreMappings = ValidateIndexes();
         ValidateLegacyFindings();
     }
 
@@ -271,7 +274,7 @@ public sealed partial class ArchiveSource :
         var archivedPages = ReadRequired<IReadOnlyList<DatabaseCityPageV1>>(series.Entries[chunkIndex]);
         if (archivedPages.Count != 1)
             throw new ArchiveValidationException("Archive database city chunk must contain exactly one page.");
-        var page = Import(_redactor.Redact(archivedPages[0]));
+        var page = Import(RedactCityPage(archivedPages[0]));
         if (series.TotalCount == 0)
             return Task.FromResult<DatabaseCityPageV1?>(page with { PageSize = pageSize, NextPageToken = null });
 
@@ -286,7 +289,7 @@ public sealed partial class ArchiveSource :
             var wrappers = ReadRequired<IReadOnlyList<DatabaseCityPageV1>>(series.Entries[chunkIndex]);
             if (wrappers.Count != 1)
                 throw new ArchiveValidationException("Archive database city chunk must contain exactly one page.");
-            var chunkPage = Import(_redactor.Redact(wrappers[0]));
+            var chunkPage = Import(RedactCityPage(wrappers[0]));
             if (contributingChunks.Add(chunkIndex))
                 contributingPages.Add(chunkPage);
             var withinChunk = checked((int)(currentOffset % series.ChunkSize));
@@ -333,6 +336,26 @@ public sealed partial class ArchiveSource :
         _package.Manifest.Entries.Any(value => value.Name == entry)
             ? ReadRequired<T>(entry)
             : null;
+
+    private DatabaseCityPageV1 RedactCityPage(DatabaseCityPageV1 page)
+    {
+        // Redaction writes the property and marks it present, so resolve legacy omission first.
+        if (!page.HasQueryStoreDatabaseId)
+        {
+            page = page with
+            {
+                QueryStoreDatabaseId = _legacyQueryStoreMappings.GetValueOrDefault(
+                    _redactor.Identifier(page.DatabaseId, "database")),
+            };
+        }
+        return _redactor.Redact(page);
+    }
+
+    private static HashSet<string> UniqueDatabaseIds(IEnumerable<string> databaseIds) =>
+        databaseIds.GroupBy(value => value, StringComparer.Ordinal)
+            .Where(group => group.Count() == 1)
+            .Select(group => group.Key)
+            .ToHashSet(StringComparer.Ordinal);
 
     private List<T> ReadSeries<T>(
         ArchivePageSeries series,
@@ -524,7 +547,7 @@ public sealed partial class ArchiveSource :
         };
     }
 
-    private void ValidateIndexes()
+    private IReadOnlyDictionary<string, string> ValidateIndexes()
     {
         RequireSection(AtlasSnapshotEntry, "atlas");
         RequireOptionalSection(AtlasStatusEntry, "atlas");
@@ -537,11 +560,14 @@ public sealed partial class ArchiveSource :
 
         ValidateIndexMap(_queryStoreIndex.FamilyEntries, "Query Store family");
         ValidateIndexMap(_queryStoreIndex.PlanEntries, "Query Store plan");
+        var capturedFamilies = new HashSet<(string FamilyId, string DatabaseId)>();
         foreach (var (familyId, entry) in _queryStoreIndex.FamilyEntries)
         {
-            var family = _redactor.Redact(ReadRequired<QueryFamilyDetailV1>(entry));
+            var archived = ReadRequired<QueryFamilyDetailV1>(entry);
+            var family = _redactor.Redact(archived);
             if (!string.Equals(family.Family.FamilyId, familyId, StringComparison.Ordinal))
                 throw new ArchiveValidationException($"Archive family index key '{familyId}' does not match its payload.");
+            capturedFamilies.Add((family.Family.FamilyId, family.Family.DatabaseId));
         }
         foreach (var (planId, entry) in _queryStoreIndex.PlanEntries)
         {
@@ -568,8 +594,14 @@ public sealed partial class ArchiveSource :
                         !string.Equals(imported.DatabaseId, parts[1], StringComparison.Ordinal))
                         throw new ArchiveValidationException(
                             $"Archive Query Store metric key '{key}' does not match a payload database.");
+                    capturedFamilies.Add((imported.FamilyId, imported.DatabaseId));
                 });
         }
+        var catalogIds = UniqueDatabaseIds(_atlas.Databases.Select(database => database.DatabaseId))
+            .Intersect(UniqueDatabaseIds(_citySummaries.Databases.Select(database => database.DatabaseId)),
+                StringComparer.Ordinal);
+        var resolver = new DatabaseCityNamespaceResolver(capturedFamilies, catalogIds);
+        capturedFamilies.Clear();
         foreach (var (databaseId, metrics) in _cityIndex.Pages)
         {
             ValidateIndexKey(databaseId, "database city database");
@@ -586,14 +618,16 @@ public sealed partial class ArchiveSource :
                     pageWrappers: true,
                     validateItem: page =>
                     {
-                        var imported = _redactor.Redact(page);
+                        var imported = _redactor.RedactForNamespaceResolution(page);
                         if (!string.Equals(imported.DatabaseId, databaseId, StringComparison.Ordinal) ||
                             imported.Metric != parsedMetric)
                             throw new ArchiveValidationException(
                                 $"Archive database city key '{databaseId}|{metric}' does not match its payload.");
+                        resolver.Observe(imported);
                     });
             }
         }
+        return resolver.GetMappings();
     }
 
     private void ValidateIndexMap(IReadOnlyDictionary<string, string> values, string kind)
