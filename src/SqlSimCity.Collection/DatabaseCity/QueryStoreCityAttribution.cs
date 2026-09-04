@@ -142,13 +142,15 @@ public sealed class QueryStoreCityAttribution(
     /// addressed by: that id matches no published Query Store index set, which would silently
     /// unattribute every object on the page.
     /// </param>
+    /// <param name="trafficWindowEnd">The catalog walk's pinned end, shared by every continuation page.</param>
     public async Task<CityAttributionResult> AttributeAsync(
         string databaseName,
         DatabaseCityMetric metric,
         IReadOnlyList<CityAttributionObject> pageObjects,
         IReadOnlyDictionary<string, string> databaseIdsByName,
         int topFamilyCount,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        DateTimeOffset? trafficWindowEnd = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databaseName);
         ArgumentNullException.ThrowIfNull(pageObjects);
@@ -183,12 +185,13 @@ public sealed class QueryStoreCityAttribution(
         var exposureEligible = new List<DatabaseCityQueryEvidence>(page.Items.Count);
         var routes = new RouteAccumulator(pageEvidence);
         var planBudget = MaxPlansPerPage;
+        var windowEnd = trafficWindowEnd ?? _clock.GetUtcNow();
 
         foreach (var summary in page.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var resolved = await AttributeFamilyAsync(
-                summary, index, routes, planBudget, cancellationToken).ConfigureAwait(false);
+                summary, index, routes, planBudget, windowEnd, cancellationToken).ConfigureAwait(false);
             planBudget -= resolved.PlansHydrated;
             families.Add(resolved.Family);
             if (resolved.ExposureEligible)
@@ -208,6 +211,7 @@ public sealed class QueryStoreCityAttribution(
         PageObjectIndex index,
         RouteAccumulator routes,
         int planBudget,
+        DateTimeOffset trafficWindowEnd,
         CancellationToken cancellationToken)
     {
         QueryFamilyDetailV1? detail = null;
@@ -333,7 +337,7 @@ public sealed class QueryStoreCityAttribution(
                         "Plan coverage is incomplete; measured waits remain unassigned rather than being transferred to readable plans.")
                     : costs.Build(counters.TotalWaitMilliseconds),
                 PlanDataVolume = volumes.Build(),
-                RecentActivity = RecentActivity(detail, costs),
+                RecentActivity = RecentActivity(detail, costs, trafficWindowEnd),
             },
             hydrated,
             // Totals belong to one building only when the plans named that building and nothing
@@ -360,9 +364,9 @@ public sealed class QueryStoreCityAttribution(
     /// starts to lie.
     /// </para>
     /// </summary>
-    private DatabaseCityRecentActivityV1 RecentActivity(QueryFamilyDetailV1 detail, PlanCostAccumulator costs)
+    private DatabaseCityRecentActivityV1 RecentActivity(
+        QueryFamilyDetailV1 detail, PlanCostAccumulator costs, DateTimeOffset end)
     {
-        var end = _clock.GetUtcNow();
         var start = end - _trafficWindow;
         var minutes = (int)Math.Round(_trafficWindow.TotalMinutes, MidpointRounding.AwayFromZero);
 

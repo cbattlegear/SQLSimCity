@@ -116,6 +116,8 @@ public sealed class ConnectedDatabaseCitySource(
             .Select(row => new CityAttributionObject(
                 ObjectId(databaseId, row.ObjectId), row.SchemaName, row.ObjectName, row.Kind))
             .ToArray();
+        // Catalog pages are live reads, but one walk must select the same traffic window on every page.
+        var trafficWindowEnd = cursor.TrafficWindowEnd ?? probe.ObservedAt.ToUniversalTime();
         // Query Store history is collected and indexed per database name, so the join is filtered by
         // the name, never by the atlas contract id this page is addressed by: an atlas id matches no
         // published Query Store index and would leave every object on the page unattributed.
@@ -127,7 +129,8 @@ public sealed class ConnectedDatabaseCitySource(
                 attributionObjects,
                 DatabaseIdsByName(atlas),
                 topFamilyCount,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                trafficWindowEnd).ConfigureAwait(false);
         var familyIdsByObject = (joined?.Families ?? [])
             .SelectMany(family => family.ObjectIds.Select(objectId => (objectId, family.FamilyId)))
             .ToLookup(pair => pair.objectId, pair => pair.FamilyId, StringComparer.Ordinal);
@@ -245,7 +248,7 @@ public sealed class ConnectedDatabaseCitySource(
         var projected = DatabaseCityProjector.ProjectObjects(schemas, evidenceObjects);        var nextToken = groups.Length > pageSize && selectedGroups.Length > 0
             ? EncodeToken(
                 databaseId, metric, pageSize, selectedGroups[^1].Key,
-                cursor.LayoutOffset + selectedGroups.Length)
+                cursor.LayoutOffset + selectedGroups.Length, trafficWindowEnd)
             : null;
         var schemaContracts = schemas
             .OrderBy(schema => schema.SchemaId, StringComparer.Ordinal)
@@ -372,10 +375,11 @@ public sealed class ConnectedDatabaseCitySource(
         DatabaseCityMetric metric,
         int pageSize,
         int afterObjectId,
-        int layoutOffset)
+        int layoutOffset,
+        DateTimeOffset trafficWindowEnd)
     {
         var bytes = Encoding.UTF8.GetBytes(
-            $"1|{databaseId}|{metric}|{pageSize.ToString(CultureInfo.InvariantCulture)}|{afterObjectId.ToString(CultureInfo.InvariantCulture)}|{layoutOffset.ToString(CultureInfo.InvariantCulture)}");
+            $"2|{databaseId}|{metric}|{pageSize.ToString(CultureInfo.InvariantCulture)}|{afterObjectId.ToString(CultureInfo.InvariantCulture)}|{layoutOffset.ToString(CultureInfo.InvariantCulture)}|{trafficWindowEnd.ToString("O", CultureInfo.InvariantCulture)}");
         return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
     }
 
@@ -386,7 +390,7 @@ public sealed class ConnectedDatabaseCitySource(
         int pageSize)
     {
         if (token is null)
-            return new DatabaseCityCursor(0, 0);
+            return new DatabaseCityCursor(0, 0, null);
         if (token.Length is < 1 or > 1024 || token.Any(character =>
                 !(char.IsAsciiLetterOrDigit(character) || character is '-' or '_')))
             throw new DatabaseCityPageTokenException();
@@ -395,8 +399,8 @@ public sealed class ConnectedDatabaseCitySource(
             var base64 = token.Replace('-', '+').Replace('_', '/');
             base64 = base64.PadRight((base64.Length + 3) / 4 * 4, '=');
             var parts = Encoding.UTF8.GetString(Convert.FromBase64String(base64)).Split('|');
-            if (parts.Length != 6 ||
-                parts[0] != "1" ||
+            if (parts.Length != 7 ||
+                parts[0] != "2" ||
                 parts[1] != databaseId ||
                 parts[2] != metric.ToString() ||
                 !int.TryParse(parts[3], NumberStyles.None, CultureInfo.InvariantCulture, out var tokenPageSize) ||
@@ -404,9 +408,12 @@ public sealed class ConnectedDatabaseCitySource(
                 !int.TryParse(parts[4], NumberStyles.None, CultureInfo.InvariantCulture, out var afterObjectId) ||
                 afterObjectId < 0 ||
                 !int.TryParse(parts[5], NumberStyles.None, CultureInfo.InvariantCulture, out var layoutOffset) ||
-                layoutOffset < 0)
+                layoutOffset < 0 ||
+                !DateTimeOffset.TryParseExact(parts[6], "O", CultureInfo.InvariantCulture,
+                    DateTimeStyles.AdjustToUniversal, out var trafficWindowEnd) ||
+                trafficWindowEnd < DateTimeOffset.MinValue + QueryStoreCityAttribution.MaximumTrafficWindow)
                 throw new DatabaseCityPageTokenException();
-            return new DatabaseCityCursor(afterObjectId, layoutOffset);
+            return new DatabaseCityCursor(afterObjectId, layoutOffset, trafficWindowEnd);
         }
         catch (FormatException)
         {
@@ -418,5 +425,5 @@ public sealed class ConnectedDatabaseCitySource(
         }
     }
 
-    private sealed record DatabaseCityCursor(int AfterObjectId, int LayoutOffset);
+    private sealed record DatabaseCityCursor(int AfterObjectId, int LayoutOffset, DateTimeOffset? TrafficWindowEnd);
 }

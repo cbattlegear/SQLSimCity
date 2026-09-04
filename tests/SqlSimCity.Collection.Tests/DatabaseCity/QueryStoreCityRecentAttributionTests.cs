@@ -11,6 +11,30 @@ public sealed class QueryStoreCityRecentAttributionTests
     private static readonly DateTimeOffset Now = new(2026, 9, 4, 12, 0, 0, TimeSpan.Zero);
 
     [Fact]
+    public async Task EveryFamilyInAnAttributionPassUsesOneWindowDespiteAnAdvancingClock()
+    {
+        var store = new FakeQueryStore();
+        store.AddFamily("first", "1", "1", [Plan("first-plan", "Customer")],
+            runtimeIntervals: [Interval("first-plan", "10", Now.AddMinutes(-10))]);
+        store.AddFamily("second", "1", "1", [Plan("second-plan", "Orders")],
+            runtimeIntervals: [Interval("second-plan", "20", Now.AddMinutes(-10))]);
+        var clock = new AdvancingClock();
+        var result = await new QueryStoreCityAttribution(store, timeProvider: clock).AttributeAsync(
+            FakeQueryStore.DatabaseName, DatabaseCityMetric.Cpu,
+            [new("customer", "dbo", "Customer", DatabaseObjectKind.Table),
+             new("orders", "dbo", "Orders", DatabaseObjectKind.Table)],
+            new Dictionary<string, string>(), 12, default);
+
+        Assert.Equal(2, result.Families.Count);
+        Assert.All(result.Families, family =>
+        {
+            Assert.Equal(Now, family.RecentActivity!.WindowEnd);
+            Assert.Equal(Now.AddMinutes(-15), family.RecentActivity.WindowStart);
+        });
+        Assert.Equal(1, clock.Reads);
+    }
+
+    [Fact]
     public async Task RecentAttributionUsesRecentPlanWaitsRatherThanRetainedPlanShares()
     {
         var store = new FakeQueryStore();
@@ -146,5 +170,11 @@ public sealed class QueryStoreCityRecentAttributionTests
     private sealed class FixedClock : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => Now;
+    }
+
+    private sealed class AdvancingClock : TimeProvider
+    {
+        public int Reads { get; private set; }
+        public override DateTimeOffset GetUtcNow() => Now.AddMilliseconds(Reads++);
     }
 }

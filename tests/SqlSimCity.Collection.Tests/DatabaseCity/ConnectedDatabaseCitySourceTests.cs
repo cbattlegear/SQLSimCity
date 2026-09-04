@@ -85,6 +85,87 @@ public sealed class ConnectedDatabaseCitySourceTests
     }
 
     [Fact]
+    public async Task CatalogContinuationPinsRecentWindowAcrossFamiliesAndPagesButNotANewWalk()
+    {
+        var started = new DateTimeOffset(2026, 8, 17, 17, 0, 0, TimeSpan.Zero).AddTicks(1234);
+        var probeClock = new AdvancingClock(started, TimeSpan.FromMinutes(2));
+        var attributionClock = new AdvancingClock(started, TimeSpan.FromMilliseconds(1));
+        var probe = new PagingCityProbeExecutor(probeClock);
+        var queryStore = new FakeQueryStore();
+        foreach (var (name, wait, category) in new[] { ("Customer", "11", "CPU"), ("OrderHeader", "22", "Lock") })
+        {
+            queryStore.AddFamily(name, "1", "1",
+                [FakeQueryStore.SizedPlan(name, new FakeQueryStore.PlanNode(
+                    FakeQueryStore.Reference(table: name), EstimatedCpu: 1))],
+                waitMilliseconds: wait, runtimeIntervals:
+                [
+                    new(started.AddMinutes(-14), started.AddMinutes(-13), WaitMilliseconds: wait,
+                        PlanId: name, WaitCategories: new Dictionary<string, string> { [category] = wait }),
+                ]);
+        }
+        ConnectedDatabaseCitySource Source() => new(
+            new FakeAtlasSource(), probe, new QueryStoreCityAttribution(queryStore, timeProvider: attributionClock));
+
+        var first = (await Source().GetDatabaseAsync(
+            FakeQueryStore.DatabaseId, DatabaseCityMetric.Cpu, 1, null, default))!;
+        Assert.NotNull(first.NextPageToken);
+        var second = (await Source().GetDatabaseAsync(
+            FakeQueryStore.DatabaseId, DatabaseCityMetric.Cpu, 1, first.NextPageToken, default))!;
+        Assert.Null(second.NextPageToken);
+        Assert.Equal("target/database/sales/object/20", Assert.Single(second.Objects).ObjectId);
+        Assert.Equal(started, first.Evidence.ObservedAt);
+        Assert.Equal(started.AddMinutes(2), second.Evidence.ObservedAt);
+        foreach (var page in new[] { first, second })
+        {
+            Assert.Equal(2, page.TopQueryFamilies.Count);
+            Assert.All(page.TopQueryFamilies, family =>
+            {
+                var recent = family.RecentActivity!;
+                Assert.Equal(started, recent.WindowEnd);
+                Assert.Equal(started.AddMinutes(-15), recent.WindowStart);
+                Assert.True(recent.Covered);
+                var (wait, category) = family.FamilyId == "Customer" ? ("11", "CPU") : ("22", "Lock");
+                Assert.Equal(wait, recent.TotalWaitMilliseconds);
+                Assert.Equal(wait, recent.WaitMillisecondsByCategory![category]);
+            });
+        }
+        Assert.Equal("11", Assert.Single(first.TopQueryFamilies
+            .Single(family => family.FamilyId == "Customer").RecentActivity!.WaitAttribution!.Objects).WaitMilliseconds);
+        Assert.Equal("22", Assert.Single(second.TopQueryFamilies
+            .Single(family => family.FamilyId == "OrderHeader").RecentActivity!.WaitAttribution!.Objects).WaitMilliseconds);
+
+        var fresh = (await Source().GetDatabaseAsync(
+            FakeQueryStore.DatabaseId, DatabaseCityMetric.Cpu, 1, null, default))!;
+        Assert.All(fresh.TopQueryFamilies, family =>
+        {
+            var recent = family.RecentActivity!;
+            Assert.Equal(started.AddMinutes(4), recent.WindowEnd);
+            Assert.Equal(started.AddMinutes(-11), recent.WindowStart);
+            Assert.False(recent.Covered);
+            Assert.Equal("0", recent.TotalWaitMilliseconds);
+            Assert.Null(recent.WaitAttribution);
+        });
+        Assert.Equal(0, attributionClock.Reads);
+    }
+
+    [Theory]
+    [InlineData("1|target/database/sales|Cpu|1|10|1")]
+    [InlineData("2|target/database/sales|Cpu|1|10|1|not-a-time")]
+    [InlineData("2|target/database/sales|Cpu|1|10|1|0001-01-01T00:00:00.0000000+00:00")]
+    public async Task RejectsLegacyOrInvalidWindowCursorsBeforeCollecting(string cursor)
+    {
+        var clock = new AdvancingClock(
+            new DateTimeOffset(2026, 8, 17, 17, 0, 0, TimeSpan.Zero), TimeSpan.FromMilliseconds(1));
+        var source = new ConnectedDatabaseCitySource(new FakeAtlasSource(), new PagingCityProbeExecutor(clock));
+        var token = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(cursor))
+            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+        await Assert.ThrowsAsync<DatabaseCityPageTokenException>(() => source.GetDatabaseAsync(
+            FakeQueryStore.DatabaseId, DatabaseCityMetric.Cpu, 1, token, default));
+        Assert.Equal(0, clock.Reads);
+    }
+
+    [Fact]
     public async Task QueryStoreFamiliesRoutesAndExposureReachTheConnectedPage()
     {
         var queryStore = new FakeQueryStore();
@@ -246,6 +327,32 @@ public sealed class ConnectedDatabaseCitySourceTests
             "target/database/sales", DatabaseCityMetric.Cpu, 2, null, CancellationToken.None);
 
         Assert.Equal(96, queryStore.RequestedPageSize);
+    }
+
+    private sealed class AdvancingClock(DateTimeOffset start, TimeSpan step) : TimeProvider
+    {
+        public int Reads { get; private set; }
+        public override DateTimeOffset GetUtcNow() => start + step * Reads++;
+    }
+
+    private sealed class PagingCityProbeExecutor(TimeProvider clock) : IDatabaseCityProbeExecutor
+    {
+        public Task<DatabaseCityProbePage> CollectPageAsync(
+            string databaseName, int afterObjectId, int topN, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Assert.Equal(FakeQueryStore.DatabaseName, databaseName);
+            DatabaseCityInventoryRow[] rows =
+            [
+                new(10, 1001, 2, "dbo", "Customer", DatabaseObjectKind.Table,
+                    "10", "5", 1, "PK_Customer", DatabaseIndexKind.Clustered),
+                new(20, 1001, 2, "dbo", "OrderHeader", DatabaseObjectKind.Table,
+                    "20", "10", 1, "PK_OrderHeader", DatabaseIndexKind.Clustered),
+            ];
+            return Task.FromResult(new DatabaseCityProbePage(
+                rows.Where(row => row.ObjectId > afterObjectId).Take(topN).ToArray(), [],
+                DataStatus.Available, "Captured.", clock.GetUtcNow(), TotalObjects: "2"));
+        }
     }
 
     private sealed class FakeCityProbeExecutor(int expectedTopN = 2) : IDatabaseCityProbeExecutor
