@@ -18,6 +18,7 @@ import type { IncidentPlacement } from './cityIncidentPlacement'
 import type { LiveFeedConnectionState } from './liveIncidents'
 import type { LiveQueryEvent } from './liveQueryFeed'
 import type { VehicleRoster } from './cityVehicles'
+import type { TourStop, TourStopKind } from './cityTour'
 import { IncidentPopup } from './IncidentPopup'
 import { MapTray, useNarrowViewport, type TrayItem } from './MapTray'
 
@@ -28,6 +29,13 @@ type Props = {
    * address book, the route, and the traffic map all read one layout produced once.
    */
   cityPlan: CityPlan
+  /**
+   * The database this city is of, used only as the opening caption of a guided tour.
+   *
+   * Optional because a tour is optional: a viewport rendered without it still tours, and the
+   * establishing shot simply says "this database" rather than naming it.
+   */
+  cityName?: string
   /** Flat basemap or oblique 3D city. Both draw the same plan and the same measurements. */
   viewMode: MapViewMode
   roads: readonly RoadTraffic[]
@@ -118,6 +126,21 @@ const KEY_ACTIONS: Record<string, CameraNudge> = {
 
 const COMPASS_POINTS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 
+/**
+ * What each kind of stop is called on screen.
+ *
+ * "Blocked" rather than "disaster", and "Busy street" rather than "problem street", because the
+ * caption beside it states a measurement and the label must not add a verdict the measurement does
+ * not support. A blocked request is a fact; whether it is a disaster is the reader's call.
+ */
+const TOUR_KINDS: Record<TourStopKind, string> = {
+  skyline: 'Skyline',
+  landmark: 'Landmark',
+  street: 'Busy street',
+  incident: 'Blocked',
+  neighbourhood: 'Neighbourhood',
+}
+
 // A module-level constant so the default prop is referentially stable. A fresh `[]` literal would
 // be a new array on every render, re-running the effect and rebuilding every building each time.
 const EMPTY_STALE_STATS: readonly string[] = Object.freeze([])
@@ -152,6 +175,7 @@ function swatch(color: number): string {
 export function DatabaseCityViewport({
   objects,
   cityPlan,
+  cityName = '',
   viewMode,
   roads,
   traffic,
@@ -184,6 +208,16 @@ export function DatabaseCityViewport({
   const [unavailable, setUnavailable] = useState(false)
   const [heading, setHeading] = useState(0)
   const [hoveredRoadId, setHoveredRoadId] = useState<string | null>(null)
+  /*
+   * The tour's two pieces of state, deliberately separate.
+   *
+   * `touring` is what the viewer asked for and drives the toggle; `tourStop` is what the scene is
+   * actually looking at and drives the caption. They come apart at exactly the moment that matters:
+   * grabbing the camera ends the tour from inside the scene, which reports `active: false` back up
+   * here, so the button un-presses itself without the viewer having touched it.
+   */
+  const [touring, setTouring] = useState(false)
+  const [tourStop, setTourStop] = useState<TourStop | null>(null)
   const [popupAt, setPopupAt] = useState<{ x: number; y: number } | null>(null)
   const [popupPlacement, setPopupPlacement] = useState<IncidentPlacement | null>(null)
   const [layers, setLayers] = useState<CityLayerToggles>({
@@ -220,6 +254,10 @@ export function DatabaseCityViewport({
         onSelectIncident: openIncident,
         onCameraChange: () => setHeading(sceneRef.current?.heading() ?? 0),
         onVehicleRoster: roster => vehicleRosterRef.current?.(roster),
+        onTour: ({ active, stop }) => {
+          setTouring(active)
+          setTourStop(stop)
+        },
       })
     } catch {
       setUnavailable(true)
@@ -255,6 +293,7 @@ export function DatabaseCityViewport({
     () => sceneRef.current?.setVehicles(liveQueries ?? null, families ?? []),
     [liveQueries, families],
   )
+  useEffect(() => sceneRef.current?.setTour(touring, cityName), [touring, cityName])
 
   // Opening a pin from the sidebar centres its object first, because a marker outside the frustum
   // projects to nothing and would open a popup the reader never sees.
@@ -542,6 +581,14 @@ export function DatabaseCityViewport({
           <button type="button" onClick={() => nudge('zoomOut')} aria-label="Zoom out">－</button>
           <button type="button" onClick={() => nudge('rotateRight')} aria-label="Rotate right">⟳</button>
           <button type="button" onClick={() => sceneRef.current?.resetView()}>Reset view</button>
+          <button
+            type="button"
+            className="hud-tour-toggle"
+            aria-pressed={touring}
+            onClick={() => setTouring(current => !current)}
+          >
+            {touring ? 'Stop tour' : 'Take a tour'}
+          </button>
           {route && <button type="button" onClick={() => sceneRef.current?.frameRoute()}>Frame route</button>}
           {selectedRoadId && (
             <button type="button" onClick={() => sceneRef.current?.frameRoad(selectedRoadId)}>Frame road</button>
@@ -549,14 +596,32 @@ export function DatabaseCityViewport({
         </div>
       </div>
 
-      {hoverLabel && (
-        <div className="hud hud-road-readout" aria-hidden="true">
-          <strong>Road</strong>
-          <span>{hoverLabel}</span>
+      {/*
+        The caption and the hover readout share the bottom-centre slot, so only one is ever mounted.
+        The tour wins while it is running: a road label that follows the pointer is answering a
+        question nobody asked during a hands-off display, and stacking the two would put the tour's
+        own street captions next to a stale label for whatever the pointer was last left over.
+      */}
+      {tourStop ? (
+        <div className="hud hud-tour">
+          <span className={`hud-tour-kind hud-tour-kind-${tourStop.kind}`}>{TOUR_KINDS[tourStop.kind]}</span>
+          <strong>{tourStop.caption}</strong>
+          <span className="hud-tour-detail">{tourStop.detail}</span>
         </div>
+      ) : (
+        hoverLabel && (
+          <div className="hud hud-road-readout" aria-hidden="true">
+            <strong>Road</strong>
+            <span>{hoverLabel}</span>
+          </div>
+        )
       )}
       <p className="visually-hidden" role="status">
-        {hoverLabel ? `Road under pointer: ${hoverLabel}` : ''}
+        {tourStop
+          ? `Tour: ${TOUR_KINDS[tourStop.kind]}. ${tourStop.caption}. ${tourStop.detail}`
+          : hoverLabel
+            ? `Road under pointer: ${hoverLabel}`
+            : ''}
       </p>
 
       {panel && <div className="hud hud-panel">{panel}</div>}

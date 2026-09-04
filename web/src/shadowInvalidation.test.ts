@@ -186,6 +186,92 @@ describe('the shadow map is invalidated by whatever changed what casts', () => {
   })
 
   /*
+   * The guided tour is the second indefinite loop, and it is the more dangerous of the two.
+   *
+   * A vehicle loop ends when the roster drains; an attract-mode tour is meant to run on a wall
+   * display for hours, moving the camera on every single frame of it. That is precisely the case
+   * issue #90 measured — 948 draw calls and 7.6 ms per frame redrawing shadows for a city that had
+   * not moved — so a `requestRender()` in here would not merely undo the saving, it would undo it
+   * for the longest-running thing this scene ever does. The sun is directional and its shadow map is
+   * rendered from the light, so a camera flying around underneath cannot change a texel of it.
+   */
+  it('leaves the tour loop drawing without asking for a new shadow pass', () => {
+    const from = scene.indexOf('const runTourLoop')
+    const to = scene.indexOf('const stopTourLoop')
+    expect(from, 'runTourLoop has been renamed and this guard now covers nothing')
+      .toBeGreaterThan(-1)
+    expect(to, 'stopTourLoop has been renamed or moved above the loop, inverting this slice')
+      .toBeGreaterThan(from)
+    const loop = code(scene.slice(from, to))
+    expect(loop).toMatch(/\n\s*draw\(\)/)
+    expect(loop).not.toMatch(/requestRender\(\)/)
+    expect(loop).not.toMatch(/requestCameraRender\(\)/)
+    expect(loop).not.toMatch(/scheduleFrame\(\)/)
+    expect(loop).not.toMatch(/needsUpdate/)
+  })
+
+  /*
+   * Three handles now, and the argument for the third is the argument for the second.
+   *
+   * Whichever `cancelAnimationFrame` runs last silently orphans the others if they share a handle,
+   * and an orphaned tour is worse than an orphaned vehicle loop: it keeps *writing to the camera*,
+   * so a scene that has been disposed goes on flying over a city nothing can stop.
+   */
+  it('gives the tour loop its own handle, and cancels it on dispose', () => {
+    const loop = code(scene.slice(
+      scene.indexOf('const runTourLoop'),
+      scene.indexOf('const stopTourLoop'),
+    ))
+    expect(loop).not.toMatch(/animationHandle/)
+    expect(loop).not.toMatch(/vehicleHandle/)
+    expect(loop).toMatch(/tourHandle = requestAnimationFrame/)
+    const dispose = code(controllerMethod('dispose'))
+    expect(dispose).toMatch(/tourHandle !== 0\) cancelAnimationFrame\(tourHandle\)/)
+  })
+
+  /*
+   * And it ends by itself, rather than idling forever once the tour is switched off.
+   *
+   * Switching the toggle off is not a render-loop concern anywhere else in this scene, so the guard
+   * has to be inside the step: a `stopTourLoop()` that is only ever called from the controller
+   * would leave a disposed scene's loop running, which is the one thing the handle cannot fix
+   * because `dispose()` has already run by then.
+   */
+  it('stops the tour loop when the tour is switched off, emptied or disposed', () => {
+    const loop = code(scene.slice(
+      scene.indexOf('const runTourLoop'),
+      scene.indexOf('const stopTourLoop'),
+    ))
+    // Guarded before the first frame is ever requested…
+    expect(loop).toMatch(/if \(tourHandle !== 0 \|\| disposed \|\| !tourActive/)
+    // …and re-tested inside the step, so the next frame after any of them ends the chain.
+    expect(loop).toMatch(/if \(disposed \|\| !tourActive \|\| tourStops\.length === 0\) \{\s*tourHandle = 0/)
+  })
+
+  /*
+   * The per-frame camera write is guarded separately, because the loop guard cannot see it.
+   *
+   * These are source-text slices, so a `requestRender()` moved one call deep — into the function the
+   * loop invokes on every frame — passes the loop assertion above while costing exactly as much.
+   * `placeTourCamera` is that function, so it gets the same contract.
+   */
+  it('places the tour camera without scheduling a frame or a shadow pass', () => {
+    const from = scene.indexOf('function placeTourCamera(')
+    const to = scene.indexOf('function reportTourHeading(')
+    expect(from, 'placeTourCamera has been renamed and this guard now covers nothing')
+      .toBeGreaterThan(-1)
+    expect(to, 'reportTourHeading has been renamed or hoisted, inverting this slice')
+      .toBeGreaterThan(from)
+    const place = code(scene.slice(from, to))
+    expect(place).toMatch(/camera\.position\.copy/)
+    expect(place).not.toMatch(/shadowMap/)
+    expect(place).not.toMatch(/needsUpdate/)
+    expect(place).not.toMatch(/requestRender\(\)/)
+    expect(place).not.toMatch(/scheduleFrame\(\)/)
+  })
+
+
+  /*
    * Nothing a vehicle does can dirty the shadow map, because no vehicle casts into it.
    *
    * This is the property that makes the loop above safe at all. It is asserted over the whole build

@@ -81,6 +81,20 @@ import {
   type VehicleRoster,
 } from './cityVehicles'
 import type { LiveQueryEvent } from './liveQueryFeed'
+import {
+  TOUR_START,
+  breakingStopIndex,
+  openingShot,
+  planCityTour,
+  resumeIndex,
+  stepTour,
+  tourFrame,
+  type TourFacts,
+  type TourPoint,
+  type TourShot,
+  type TourState,
+  type TourStop,
+} from './cityTour'
 
 export type CityLayerToggles = {
   traffic: boolean
@@ -319,6 +333,18 @@ export type DatabaseCitySceneController = {
   /** Centres the camera on one building without changing zoom. */
   focusObject(objectId: string): void
   nudge(action: CameraNudge): void
+  /**
+   * Runs or stops the guided tour: the camera flying itself around the city indefinitely.
+   *
+   * The itinerary is planned by `cityTour.ts` from what this scene has actually been given and
+   * actually drew, and it is replanned whenever those change — so a block that starts while the
+   * tour is running gets visited rather than waiting for the next switch-on. `cityName` is only
+   * used for the establishing shot's caption.
+   *
+   * Any camera input from the viewer ends the tour, which is why nothing here is a "pause": a tour
+   * that resumed on its own would take the camera back off whoever had just grabbed it.
+   */
+  setTour(active: boolean, cityName: string): void
   /** Compass heading in degrees; 0 means the camera looks north. */
   heading(): number
   getPlan(): CityPlan | null
@@ -338,6 +364,15 @@ type SceneOptions = {
    * underneath it are redrawn, because a vehicle is only ever placed on a road this scene drew.
    */
   onVehicleRoster?: (roster: VehicleRoster) => void
+  /**
+   * Where the guided tour currently is, so the caption over the canvas can name it.
+   *
+   * Fired when the tour moves to a new stop and when it ends, never per frame: a caption that
+   * changes sixty times a second is a re-render sixty times a second, for text that changed on
+   * none of them. `active` false is also how the viewer's own click on the canvas gets back to the
+   * toggle, because the scene is what notices the input that ended the tour.
+   */
+  onTour?: (update: { active: boolean; stop: TourStop | null }) => void
 }
 
 export function createDatabaseCityScene(
@@ -2130,6 +2165,244 @@ export function createDatabaseCityScene(
     buildDisasters()
     if (animatedDisasters === 0) stopDisasterLoop()
     else runDisasterLoop()
+  }
+
+  /*
+   * ---------------------------------------------------------------- the guided tour
+   *
+   * The third frame loop, and the third handle. Placed below `stopVehicleLoop` deliberately:
+   * `shadowInvalidation.test.ts` slices this file by named anchors, and a function inserted between
+   * `runDampingLoop` and `runVehicleLoop` would silently extend the slice above it so the guard
+   * started asserting about code it was never written for.
+   *
+   * It obeys the same three rules the vehicle loop documents, for the same reasons:
+   *
+   * - **Its own handle.** `tourHandle`, cancelled in `dispose()` alongside the other two. Sharing
+   *   `animationHandle` would orphan whichever loop the damping loop zeroed the handle out from
+   *   under, leaving an rAF chain nothing could ever cancel.
+   * - **It stops itself.** The guard is re-tested every frame, so switching the tour off, emptying
+   *   the itinerary, or disposing the scene all end it on the next frame rather than leaving a
+   *   callback scheduled forever against a scene that has gone.
+   * - **It calls `draw()` directly.** A tour is minutes of continuous camera movement, and a
+   *   `requestRender()` in here would re-arm the 948-caster shadow pass on every one of those
+   *   frames — restoring far more than issue #90 removed. A directional sun's shadow map is drawn
+   *   from the light, so a camera flying around underneath it cannot change a texel of it.
+   */
+  let tourHandle = 0
+  let tourActive = false
+  let tourStops: readonly TourStop[] = []
+  let tourState: TourState = TOUR_START
+  /** The pose the current leg started from, captured rather than recomputed. See `tourFrame`. */
+  let tourFrom: TourShot | null = null
+  let tourCityName = ''
+  /** The stop last reported upwards, so the caption is pushed on change and not per frame. */
+  let tourReportedId: string | null = null
+  let tourHeadingAt = 0
+  const tourDirection = new THREE.Vector3()
+
+  /**
+   * How many world units of ground one orbit distance holds, through whichever lens is mounted.
+   *
+   * The same arithmetic `fitDistance` does, minus its vertical term — a tour target sits a few
+   * units above the kerb, so the height of the box never won there anyway. Factored out because the
+   * tour needs it in *both* directions: spans go out to the camera, and the camera comes back as a
+   * span whenever a leg starts from wherever the viewer left it.
+   */
+  function tourSpanFactor(): number {
+    const aspect = Math.max(canvas.clientWidth, 1) / Math.max(canvas.clientHeight, 1)
+    const vFov = THREE.MathUtils.degToRad(camera.fov)
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect)
+    return Math.max(1 / (2 * Math.tan(hFov / 2)), 1 / (2 * Math.tan(vFov / 2))) * 1.16
+  }
+
+  const tourDistance = (span: number) => Math.max(span, 90) * tourSpanFactor()
+
+  /** The camera as the tour would describe it, so a leg can glide out of a hand-dragged view. */
+  function cameraShot(): TourShot {
+    const offset = camera.position.clone().sub(controls.target)
+    const distance = Math.max(offset.length(), 1)
+    return {
+      x: controls.target.x,
+      z: controls.target.z,
+      y: controls.target.y,
+      span: distance / tourSpanFactor(),
+      azimuth: Math.atan2(offset.x, offset.z),
+      polar: Math.acos(THREE.MathUtils.clamp(offset.y / distance, -1, 1)),
+    }
+  }
+
+  /**
+   * What the tour is allowed to plan from: what this scene was given, and what it actually drew.
+   *
+   * The road polylines are the reason this is assembled here rather than in the view. A vehicle is
+   * placed on a road this scene put down and so is a tour camera following one, and `roadPaths` is
+   * the only record of where those went.
+   */
+  function tourFacts(): TourFacts {
+    const lots = new Map<string, TourPoint>()
+    if (plan) for (const [objectId, lot] of plan.lots) lots.set(objectId, { x: lot.x, z: lot.z })
+    const paths = new Map<string, readonly TourPoint[]>()
+    for (const [routeId, entry] of roadPaths) paths.set(routeId, entry.polyline)
+    return {
+      cityName: tourCityName,
+      bounds: plan
+        ? plan.bounds
+        : { minX: 0, maxX: 0, minZ: 0, maxZ: 0, centerX: 0, centerZ: 0, width: 0, depth: 0 },
+      cell: plan?.cell ?? 30,
+      objects: currentObjects,
+      lots,
+      roads: currentRoads,
+      roadPaths: paths,
+      incidents: currentIncidents,
+    }
+  }
+
+  function reportTourStop() {
+    const stop = tourActive ? tourStops[tourState.index] ?? null : null
+    const id = stop?.id ?? null
+    if (id === tourReportedId && (tourActive || tourReportedId === null)) return
+    tourReportedId = id
+    options.onTour?.({ active: tourActive, stop })
+  }
+
+  /**
+   * Place the camera for this instant of the itinerary.
+   *
+   * The mode clamps are the same ones `frame()` applies and for the same reason: dropping the
+   * camera to an oblique angle while the flat basemap has the controls locked flat would snap back
+   * the moment anything called `controls.update()`, taking the heading with it. So a tour of the
+   * printed basemap pans and zooms and does not tilt, which is what a basemap is.
+   */
+  function placeTourCamera() {
+    const stop = tourStops[tourState.index]
+    if (!stop) return
+    const flat = viewMode === 'map'
+    const { shot } = tourFrame(tourFrom ?? openingShot(stop), stop, tourState.elapsed)
+    const polar = flat ? 0.0005 : THREE.MathUtils.clamp(shot.polar, 0.05, Math.PI / 2 - 0.05)
+    const azimuth = flat ? 0 : shot.azimuth
+    const distance = THREE.MathUtils.clamp(
+      tourDistance(shot.span),
+      controls.minDistance,
+      controls.maxDistance,
+    )
+    controls.target.set(shot.x, flat ? 0 : shot.y, shot.z)
+    tourDirection.set(
+      Math.sin(polar) * Math.sin(azimuth),
+      Math.cos(polar),
+      Math.sin(polar) * Math.cos(azimuth))
+    camera.position.copy(controls.target).addScaledVector(tourDirection, distance)
+    camera.lookAt(controls.target)
+    // Carried across so that stopping the tour, or switching to the flat basemap and back, leaves
+    // the city on the bearing the tour left it on rather than snapping to the default.
+    if (!flat) cityAzimuth = azimuth
+    setDepthRange(distance)
+  }
+
+  /**
+   * The compass, kept alive without re-rendering the viewport sixty times a second.
+   *
+   * `controls.update()` is what normally fires `change`, and the tour deliberately never calls it —
+   * OrbitControls' damping would fight a camera that is being written to directly. So the heading
+   * is pushed from here instead, rate-limited, because the consumer is React state.
+   */
+  function reportTourHeading(now: number) {
+    if (now - tourHeadingAt < 200) return
+    tourHeadingAt = now
+    options.onCameraChange?.()
+  }
+
+  const runTourLoop = () => {
+    if (tourHandle !== 0 || disposed || !tourActive || tourStops.length === 0) return
+    let previous = performance.now()
+    const step = (now: number) => {
+      if (disposed || !tourActive || tourStops.length === 0) {
+        tourHandle = 0
+        return
+      }
+      /*
+       * Clamped, because a backgrounded tab hands back the whole gap on the frame it resumes and
+       * running the itinerary through that would teleport the camera mid-leg.
+       *
+       * The ceiling is deliberately far above any frame this scene actually draws, and that
+       * matters more than it looks. A clamp *below* the real frame interval does not bound
+       * anything — it silently rescales time, because it bites on every frame rather than on the
+       * exceptional one. Measured at 1440×900 over a 4,200-object city, the establishing shot
+       * costs a median 147 ms and a max 197 ms per frame; a 100 ms ceiling therefore ran the whole
+       * tour at ~68% speed, and the symptom was four stops in a minute where the itinerary asks
+       * for six. Half a second clears the worst measured frame with room to spare and still bounds
+       * a tab-restore jump to a fraction of a leg.
+       */
+      const elapsed = Math.min(now - previous, 500)
+      previous = now
+      const from = tourState.index
+      tourState = stepTour(tourState, tourStops, elapsed)
+      if (tourState.index !== from) {
+        // The next leg travels from wherever the last one finished, which is right here.
+        tourFrom = cameraShot()
+        reportTourStop()
+      }
+      placeTourCamera()
+      reportTourHeading(now)
+      draw()
+      tourHandle = requestAnimationFrame(step)
+    }
+    tourHandle = requestAnimationFrame(step)
+  }
+
+  const stopTourLoop = () => {
+    if (tourHandle === 0) return
+    cancelAnimationFrame(tourHandle)
+    tourHandle = 0
+  }
+
+  /**
+   * Rebuild the itinerary against data that has moved, without throwing away where the tour is.
+   *
+   * Called from every setter that changes what there is to look at. Restarting at stop zero on each
+   * of those would pin a busy instance on its establishing shot forever, because the live feed moves
+   * more often than a single stop lasts.
+   */
+  function refreshTour() {
+    if (!tourActive) return
+    const previous = tourStops
+    const next = planCityTour(tourFacts(), { reducedMotion })
+    tourStops = next
+    if (next.length === 0) {
+      tourState = TOUR_START
+      reportTourStop()
+      return
+    }
+    const breaking = breakingStopIndex(previous, next)
+    if (breaking !== -1) {
+      // Something is blocked that was not blocked a moment ago. That is the one thing on this map
+      // worth abandoning a shot for; see `breakingStopIndex`.
+      tourState = { index: breaking, elapsed: 0 }
+      tourFrom = cameraShot()
+    } else {
+      const index = resumeIndex(previous, next, tourState.index)
+      const carried = previous[tourState.index]?.id === next[index]?.id
+      tourState = { index, elapsed: carried ? tourState.elapsed : 0 }
+      if (!carried) tourFrom = cameraShot()
+    }
+    reportTourStop()
+    runTourLoop()
+  }
+
+  /**
+   * End the tour because the viewer took the camera.
+   *
+   * Deliberately not a pause. A tour that resumed on its own after a few idle seconds would take
+   * the camera back off someone who had just grabbed it, which is the single most irritating thing
+   * an attract mode can do.
+   */
+  function endTourOnInput() {
+    if (!tourActive) return
+    tourActive = false
+    stopTourLoop()
+    // Hand the camera back where it stands. OrbitControls re-derives its spherical coordinates from
+    // the camera and the target on every update, so a pose written underneath it resumes cleanly.
+    controls.update()
+    reportTourStop()
   }
 
   controls.addEventListener('change', () => {
@@ -3969,6 +4242,9 @@ export function createDatabaseCityScene(
   // A pointer-up that follows an orbit drag must not also select a building.
   let pointerDownAt: { x: number; y: number; button: number } | null = null
   const rememberPointer = (event: PointerEvent) => {
+    // Touching the canvas at all is the viewer taking the camera, so the tour gets out of the way
+    // before OrbitControls sees the drag. It is ended rather than paused; see `endTourOnInput`.
+    endTourOnInput()
     pointerDownAt = { x: event.clientX, y: event.clientY, button: event.button }
   }
   const maybeSelect = (event: PointerEvent) => {
@@ -4010,6 +4286,9 @@ export function createDatabaseCityScene(
   }
 
   canvas.addEventListener('pointerdown', rememberPointer)
+  // Scrolling to zoom never produces a pointerdown, so it needs its own way of ending the tour —
+  // otherwise the wheel and the itinerary fight over the same orbit distance.
+  canvas.addEventListener('wheel', endTourOnInput, { passive: true })
   canvas.addEventListener('pointerup', maybeSelect)
   canvas.addEventListener('pointercancel', cancelPointer)
   canvas.addEventListener('pointermove', trackHover)
@@ -4109,6 +4388,9 @@ export function createDatabaseCityScene(
         framedOnce = true
         frame(cityBox())
       }
+      // A page that loaded more objects has more landmarks worth visiting, and the buildings the
+      // tour was already touring may have moved.
+      refreshTour()
       requestRender()
     },
     setRoads(roads) {
@@ -4116,6 +4398,8 @@ export function createDatabaseCityScene(
       if (plan) buildRoads(roads, plan)
       // Vehicles drive the roads as drawn, so a re-graded network re-homes the traffic on it.
       refreshVehicles()
+      // And the tour follows the roads as drawn, so a re-graded network re-plans which it visits.
+      refreshTour()
       requestRender()
     },
     setTraffic(traffic) {
@@ -4197,6 +4481,8 @@ export function createDatabaseCityScene(
       refreshVehicles()
       // Wreckage is placed at the deadlock pins, which the rebuild above just recomputed.
       refreshDisasters()
+      // A pin that was not there a moment ago is what the tour cuts away for.
+      refreshTour()
       requestRender()
     },
     setVehicles(events, families) {
@@ -4219,9 +4505,11 @@ export function createDatabaseCityScene(
       }
     },
     resetView() {
+      endTourOnInput()
       frame(cityBox())
     },
     frameRoute() {
+      endTourOnInput()
       if (!currentRoute || currentRoute.polyline.length === 0) return
       const box = new THREE.Box3()
       for (const point of currentRoute.polyline) {
@@ -4231,6 +4519,7 @@ export function createDatabaseCityScene(
       frame(box)
     },
     frameRoad(routeId) {
+      endTourOnInput()
       const entry = roadPaths.get(routeId)
       if (!entry || entry.polyline.length === 0) return
       const box = new THREE.Box3()
@@ -4241,6 +4530,7 @@ export function createDatabaseCityScene(
       frame(box)
     },
     focusObject(objectId) {
+      endTourOnInput()
       const lot = plan?.lots.get(objectId)
       if (!lot) return
       const offset = camera.position.clone().sub(controls.target)
@@ -4250,6 +4540,7 @@ export function createDatabaseCityScene(
       requestCameraRender()
     },
     nudge(action) {
+      endTourOnInput()
       const forward = new THREE.Vector3()
       camera.getWorldDirection(forward)
       forward.y = 0
@@ -4299,6 +4590,27 @@ export function createDatabaseCityScene(
       // Every arm of `nudge` moves the camera and nothing else.
       requestCameraRender()
     },
+    setTour(active, cityName) {
+      tourCityName = cityName
+      if (!active) {
+        if (!tourActive) return
+        tourActive = false
+        stopTourLoop()
+        // Hand the camera back where it stands, and let the controls re-derive their own state
+        // from it. Without this the next drag starts from wherever the tour was switched *on*.
+        controls.update()
+        reportTourStop()
+        return
+      }
+      tourStops = planCityTour(tourFacts(), { reducedMotion })
+      if (tourStops.length === 0) return
+      tourActive = true
+      tourState = TOUR_START
+      // The first leg glides out of wherever the viewer had left the camera, rather than cutting.
+      tourFrom = cameraShot()
+      reportTourStop()
+      runTourLoop()
+    },
     heading() {
       const forward = new THREE.Vector3()
       camera.getWorldDirection(forward)
@@ -4310,10 +4622,12 @@ export function createDatabaseCityScene(
       if (animationHandle !== 0) cancelAnimationFrame(animationHandle)
       if (vehicleHandle !== 0) cancelAnimationFrame(vehicleHandle)
       if (disasterHandle !== 0) cancelAnimationFrame(disasterHandle)
+      if (tourHandle !== 0) cancelAnimationFrame(tourHandle)
       if (hoverHandle !== 0) cancelAnimationFrame(hoverHandle)
       resize.disconnect()
       stopWatchingClock()
       canvas.removeEventListener('pointerdown', rememberPointer)
+      canvas.removeEventListener('wheel', endTourOnInput)
       canvas.removeEventListener('pointerup', maybeSelect)
       canvas.removeEventListener('pointercancel', cancelPointer)
       canvas.removeEventListener('pointermove', trackHover)
