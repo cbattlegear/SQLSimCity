@@ -59,6 +59,79 @@ public sealed class ProtectedQueryStoreHistoryTests
     }
 
     [Fact]
+    public async Task VariantFamilySurvivesRestoredPublicationWithoutRecollection()
+    {
+        var repository = new ProtectedQueryStoreRepository(new MemoryProtectedStore());
+        using (var sink = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker()))
+            await PublishCycleAsync(sink, 40);
+        var before = Assert.Single((await repository.ReadPublishedSnapshotAsync())!.Families);
+        using var restarted = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker());
+        await restarted.PublishAsync(new(false, Now, Now.AddMinutes(5), []), default);
+        var after = Assert.Single((await repository.ReadPublishedSnapshotAsync())!.Families);
+        Assert.Equal(before.Family.FamilyId, after.Family.FamilyId);
+        Assert.Equal(before.Family.ExecutionCount, after.Family.ExecutionCount);
+        Assert.Equal(2, after.Family.PhysicalQueries.Count);
+        Assert.Equal("db:dispatcher", after.Plans.Single(plan => plan.PlanType == QueryPlanType.Variant).DispatcherPlanId);
+        Assert.Equal(QueryOptimizationKind.ParameterSensitivePlan,
+            after.Plans.Single(plan => plan.PlanType == QueryPlanType.Variant).Optimization);
+    }
+
+    [Fact]
+    public async Task CancelledRestoreDoesNotMakeTheNextCallerAcceptEmptyHistory()
+    {
+        var store = new MemoryProtectedStore();
+        var repository = new ProtectedQueryStoreRepository(store);
+        using (var initial = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker()))
+            await PublishCycleAsync(initial, 40);
+        store.PointerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.ReleasePointer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var sink = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker());
+        using var cancellation = new CancellationTokenSource();
+        var first = sink.PublishAsync(new(false, Now, Now, []), cancellation.Token);
+        await store.PointerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first);
+        store.ReleasePointer.TrySetResult();
+
+        await sink.PublishAsync(new(false, Now, Now, []), default);
+
+        var snapshot = (await repository.ReadPublishedSnapshotAsync())!;
+        Assert.Equal("40", Assert.Single(snapshot.Families).Family.ExecutionCount);
+    }
+
+    [Fact]
+    public async Task ConcurrentDatabaseStartsWaitForOneCompleteRestore()
+    {
+        var store = new MemoryProtectedStore();
+        var repository = new ProtectedQueryStoreRepository(store);
+        using (var initial = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker()))
+        {
+            await PublishCycleAsync(initial, 4, databaseId: "db-a");
+            await PublishCycleAsync(initial, 8, databaseId: "db-b");
+        }
+        store.PointerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.ReleasePointer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.PointerReads = 0;
+        using var sink = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker());
+        var first = sink.BeginDatabaseCycleAsync(State("db-a"), "epoch", false, default);
+        await store.PointerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var second = sink.BeginDatabaseCycleAsync(State("db-b"), "epoch", false, default);
+        store.ReleasePointer.TrySetResult();
+        await Task.WhenAll(first, second);
+        Assert.Equal(1, store.PointerReads);
+        await sink.AbortDatabaseCycleAsync("db-a", default);
+        await sink.AbortDatabaseCycleAsync("db-b", default);
+        await sink.PublishAsync(new(false, Now, Now, []), default);
+        var snapshot = (await repository.ReadPublishedSnapshotAsync())!;
+        Assert.Equal("4", snapshot.Families.Single(family => family.Family.DatabaseId == "db-a").Family.ExecutionCount);
+        Assert.Equal("8", snapshot.Families.Single(family => family.Family.DatabaseId == "db-b").Family.ExecutionCount);
+
+        static QueryStoreDatabaseState State(string database) =>
+            new(database, QueryStoreCollectionState.ReadWrite, "epoch", Now.AddHours(-1), Now,
+                "ready", 16, 160, true, false, false, false);
+    }
+
+    [Fact]
     public async Task RawPayloadsUseOnlySensitiveProtectedRecordKinds()
     {
         var store = new MemoryProtectedStore();
@@ -679,6 +752,9 @@ public sealed class ProtectedQueryStoreHistoryTests
         public Dictionary<string, ProtectedRecord> Records { get; } = new(StringComparer.Ordinal);
         public string? ThrowRecordKind { get; set; }
         public int MaxPayloadBytes { get; init; } = 1_048_576;
+        public TaskCompletionSource? PointerEntered { get; set; }
+        public TaskCompletionSource? ReleasePointer { get; set; }
+        public int PointerReads;
 
         public Task PutAsync(
             ProtectedRecordId id, string recordKind, DateTimeOffset capturedAt,
@@ -694,12 +770,18 @@ public sealed class ProtectedQueryStoreHistoryTests
             return Task.CompletedTask;
         }
 
-        public Task<ProtectedRecord?> GetAsync(
+        public async Task<ProtectedRecord?> GetAsync(
             ProtectedRecordId id, CancellationToken cancellationToken = default)
         {
+            if (id.Value == "qs:current-snapshot-pointer" && ReleasePointer is { } release)
+            {
+                Interlocked.Increment(ref PointerReads);
+                PointerEntered?.TrySetResult();
+                await release.Task.WaitAsync(cancellationToken);
+            }
             var value = Records.GetValueOrDefault(id.Value);
-            return Task.FromResult(value is null ? null : new ProtectedRecord(
-                value.Id, value.RecordKind, value.CapturedAt, value.Resolution, value.Payload));
+            return value is null ? null : new ProtectedRecord(
+                value.Id, value.RecordKind, value.CapturedAt, value.Resolution, value.Payload);
         }
 
         public Task<bool> DeleteAsync(

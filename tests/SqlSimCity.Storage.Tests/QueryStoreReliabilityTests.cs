@@ -76,12 +76,21 @@ public sealed class QueryStoreReliabilityTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task LegacyPublicationTimestampIsUnknownRatherThanClaimedAsAnObservation()
+    [Theory]
+    [InlineData(QueryStoreCollectionState.ReadWrite, DataStatus.Unknown)]
+    [InlineData(QueryStoreCollectionState.Off, DataStatus.Disabled)]
+    [InlineData(QueryStoreCollectionState.PermissionDenied, DataStatus.PermissionDenied)]
+    [InlineData(QueryStoreCollectionState.Unsupported, DataStatus.Unsupported)]
+    public async Task LegacyPublicationTimestampIsUnknownRatherThanClaimedAsAnObservation(
+        QueryStoreCollectionState attempt, DataStatus expected)
     {
         using var store = await OpenStoreAsync();
         var repository = new ProtectedQueryStoreRepository(store);
-        await CollectAsync(repository, new ReliabilitySource(_clock));
+        var source = new ReliabilitySource(_clock);
+        await CollectAsync(repository, source);
+        source.States["db"] = attempt;
+        source.States["sibling"] = attempt;
+        await CollectAsync(repository, source);
         var snapshot = (await repository.ReadPublishedSnapshotAsync())!;
         await repository.PublishSnapshotAsync(snapshot with { DatabaseObservations = null });
         _clock.Advance(TimeSpan.FromMinutes(5));
@@ -91,8 +100,8 @@ public sealed class QueryStoreReliabilityTests : IDisposable
         var restored = (await repository.ReadPublishedSnapshotAsync())!;
         Assert.All(restored.Families, family =>
         {
-            AssertEvidence(family.Family.Evidence, null, DataStatus.Unknown);
-            Assert.All(family.Runtime, bucket => AssertEvidence(bucket.Evidence, null, DataStatus.Unknown));
+            AssertEvidence(family.Family.Evidence, null, expected);
+            Assert.All(family.Runtime, bucket => AssertEvidence(bucket.Evidence, null, expected));
         });
     }
 
@@ -316,6 +325,9 @@ public sealed class QueryStoreReliabilityTests : IDisposable
         var restarted = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker());
         await Assert.ThrowsAsync<FormatException>(() =>
             restarted.PublishAsync(new(false, Now, Now, []), default));
+        await repository.PublishSnapshotAsync(snapshot);
+        await restarted.PublishAsync(new(false, Now, Now, []), default);
+        Assert.Equal(WaitSignature(snapshot), WaitSignature((await repository.ReadPublishedSnapshotAsync())!));
     }
 
     private static string[] WaitSignature(QueryStorePublishedSnapshot snapshot) =>

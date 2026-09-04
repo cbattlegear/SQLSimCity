@@ -13,7 +13,7 @@ public sealed class ProtectedQueryStoreHistorySink(
     ProtectedQueryStoreRepository repository,
     QueryStoreCollectionStatusTracker statusTracker,
     ILogger<ProtectedQueryStoreHistorySink>? logger = null,
-    QueryStoreRetentionOptions? retention = null) : IQueryStoreHistorySink
+    QueryStoreRetentionOptions? retention = null) : IQueryStoreHistorySink, IDisposable
 {
     /// <summary>
     /// Information, not Debug: every publish rewrites the whole slot, so this is the one number
@@ -36,11 +36,15 @@ public sealed class ProtectedQueryStoreHistorySink(
     private readonly ConcurrentDictionary<string, DatabaseFacts> _committed = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DatabaseFacts> _staged = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, QueryStoreWatermark> _pendingWatermarks = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _loadGate = new(1, 1);
+    private bool _loaded;
     private long _sequence;
     public QueryStoreBuildInspection LastBuildInspection { get; private set; } = new(0, 0, 0, 0, 0, 0);
 
     /// <summary>What the most recent publish cost. <see cref="QueryStorePublishCost.None"/> before the first.</summary>
     public QueryStorePublishCost LastPublishCost { get; private set; } = QueryStorePublishCost.None;
+
+    public void Dispose() => _loadGate.Dispose();
 
     public Task<QueryStoreWatermark?> GetWatermarkAsync(
         string databaseId,
@@ -283,25 +287,49 @@ public sealed class ProtectedQueryStoreHistorySink(
 
     private async Task EnsureLoadedAsync(CancellationToken cancellationToken)
     {
-        if (!_committed.IsEmpty || Volatile.Read(ref _sequence) != 0) return;
-        var snapshot = await repository.ReadPublishedSnapshotAsync(cancellationToken).ConfigureAwait(false);
-        if (snapshot is null)
+        if (Volatile.Read(ref _loaded)) return;
+        await _loadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            Interlocked.CompareExchange(ref _sequence, 0, 0);
-            return;
+            if (_loaded) return;
+            await LoadSnapshotAsync(cancellationToken).ConfigureAwait(false);
+            Volatile.Write(ref _loaded, true);
         }
-        Interlocked.Exchange(ref _sequence, snapshot.Sequence);
-        foreach (var group in snapshot.Families.GroupBy(detail => detail.Family.DatabaseId))
-            _committed.TryAdd(group.Key, DatabaseFacts.FromPublished(
-                group.Key, group, snapshot.DatabaseObservations is not null));
+        finally
+        {
+            _loadGate.Release();
+        }
+    }
+
+    private async Task LoadSnapshotAsync(CancellationToken cancellationToken)
+    {
+        var snapshot = await repository.ReadPublishedSnapshotAsync(cancellationToken).ConfigureAwait(false);
+        if (snapshot is null) return;
+        var restored = snapshot.Families.GroupBy(detail => detail.Family.DatabaseId)
+            .ToDictionary(group => group.Key, group => DatabaseFacts.FromPublished(
+                group.Key, group, snapshot.DatabaseObservations is not null), StringComparer.Ordinal);
         if (snapshot.DatabaseObservations is { } observations)
             foreach (var pair in observations)
             {
-                var state = _committed.GetOrAdd(pair.Key, id => new DatabaseFacts(id));
+                if (!restored.TryGetValue(pair.Key, out var state))
+                    restored[pair.Key] = state = new DatabaseFacts(pair.Key);
                 state.State = pair.Value.LastSuccess;
                 state.AttemptState = pair.Value.AttemptState;
                 state.AttemptReason = pair.Value.Reason;
             }
+        else
+            foreach (var status in snapshot.Status.Databases)
+            {
+                if (!Enum.TryParse<QueryStoreCollectionState>(status.State.ToString(), out var attempt) ||
+                    !Enum.IsDefined(attempt))
+                    throw new InvalidDataException("The stored Query Store attempt state is invalid.");
+                if (!restored.TryGetValue(status.DatabaseId, out var state))
+                    restored[status.DatabaseId] = state = new DatabaseFacts(status.DatabaseId);
+                state.AttemptState = attempt;
+                state.AttemptReason += $" Last reported outcome: {status.Reason}";
+            }
+        foreach (var pair in restored) _committed.TryAdd(pair.Key, pair.Value);
+        Interlocked.Exchange(ref _sequence, snapshot.Sequence);
     }
 
     private DatabaseFacts GetStage(string databaseId) =>
@@ -814,6 +842,15 @@ public sealed class ProtectedQueryStoreHistorySink(
                         BigInteger.Parse(plan.ForceFailureCount, CultureInfo.InvariantCulture),
                         plan.LastForceFailureReason, plan.EngineVersion, plan.CompatibilityLevel,
                         plan.LastExecutionAt);
+                foreach (var plan in detail.Plans)
+                {
+                    if (plan.DispatcherPlanId is not { } dispatcherPlanId) continue;
+                    var dispatcherId = RawId(databaseId, dispatcherPlanId);
+                    if (!state.Plans.TryGetValue(dispatcherId, out var dispatcher))
+                        throw new InvalidDataException("A restored Query Store variant has no dispatcher plan.");
+                    state.Variants[plan.QueryId] = new QueryVariantFact(
+                        plan.QueryId, dispatcher.QueryId, dispatcherId, plan.Optimization);
+                }
                 foreach (var runtime in detail.Runtime)
                 {
                     // Pre-v1.0 snapshots combined epoch and interval into one opaque field.
