@@ -74,6 +74,7 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
     private readonly Dictionary<string, NormalizedShowplanV1> _plans = [];
 
     public string? TotalCount { get; init; }
+    public string ExpectedDatabaseName { get; init; } = DatabaseName;
     public bool ThrowOnQueries { get; init; }
     public bool ReturnNullPlans { get; init; }
     public HashSet<string> UnavailablePlanIds { get; } = new(StringComparer.Ordinal);
@@ -98,11 +99,12 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
         (string PlanId, PlanNode[] Nodes)[] plans,
         string waitMilliseconds = "0",
         IReadOnlyList<IReadOnlyDictionary<string, string>>? runtimeWaits = null,
-        IReadOnlyList<RuntimeInterval>? runtimeIntervals = null)
+        IReadOnlyList<RuntimeInterval>? runtimeIntervals = null,
+        string databaseId = DatabaseName)
     {
         var text = new QueryTextDescriptorV1(QueryTextAvailability.Available, "SELECT 1", "fp", "Captured.");
         var summary = new QueryFamilySummaryV1(
-            familyId, DatabaseName, $"hash-{familyId}", "fp", text, [],
+            familyId, databaseId, $"hash-{familyId}", "fp", text, [],
             executions, cpu, "2000", "300", waitMilliseconds, Observed, Observed, Evidence);
         _families.Add(summary);
 
@@ -153,7 +155,7 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
 
         RequestedDatabaseId = databaseId;
         RequestedPageSize = pageSize;
-        Assert.Equal(DatabaseName, databaseId);
+        Assert.Equal(ExpectedDatabaseName, databaseId);
         Assert.Equal("cpu", metric);
         return Task.FromResult(new PageV1<QueryFamilySummaryV1>(
             "1.0", _families.Take(pageSize).ToArray(), null, pageSize, TotalCount) { Evidence = Evidence });

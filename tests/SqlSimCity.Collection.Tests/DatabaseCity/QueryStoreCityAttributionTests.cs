@@ -37,6 +37,67 @@ public sealed class QueryStoreCityAttributionTests
             CancellationToken.None);
 
     [Fact]
+    public async Task PublishedDatabaseNamespaceUsesExactFamilyIdentityRatherThanCatalogAlias()
+    {
+        var store = new FakeQueryStore { ExpectedDatabaseName = "Sales" };
+        store.AddFamily("first", "1", "1", [Plan("first-plan", Reference(table: "Customer"))],
+            databaseId: "sAlEs");
+        store.AddFamily("second", "1", "1", [Plan("second-plan", Reference(table: "OrderHeader"))],
+            databaseId: "sAlEs");
+
+        var result = await new QueryStoreCityAttribution(store).AttributeAsync(
+            "Sales", DatabaseCityMetric.Cpu, PageObjects, new Dictionary<string, string>(), 12, default);
+
+        Assert.Equal(2, result.Families.Count);
+        Assert.Equal("sAlEs", result.QueryStoreDatabaseId);
+        Assert.Equal("Sales", store.RequestedDatabaseId);
+    }
+
+    [Theory]
+    [InlineData("Sales")]
+    [InlineData("inventory")]
+    public async Task PublishedDatabaseNamespaceIsUnknownWhenFamilyIdentitiesDisagree(string secondDatabaseId)
+    {
+        var store = new FakeQueryStore();
+        store.AddFamily("first", "1", "1", [Plan("first-plan", Reference(table: "Customer"))],
+            databaseId: "sales");
+        store.AddFamily("second", "1", "1", [Plan("second-plan", Reference(table: "OrderHeader"))],
+            databaseId: secondDatabaseId);
+
+        var result = await AttributeAsync(store);
+
+        Assert.Equal(2, result.Families.Count);
+        Assert.Null(result.QueryStoreDatabaseId);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("inventory")]
+    public async Task PublishedDatabaseNamespaceCannotAttestBlankOrUnrelatedFamilyIdentities(string databaseId)
+    {
+        var store = new FakeQueryStore();
+        store.AddFamily("first", "1", "1", [Plan("plan", Reference(table: "Customer"))],
+            databaseId: databaseId);
+
+        var result = await AttributeAsync(store);
+
+        Assert.Single(result.Families);
+        Assert.Null(result.QueryStoreDatabaseId);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PublishedDatabaseNamespaceIsUnknownWithoutReadableFamilySummaries(bool failed)
+    {
+        var result = await AttributeAsync(new FakeQueryStore { ThrowOnQueries = failed });
+
+        Assert.Empty(result.Families);
+        Assert.Null(result.QueryStoreDatabaseId);
+    }
+
+    [Fact]
     public async Task SingleObjectPlanIsConfirmedAndCarriesTheFamilyTotalsUndivided()
     {
         var store = new FakeQueryStore();

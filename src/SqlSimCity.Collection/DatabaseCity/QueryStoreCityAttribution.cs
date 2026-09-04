@@ -30,7 +30,11 @@ public sealed record CityAttributionResult(
     DatabaseCityWorkloadAggregateV1 OtherWorkload,
     IReadOnlyList<DatabaseCityRouteV1> Routes,
     IReadOnlyDictionary<string, DatabaseCityAttributedExposureV1> ExposureByObjectId,
-    EvidenceV1 Evidence);
+    EvidenceV1 Evidence)
+{
+    /// <summary>The exact namespace attested by all returned family summaries, never a catalog alias.</summary>
+    public string? QueryStoreDatabaseId { get; init; }
+}
 
 /// <summary>
 /// Joins Query Store query families to the catalog objects of a bounded database-city page by
@@ -198,12 +202,20 @@ public sealed class QueryStoreCityAttribution(
                 exposureEligible.Add(resolved.Family);
         }
 
+        var queryStoreDatabaseId = page.Items[0].DatabaseId;
         return new CityAttributionResult(
             families,
             OtherWorkload(page, families.Count, pageEvidence),
             routes.Build(),
             BuildExposure(families, exposureEligible, index, pageEvidence),
-            pageEvidence);
+            pageEvidence)
+        {
+            QueryStoreDatabaseId = !string.IsNullOrWhiteSpace(queryStoreDatabaseId) &&
+                StringComparer.OrdinalIgnoreCase.Equals(queryStoreDatabaseId, databaseName) &&
+                page.Items.All(summary => StringComparer.Ordinal.Equals(summary.DatabaseId, queryStoreDatabaseId))
+                    ? queryStoreDatabaseId
+                    : null,
+        };
     }
 
     private async Task<ResolvedFamily> AttributeFamilyAsync(
