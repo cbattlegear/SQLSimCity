@@ -1,6 +1,13 @@
 import type { DatabaseCityObject } from './databaseCityContracts'
 import type { IncidentProjection } from './cityIncidents'
 import type { CityRoute } from './cityRoute'
+import {
+  DEGRADING_WARNING_KINDS,
+  EMPTY_DISASTER_SURVEY,
+  type DisasterSurvey,
+  type SurveyedMissingIndex,
+  type SurveyedWarning,
+} from './cityDisasterSurvey'
 
 /**
  * How much of the optimizer's own estimated saving a suggested index must promise before the
@@ -12,22 +19,10 @@ import type { CityRoute } from './cityRoute'
 export const LARGE_MISSING_INDEX_IMPACT_PERCENT = 80
 
 /**
- * Warning kinds the parser can actually produce, which is narrower than the set of kinds SQL Server
- * documents.
- *
- * A kind is the raw Showplan element or attribute name. `SpillToTempDb` and `PlanAffectingConvert`
- * are elements; `NoJoinPredicate` is an attribute on `<Warnings>` and only became reachable once the
- * parser started reading those. Names that are neither — `HashSpill`, `SortSpill` — match nothing no
- * matter how plausible they look, so they are deliberately absent rather than kept as harmless
- * spares: a set entry that can never match is a rule that silently never fires.
+ * Re-exported so the projection and the survey can never disagree about which warning kinds are
+ * degrading. The set lives with the parser-facing code that produces the kinds.
  */
-const DEGRADING_WARNING_KINDS = new Set([
-  'spilltotempdb',
-  'unmatchedindexes',
-  'planaffectingconvert',
-  'nojoinpredicate',
-  'columnswithnostatistics',
-])
+export { DEGRADING_WARNING_KINDS }
 
 export interface CityDisaster {
   readonly key: 'water-main-break' | 'building-fire' | 'car-crash' | 'stats-decay'
@@ -45,19 +40,111 @@ export interface CityDisasterProjection {
   readonly staleStatsObjectIds: readonly string[]
   /** Objects the optimizer asked for an index on, weighted by its own estimated impact. */
   readonly fireObjectIds: readonly string[]
+  /**
+   * Objects whose work carries a warning the engine associates with degraded behaviour.
+   *
+   * Separate from {@link fireObjectIds} because they are different evidence with different remedies,
+   * and because a building can honestly be both: a table with no useful index that also spills is
+   * on fire *and* has a burst main under it.
+   */
+  readonly waterMainObjectIds: readonly string[]
+  /**
+   * True when at least one plan was read that carried missing-index evidence at all.
+   *
+   * Distinguishes "the optimizer asked for nothing" from "nothing was read", which is the difference
+   * between a city with no fires and a city nobody surveyed.
+   */
+  readonly missingIndexesObserved: boolean
+}
+
+/**
+ * A disaster whose only evidence is one routed plan is a disaster that exists for as long as the
+ * operator keeps that plan on screen. Merging the routed plan into the surveyed workload is what
+ * lets the same rules light the whole city permanently, and the dedupe by plan id in
+ * {@link projectCityDisasters} is what stops the routed plan being counted twice once the survey
+ * has read it too.
+ */
+function routeMissingIndexes(route: CityRoute): SurveyedMissingIndex[] {
+  return route.missingIndexes.map(missing => ({
+    objectId: missing.objectId,
+    label: missing.label,
+    impactPercent: missing.impactPercent,
+    familyId: `plan:${route.planId}`,
+    planId: route.planId,
+  }))
+}
+
+function routeWarnings(route: CityRoute): SurveyedWarning[] {
+  const warnings: SurveyedWarning[] = []
+  for (const stop of route.stops) {
+    for (const warning of stop.warnings) {
+      const kind = warningKind(warning)
+      if (!DEGRADING_WARNING_KINDS.has(kind)) continue
+      warnings.push({
+        kind,
+        objectId: stop.objectId,
+        label: stop.label,
+        familyId: `plan:${route.planId}`,
+        planId: route.planId,
+      })
+    }
+  }
+  /*
+   * An unplaced operation's warning is real and is counted, but it belongs to no table by
+   * definition -- that is what "unplaced" means -- so it carries a null object and is never drawn
+   * on a building that did not produce it.
+   */
+  for (const operation of route.unplacedOperations) {
+    for (const warning of operation.warnings) {
+      const kind = warningKind(warning)
+      if (!DEGRADING_WARNING_KINDS.has(kind)) continue
+      warnings.push({
+        kind,
+        objectId: null,
+        label: operation.physicalOperation,
+        familyId: `plan:${route.planId}`,
+        planId: route.planId,
+      })
+    }
+  }
+  return warnings
 }
 
 export function projectCityDisasters({
   incidents,
   route,
   objects,
+  survey = EMPTY_DISASTER_SURVEY,
 }: {
   incidents: IncidentProjection
   route: CityRoute | null
   objects: readonly DatabaseCityObject[]
+  /**
+   * The workload's surveyed plans. Defaults to the empty survey so a caller that has not run one --
+   * or has not finished running one -- gets exactly the routed plan's evidence and no claim about
+   * the rest of the workload.
+   */
+  survey?: DisasterSurvey
 }): CityDisasterProjection {
   const items: CityDisaster[] = []
-  const fireObjectIds: string[] = []
+
+  /*
+   * The routed plan is merged in only when the survey did not already read it. Both sources resolve
+   * the same `<MissingIndexes>` block from the same plan id, so without this a plan that is both
+   * surveyed and routed reports every one of its fires twice.
+   */
+  const surveyedPlanIds = new Set(survey.missingIndexes.map(missing => missing.planId))
+  for (const warning of survey.warnings) surveyedPlanIds.add(warning.planId)
+  const routed = route !== null && !surveyedPlanIds.has(route.planId) ? route : null
+
+  const allMissingIndexes = routed
+    ? [...survey.missingIndexes, ...routeMissingIndexes(routed)]
+    : survey.missingIndexes
+  const allWarnings = routed
+    ? [...survey.warnings, ...routeWarnings(routed)]
+    : survey.warnings
+  const missingIndexesObserved =
+    survey.missingIndexesObserved || (routed?.missingIndexesObserved ?? false)
 
   if (incidents.deadlocks.retainedCount > 0) {
     items.push({
@@ -68,38 +155,41 @@ export function projectCityDisasters({
     })
   }
 
-  if (route) {
-    const degradedCount = route.stops
-      .flatMap(stop => stop.warnings)
-      .concat(route.unplacedOperations.flatMap(operation => operation.warnings))
-      .filter(warning => DEGRADING_WARNING_KINDS.has(warningKind(warning))).length
-    if (degradedCount > 0) {
-      items.push({
-        key: 'water-main-break',
-        headline: `${degradedCount} water-main break signal(s)`,
-        detail:
-          'The routed plan carries warning(s) the engine associates with degraded behavior — spills to tempdb, plan-affecting converts, a join with no predicate, or columns with no statistics.',
-      })
-    }
+  const waterMainObjectIds = [...new Set(
+    allWarnings.map(warning => warning.objectId).filter((id): id is string => id !== null),
+  )]
+  if (allWarnings.length > 0) {
+    const kinds = [...new Set(allWarnings.map(warning => warning.kind))].sort()
+    items.push({
+      key: 'water-main-break',
+      headline: `${allWarnings.length} water-main break signal(s)`,
+      detail:
+        `Compiled plan(s) carry warning(s) the engine associates with degraded behavior — ` +
+        `${kinds.join(', ')}. A burst main is drawn at each of the ${waterMainObjectIds.length} ` +
+        `table(s) whose own work carries one; a warning belonging to no table is counted here and ` +
+        `drawn nowhere.`,
+    })
+  }
 
-    const fires = route.missingIndexes.filter(
-      missing =>
-        missing.impactPercent !== null &&
-        missing.impactPercent >= LARGE_MISSING_INDEX_IMPACT_PERCENT,
-    )
-    for (const fire of fires) if (fire.objectId !== null) fireObjectIds.push(fire.objectId)
-    if (fires.length > 0) {
-      const worst = fires.reduce((a, b) => ((b.impactPercent ?? 0) > (a.impactPercent ?? 0) ? b : a))
-      items.push({
-        key: 'building-fire',
-        headline: `${fires.length} building fire(s)`,
-        detail:
-          `The optimizer asked for an index it estimates would make this query at least ` +
-          `${LARGE_MISSING_INDEX_IMPACT_PERCENT}% cheaper — worst is ${worst.label} at ` +
-          `${formatImpact(worst.impactPercent)}%. That is the optimizer's estimate for this plan, ` +
-          `not a measurement, and not a claim about the table's other queries.`,
-      })
-    }
+  const fires = allMissingIndexes.filter(
+    missing =>
+      missing.impactPercent !== null &&
+      missing.impactPercent >= LARGE_MISSING_INDEX_IMPACT_PERCENT,
+  )
+  const fireObjectIds = [...new Set(
+    fires.map(fire => fire.objectId).filter((id): id is string => id !== null),
+  )]
+  if (fires.length > 0) {
+    const worst = fires.reduce((a, b) => ((b.impactPercent ?? 0) > (a.impactPercent ?? 0) ? b : a))
+    items.push({
+      key: 'building-fire',
+      headline: `${fires.length} building fire(s)`,
+      detail:
+        `The optimizer asked for an index it estimates would make that query at least ` +
+        `${LARGE_MISSING_INDEX_IMPACT_PERCENT}% cheaper — worst is ${worst.label} at ` +
+        `${formatImpact(worst.impactPercent)}%. That is the optimizer's estimate for one plan, ` +
+        `not a measurement, and not a claim about the table's other queries.`,
+    })
   }
 
   const stale = staleStatsObjectIds(objects)
@@ -115,7 +205,13 @@ export function projectCityDisasters({
     })
   }
 
-  return { items, staleStatsObjectIds: stale, fireObjectIds }
+  return {
+    items,
+    staleStatsObjectIds: stale,
+    fireObjectIds,
+    waterMainObjectIds,
+    missingIndexesObserved,
+  }
 }
 
 /**

@@ -55,6 +55,12 @@ import {
 } from './liveQueryFeed'
 import { IncidentSummary } from './IncidentPopup'
 import { projectCityDisasters } from './cityDisasters'
+import {
+  EMPTY_DISASTER_SURVEY,
+  runDisasterSurvey,
+  type CachedSurveyPlan,
+  type DisasterSurvey,
+} from './cityDisasterSurvey'
 
 const metrics = ['cpu', 'duration', 'reads', 'executions'] as const
 type Metric = (typeof metrics)[number]
@@ -594,13 +600,56 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
       databaseName,
     })
   }, [activePlan, cityPlan, visibleObjects, databaseName])
+  /*
+   * The disaster survey.
+   *
+   * Missing indexes and plan warnings live on a *compiled showplan*, and the city page carries no
+   * such thing — so before this existed, the only way a fire could appear was for the operator to
+   * route a plan by hand, and the city as a whole showed three of its four disasters never. That is
+   * backwards for a visualisation whose whole claim is that the picture explains the workload.
+   *
+   * So the ranked families' plans are read in the background and the evidence is accumulated across
+   * the workload. It is a survey, deliberately: capped at forty families, four at a time, cached by
+   * family id so a refresh re-reads nothing, and disclosed as a count of plans read rather than
+   * presented as the whole truth.
+   */
+  const [survey, setSurvey] = useState<DisasterSurvey>(EMPTY_DISASTER_SURVEY)
+  const surveyCache = useRef(new Map<string, CachedSurveyPlan | null>())
+  const surveyDatabase = useRef<string | null>(null)
+
+  useEffect(() => {
+    // A different database is a different workload, so the cached evidence is not merely stale, it
+    // is about somewhere else. Dropped rather than merged.
+    if (surveyDatabase.current !== databaseId) {
+      surveyDatabase.current = databaseId
+      surveyCache.current = new Map()
+      setSurvey(EMPTY_DISASTER_SURVEY)
+    }
+    if (families.length === 0) return
+    const controller = new AbortController()
+    void runDisasterSurvey(families, {
+      objects: visibleObjects,
+      databaseName,
+      fetchers: { fetchQueryFamily, fetchPlan },
+      signal: controller.signal,
+      cache: surveyCache.current,
+      // Reported as each plan lands, so a large survey fills the city in rather than showing
+      // nothing for the length of forty round trips.
+      onProgress: partial => { if (!controller.signal.aborted) setSurvey(partial) },
+    })
+      .then(result => { if (!controller.signal.aborted) setSurvey(result) })
+      .catch(() => { /* Aborted, or every family failed; the survey reports its own status. */ })
+    return () => controller.abort()
+  }, [databaseId, databaseName, families, visibleObjects])
+
   const disasters = useMemo(
     () => projectCityDisasters({
       incidents,
       route,
       objects: visibleObjects,
+      survey,
     }),
-    [incidents, route, visibleObjects],
+    [incidents, route, visibleObjects, survey],
   )
 
   /**
@@ -871,18 +920,32 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
           openId={openIncidentId}
           onOpen={openIncidentFromList}
         />
-        {disasters.items.length > 0 && (
+        {(disasters.items.length > 0 || survey.status !== 'idle') && (
           <div className="source-note">
             <strong>Disasters</strong>
-            <ul>
-              {disasters.items.map(item => (
-                <li key={item.key}>
-                  <strong>{item.headline}</strong>
-                  <small>{item.detail}</small>
-                </li>
-              ))}
-            </ul>
-            <small>Run-down buildings are objects with at least one statistic past SQL Server's own AUTO_UPDATE_STATISTICS threshold — 500 modifications up to 500 rows, then MIN(500 + 0.20n, SQRT(1000n)).</small>
+            {disasters.items.length > 0 ? (
+              <ul>
+                {disasters.items.map(item => (
+                  <li key={item.key}>
+                    <strong>{item.headline}</strong>
+                    <small>{item.detail}</small>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <small>
+                {survey.status === 'running'
+                  ? 'Still reading plans; nothing found yet.'
+                  : 'Nothing found. No plan read named an object on this map, and no statistic is past its threshold.'}
+              </small>
+            )}
+            {/*
+              * How much of the workload this answer rests on, always shown -- including when nothing
+              * was found, which is the case that needs it most. A quiet city and a survey that read
+              * no plans at all look identical on the map, and only this line tells them apart.
+              */}
+            <small>{survey.reason}</small>
+            <small>Run-down buildings are objects with at least one statistic past SQL Server&apos;s own AUTO_UPDATE_STATISTICS threshold — 500 modifications up to 500 rows, then MIN(500 + 0.20n, SQRT(1000n)).</small>
           </div>
         )}
       </div>
@@ -1147,6 +1210,8 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
           feedState={feedState}
           incidents={incidents}
           staleStatsObjectIds={disasters.staleStatsObjectIds}
+          fireObjectIds={disasters.fireObjectIds}
+          waterMainObjectIds={disasters.waterMainObjectIds}
           liveQueries={queryFeed.events}
           families={families}
           onVehicleRoster={setVehicleRoster}

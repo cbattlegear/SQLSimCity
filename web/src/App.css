@@ -831,6 +831,38 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
 .hud-layers input { accent-color: #72f4c4; }
 
 .hud-legend { padding: 8px 11px; }
+/*
+ * The wide legend is capped and scrolls its own body.
+ *
+ * Bottom-left is anchored to the bottom of the map, so an uncapped legend grows *upward* and off
+ * the top of the window -- taking its own summary with it, which leaves it stuck open. This is not
+ * the `scrollHeight > clientHeight` signature: the box is clipped by the viewport, not by its own
+ * overflow, so it reads as perfectly healthy right up until you try to click the summary.
+ *
+ * The cap is on the open state only, so a folded legend is still just its one-line summary. The
+ * summary is `flex: none` so it is never what gives way -- the failure being fixed here is
+ * precisely a summary that got squeezed out of reach.
+ */
+.hud-legend[open] { display: flex; flex-direction: column; max-height: min(62vh, 520px); }
+.hud-legend > summary { flex: none; }
+/*
+ * `<details>` wraps its children in a `::details-content` box, and *that* is the flex item -- not
+ * the `<ul>`, and not `.legend-scroll`. It is `display: block` with `min-height: auto`, so it
+ * floors on its own content and the cap above would never reach the scroller inside it. Giving it
+ * `min-height: 0` lets it give way and the flex column passes the shrink down to `.legend-scroll`.
+ * An engine without the box skips this rule and does not need it: there `.legend-scroll` is the
+ * flex item directly, and it already scrolls.
+ */
+.hud-legend::details-content { min-height: 0; display: flex; flex-direction: column; }
+/* `contain` because `.map-shell` is `position: fixed` -- scroll chaining here would pan the map. */
+.legend-scroll { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+/*
+ * In the tray the panel is already the scroller and already bounded by the map, so repeating the
+ * cap here would nest one scroller inside another and give the reader two places to drag. Higher
+ * specificity than the rules above, so this wins wherever it applies regardless of source order.
+ */
+.map-tray-panel .hud-legend[open] { display: block; max-height: none; }
+.map-tray-panel .legend-scroll { min-height: auto; overflow-y: visible; }
 .hud-legend summary { cursor: pointer; color: #93a8ba; font: .66rem ui-monospace, Consolas, monospace; letter-spacing: .06em; text-transform: uppercase; }
 .legend-encoded { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: .68rem; }
 .legend-encoded li { display: flex; gap: 8px; align-items: center; }
@@ -841,6 +873,16 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
 .legend-solid { background: #93a8ba; border-color: #93a8ba; }
 .legend-dashed { background: repeating-linear-gradient(90deg, #93a8ba 0 7px, transparent 7px 11px); border-color: #5d7183; }
 .legend-sparse { background: repeating-linear-gradient(90deg, #93a8ba 0 3px, transparent 3px 9px); border-color: #5d7183; }
+/*
+ * Disaster swatches. Each one is the scene's own colours in the scene's own arrangement -- flame
+ * under smoke, jet over puddle -- so the swatch is recognisable as the thing on the map rather than
+ * a colour key the reader has to memorise. The scene's material colours are the source of truth;
+ * these are hand-copied and drift silently, so change them together.
+ */
+.legend-disaster-fire { background: linear-gradient(#b3a99c 0 45%, #ff8b1f 45% 100%); border-color: #7a4a12; }
+.legend-disaster-water { background: linear-gradient(#7fd4ff 0 55%, #2f7fa8 55% 100%); border-color: #2f7fa8; }
+.legend-disaster-wreck { background: #b8352b; border-color: #7d241d; }
+.legend-disaster-weathered { background: #4a443c; border-color: #5c564c; box-shadow: inset 0 0 0 3px #6f5c44; }
 .legend-decoration { margin: 8px 0 0; color: #7f93a5; font-size: .65rem; line-height: 1.45; }
 .legend-caveat { margin: 8px 0 0; padding-top: 8px; border-top: 1px solid #2b3b4b; color: #9bb0c2; font-size: .66rem; line-height: 1.5; }
 .city-wait-lanes { margin-top: 24px; }

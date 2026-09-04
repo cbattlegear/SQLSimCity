@@ -263,6 +263,23 @@ export type DatabaseCitySceneController = {
    * because a city-wide wash would weather buildings whose statistics are fresh.
    */
   setStaleStatsObjects(objectIds: readonly string[]): void
+  /**
+   * Sets the buildings alight.
+   *
+   * One fire is one table the optimizer asked for a high-impact index on. Per object for the same
+   * reason weathering is: the evidence is per table, and a city-wide flag would burn buildings the
+   * optimizer never named.
+   */
+  setFireObjects(objectIds: readonly string[]): void
+  /**
+   * Bursts a water main at the kerb of each building whose plan work carries a degrading warning —
+   * a spill to tempdb, a plan-affecting convert, a join with no predicate, columns with no
+   * statistics.
+   *
+   * Drawn at the frontage rather than on the roof because it is infrastructure under the street,
+   * and because a building can be on fire at the same time and the two cues must stay separable.
+   */
+  setWaterMainBreaks(objectIds: readonly string[]): void
   setLayers(layers: Partial<CityLayerToggles>): void
   /** Live incident pins, placed on the road between the parties rather than on a roof. */
   setIncidents(markers: readonly IncidentMarker[]): void
@@ -1171,6 +1188,8 @@ export function createDatabaseCityScene(
     camera.updateProjectionMatrix()
     // Incident pins are anchored to the massing, which just changed.
     buildIncidents(currentIncidents)
+    // So are the fires, whose plumes stand on roofs the mode switch just flattened or restored.
+    refreshDisasters()
 
     /*
      * Keep looking at what you were looking at.
@@ -1316,6 +1335,27 @@ export function createDatabaseCityScene(
   /** Vehicles that are not stopped. Zero means there is nothing to animate and the loop must end. */
   let movingVehicles = 0
   let staleStatsObjectIds = new Set<string>()
+  /** Tables the optimizer asked a high-impact index for; their buildings burn. */
+  let fireObjectIds = new Set<string>()
+  /** Tables whose plan work carries a degrading warning; their kerb has a burst main. */
+  let waterMainObjectIds = new Set<string>()
+  /**
+   * Roof height per object, in world units, recorded as each building is built.
+   *
+   * A fire is drawn on the roof, and the roof height comes out of `buildBuildingGeometry` — which
+   * runs in `buildBuildings` and nowhere else. Recording it there is what lets the disaster pass
+   * place a plume without rebuilding, or re-deriving, the massing it has to sit on.
+   */
+  const buildingTops = new Map<string, number>()
+  /**
+   * Disaster animation state.
+   *
+   * `disasterHandle` is its own handle for exactly the reason `vehicleHandle` is — see
+   * {@link runVehicleLoop}. Three loops, three handles, each responsible for cancelling itself.
+   */
+  let disasterHandle = 0
+  /** Animated time consumed by the disaster loop, in ms. Never the wall clock. */
+  let disasterClock = 0
   /** Placements keyed by the session they were pinned for, so a blocked vehicle stops at its pin. */
   const blockedPlacements = new Map<number, IncidentPlacement>()
   const layers: CityLayerToggles = {
@@ -1452,6 +1492,9 @@ export function createDatabaseCityScene(
     // camera-only one — leaves them where the current clock says they are, at a size the current
     // zoom can read. See the vehicle block for why the clock is not the wall clock.
     placeVehicles()
+    // Fires, smoke and water jets are written here for the same reason vehicles are: a camera-only
+    // frame must redraw them where the disaster clock already had them, not skip or advance them.
+    placeDisasters()
     // The sky follows the camera across the plan but stays pinned to the ground plane in height, so
     // its horizon is the city's horizon. Centring it on the camera instead puts the horizon at eye
     // level, which from an aerial view means the whole background is the *under* side of the dome.
@@ -1562,6 +1605,531 @@ export function createDatabaseCityScene(
     if (vehicleHandle === 0) return
     cancelAnimationFrame(vehicleHandle)
     vehicleHandle = 0
+  }
+
+  /*
+   * ----------------------------------------------------------------------------------------------
+   * Disasters.
+   *
+   * Three of the four things `cityDisasters.ts` reports had nowhere to be drawn, so the sidebar
+   * described a city that never changed: fires and burst mains were computed and discarded, and a
+   * recorded deadlock got a flat pin and no wreckage. They are drawn here, on the same terms the
+   * weathering already had — per object, from the object's own evidence, and never as a city-wide
+   * wash.
+   *
+   * Everything below obeys the three rules the vehicle block established, for the same reasons:
+   *
+   * 1. **Nothing here casts or receives a shadow.** Flames and smoke move every frame, so a caster
+   *    would re-arm the 948-draw-call shadow pass issue #90 removed, once per frame, forever.
+   * 2. **The loop has its own handle** (`disasterHandle`) and calls `draw()` directly, never
+   *    `requestRender()`.
+   * 3. **The loop ends itself** when there is nothing burning or spraying, so a city with no
+   *    disasters goes fully idle rather than scheduling an empty frame for ever.
+   *
+   * Everything is instanced. A fire is three flames and three smoke puffs, and a city can carry
+   * dozens of them; one mesh per part would put a hundred-odd draw calls on the screen for what is
+   * an overlay. Four instanced meshes cover every disaster in the city at four draw calls total.
+   * ----------------------------------------------------------------------------------------------
+   */
+
+  const disasterGroup = new THREE.Group()
+  scene.add(disasterGroup)
+
+  /** Flames per fire, and puffs per plume. Three of each reads as a fire; one reads as a cone. */
+  const FLAMES_PER_FIRE = 3
+  const SMOKE_PER_FIRE = 3
+  /** Water jets per burst main. */
+  const JETS_PER_BREAK = 3
+
+  /*
+   * ----------------------------------------------------------------------------------------------
+   * Why a disaster is magnified, and against what.
+   *
+   * A fire drawn at true scale is a fire nobody sees. Measured on this machine at the default
+   * framing (1440x900, fov 46, ~1495 units out), an unmagnified plume covered **15 pixels of
+   * 1,296,000** — present, correct, and indistinguishable from noise, which is exactly the
+   * "I don't see any of the other issues showing up ever" report that started this work. It is the
+   * same defect the vehicle block records as authored shells reading as "just blocks", so it takes
+   * the same cure: `labelScreenScale` grows the signal until it clears a pixel floor.
+   *
+   * The floor is higher than the vehicles' 16 px because a vehicle only has to be *found* — it is
+   * one of hundreds moving along a road, and the reader is scanning traffic. A disaster has to be
+   * *noticed* unprompted, on a city the reader is not searching, so it is sized to be the thing
+   * that catches the eye rather than the thing that rewards a look.
+   */
+  const DISASTER_MIN_PX = 34
+
+  /**
+   * The authored size band every disaster is drawn within, before magnification.
+   *
+   * A band rather than a bare minimum, because one shared magnification can only clear a floor for
+   * the smallest part *and* leave the largest part inside the frame if the ladder between them is
+   * short. Uncapped, a fire on the largest table in the city was fifteen world units where a jet on
+   * the smallest was two, and no single factor serves a 7:1 spread: the factor that made the jet
+   * legible turned the fire into a wall.
+   *
+   * Capping the top is honest here in a way it would not be for a building, because a disaster's
+   * size is a legibility floor and is not claiming a quantity -- the legend says so outright. What
+   * is being claimed is *which* object the evidence named, and that survives the cap intact.
+   */
+  const DISASTER_SIZE_MIN = 5
+  const DISASTER_SIZE_MAX = 8
+
+  /** Holds a footprint-derived size inside the band above. */
+  const disasterSize = (raw: number): number =>
+    Math.min(DISASTER_SIZE_MAX, Math.max(DISASTER_SIZE_MIN, raw))
+
+  /** Cone height as a multiple of the authored size, at full pulse. */
+  const FLAME_ASPECT = 2.1
+  const JET_ASPECT = 2.2
+
+  /**
+   * The smallest fraction of its full height the pulse ever leaves a part at.
+   *
+   * A floor, not an amplitude, because this is what the magnification is measured against: a part
+   * that shrinks to a quarter of its height for most of its cycle is invisible for most of its
+   * cycle, however generous the factor computed from its peak. The jet's floor used to be 0.24 and
+   * that is exactly what went wrong. Kept high enough that the pulse reads as a flicker in size
+   * rather than as the part appearing and disappearing.
+   */
+  const FLAME_PULSE_FLOOR = 0.56
+  const JET_PULSE_FLOOR = 0.6
+
+  /**
+   * The height the magnification is measured against.
+   *
+   * One shared factor for every disaster part, computed from the **shortest** signal the layer
+   * actually draws. Magnifying off the shortest is what the vehicle block does off the bicycle, and
+   * for the same reason: it puts every signal over the floor, where measuring off the tallest plume
+   * would leave the jets under it. Scaling each part to its own floor instead would flatten the
+   * ratio between a fire and a burst main, which is the one comparison this layer invites.
+   *
+   * It is **derived**, not typed in, because a hand-picked number was the defect. It used to be a
+   * flat 10 -- "a water jet on the smallest lot, nominally ten units from kerb to spray" -- which is
+   * the jet's height at *full pulse*. The pulse then swung it down to 24% of that, so the part the
+   * floor was measured against spent most of its cycle at a quarter of the size the floor promised.
+   * Measured in the browser at 1440x900 the result was a jet occupying **7x16 pixels**: the same
+   * present-but-invisible failure the magnification was added to cure, hiding inside the fix for it.
+   *
+   * Deriving it from the pulse floors and the authored size band means the constant cannot drift out
+   * of agreement with the geometry again -- change an aspect or a floor and this follows.
+   */
+  const DISASTER_REFERENCE_HEIGHT = Math.min(
+    DISASTER_SIZE_MIN * FLAME_ASPECT * FLAME_PULSE_FLOOR,
+    DISASTER_SIZE_MIN * JET_ASPECT * JET_PULSE_FLOOR,
+  )
+
+  /**
+   * How far the magnification is allowed to run before a disaster stops growing.
+   *
+   * Below the vehicles' 18x on purpose. A vehicle is a few units long and stays inside its lane at
+   * any magnification; a plume is anchored to a roof and grows upward, so an uncapped factor turns
+   * a city-wide view into a wall of smoke with no city behind it. At 14x a fire on the far side of
+   * the largest plan still reads, and the skyline still exists.
+   */
+  const DISASTER_MAX_GROWTH = 14
+
+  /**
+   * Which way a plume leans, as a fraction of how far it has risen.
+   *
+   * A plume that goes straight up is a column in the 3D view and a **dot** in map mode, because map
+   * mode looks down the plume's own axis — measured, a fire there was an orange smudge no bigger
+   * than the building under it, which is the same "cannot see it" failure at a different camera.
+   * Leaning it lays the column out across the ground so the overhead view gets a smear with a
+   * direction instead of a point, and the 3D view gets a fire on a windy day rather than a candle.
+   *
+   * One fixed direction for the whole city, not a per-fire one: smoke from two fires in the same
+   * town leaning opposite ways reads as decoration, and the reader would start looking for a meaning
+   * in the angle that is not there.
+   */
+  const DISASTER_WIND = { x: 0.62, z: -0.38 }
+
+  /**
+   * Materials are `MeshBasicMaterial`, not `MeshStandard`.
+   *
+   * Fire is a light source, not a lit surface. A standard material would be shaded by the sun and
+   * would therefore go *dark* at night, which is precisely when a fire should be most visible, and
+   * it would sit under the tone mapper alongside the buildings rather than blowing past them. Basic
+   * and un-tone-mapped is what keeps a flame reading as emission at every hour.
+   *
+   * Smoke is a warm light grey rather than the soot colour it started as. A magnified plume spends
+   * most of its rise above the skyline, against the near-black sky dome, where `0x2a2b30` at 0.34
+   * was measured as invisible — the plume was drawing and could not be seen. Light-on-dark is what
+   * makes the column the part you notice from across the plan; the flame underneath is the part
+   * that identifies it once you look.
+   *
+   * Map mode inverts that, because its basemap is near-white paper rather than night: the same
+   * light plume there is invisible for the opposite reason. {@link buildDisasters} swaps the smoke
+   * colour with the mode, which is the one property of this layer that is not mode-independent.
+   */
+  const SMOKE_COLOR = { city: 0xb3a99c, map: 0x4a4640 }
+
+  const disasterMaterials = {
+    flame: new THREE.MeshBasicMaterial({ color: 0xff8b1f, transparent: true, opacity: 0.92, depthWrite: false }),
+    smoke: new THREE.MeshBasicMaterial({ color: SMOKE_COLOR.city, transparent: true, opacity: 0.5, depthWrite: false }),
+    water: new THREE.MeshBasicMaterial({ color: 0x7fd4ff, transparent: true, opacity: 0.7, depthWrite: false }),
+    puddle: sink(
+      new THREE.MeshBasicMaterial({ color: 0x2f7fa8, transparent: true, opacity: 0.6 }),
+      GROUND_RANK.sharedLane,
+    ),
+    wreck: new THREE.MeshBasicMaterial({ color: 0xb8352b }),
+  }
+  for (const material of Object.values(disasterMaterials)) material.toneMapped = false
+
+  /** One animated instance: where it sits, how big it is, and where in its cycle it started. */
+  interface DisasterPart {
+    readonly x: number
+    readonly z: number
+    readonly baseY: number
+    readonly size: number
+    /** World height the part travels over its cycle. Zero for parts that only pulse. */
+    readonly rise: number
+    /** 0..1 offset into the cycle, so neighbouring parts never pulse in lockstep. */
+    readonly phase: number
+    /** Cycle length in seconds. */
+    readonly period: number
+  }
+
+  /**
+   * A disaster part that never animates but still has to be magnified.
+   *
+   * Puddles and wreckage hold still, so nothing about the clock moves them — but the magnification
+   * changes every time the camera does, and a matrix written once at build time would leave them at
+   * true scale while the flames above them grew. They are therefore written from
+   * {@link placeDisasters} alongside everything else rather than composed in {@link buildDisasters}.
+   */
+  interface StaticDisasterPart {
+    readonly position: THREE.Vector3
+    readonly quaternion: THREE.Quaternion
+    readonly scale: THREE.Vector3
+    /** Height above the ground plane at 1x, so magnifying lifts the part instead of sinking it. */
+    readonly baseY: number
+  }
+
+  let flameParts: DisasterPart[] = []
+  let smokeParts: DisasterPart[] = []
+  let jetParts: DisasterPart[] = []
+  let puddleParts: StaticDisasterPart[] = []
+  let wreckParts: StaticDisasterPart[] = []
+  let flameMesh: THREE.InstancedMesh | null = null
+  let smokeMesh: THREE.InstancedMesh | null = null
+  let jetMesh: THREE.InstancedMesh | null = null
+  let puddleMesh: THREE.InstancedMesh | null = null
+  let wreckMesh: THREE.InstancedMesh | null = null
+
+  const disasterMatrix = new THREE.Matrix4()
+  const disasterPosition = new THREE.Vector3()
+  const disasterQuaternion = new THREE.Quaternion()
+  const disasterScale = new THREE.Vector3()
+
+  /** True while anything in the city is burning or spraying, which is what keeps the loop alive. */
+  let animatedDisasters = 0
+
+  /**
+   * A deterministic hash of an object id, in 0..1.
+   *
+   * Phases are seeded from the id rather than from `Math.random()` so a rebuild — a refresh, a
+   * layer toggle, a mode switch — puts every flame back where it was instead of resetting the whole
+   * city's fires to a new set of offsets.
+   */
+  function disasterSeed(key: string, salt: number): number {
+    let hash = 0x811c9dc5 ^ salt
+    for (let i = 0; i < key.length; i += 1) {
+      hash ^= key.charCodeAt(i)
+      hash = Math.imul(hash, 0x01000193)
+    }
+    return ((hash >>> 0) % 10_000) / 10_000
+  }
+
+  function buildDisasters() {
+    clearGroup(disasterGroup)
+    flameParts = []
+    smokeParts = []
+    jetParts = []
+    puddleParts = []
+    wreckParts = []
+    flameMesh = null
+    smokeMesh = null
+    jetMesh = null
+    puddleMesh = null
+    wreckMesh = null
+    animatedDisasters = 0
+    if (!plan) return
+
+    const flat = viewMode === 'map'
+    disasterMaterials.smoke.color.setHex(flat ? SMOKE_COLOR.map : SMOKE_COLOR.city)
+
+    for (const objectId of fireObjectIds) {
+      const lot = plan.lots.get(objectId)
+      if (!lot) continue
+      const footprint = lot.footprint ?? 11
+      /*
+       * Map mode flattens the massing to about a hundredth of its height, so a plume anchored to
+       * the real roof would float hundreds of units over a flat drawing. The basemap gets the same
+       * fire at the same place, sitting on the plate — which is the idiom the incident pins already
+       * use for the same reason.
+       */
+      const roof = flat ? 1.5 : (buildingTops.get(objectId) ?? 12)
+      const size = disasterSize(footprint * 0.42)
+      for (let i = 0; i < FLAMES_PER_FIRE; i += 1) {
+        const spin = disasterSeed(objectId, i) * Math.PI * 2
+        const reach = footprint * 0.22 * (i === 0 ? 0 : 1)
+        flameParts.push({
+          x: lot.x + Math.cos(spin) * reach,
+          z: lot.z + Math.sin(spin) * reach,
+          baseY: roof,
+          size: size * (i === 0 ? 1 : 0.7),
+          rise: 0,
+          phase: disasterSeed(objectId, i + 11),
+          period: 0.55 + disasterSeed(objectId, i + 23) * 0.35,
+        })
+      }
+      for (let i = 0; i < SMOKE_PER_FIRE; i += 1) {
+        smokeParts.push({
+          x: lot.x + (disasterSeed(objectId, i + 31) - 0.5) * footprint * 0.3,
+          z: lot.z + (disasterSeed(objectId, i + 41) - 0.5) * footprint * 0.3,
+          baseY: roof + size * 0.8,
+          size: size * 0.9,
+          rise: size * 3.4,
+          phase: i / SMOKE_PER_FIRE,
+          period: 2.6 + disasterSeed(objectId, i + 53) * 0.9,
+        })
+      }
+      animatedDisasters += 1
+    }
+
+    for (const objectId of waterMainObjectIds) {
+      const lot = plan.lots.get(objectId)
+      if (!lot) continue
+      const size = disasterSize((lot.footprint ?? 11) * 0.24)
+      for (let i = 0; i < JETS_PER_BREAK; i += 1) {
+        const spin = disasterSeed(objectId, i + 67) * Math.PI * 2
+        const reach = i === 0 ? 0 : size * 0.5
+        jetParts.push({
+          x: lot.accessX + Math.cos(spin) * reach,
+          z: lot.accessZ + Math.sin(spin) * reach,
+          baseY: 0.2,
+          size: size * (i === 0 ? 1 : 0.62),
+          rise: 0,
+          phase: disasterSeed(objectId, i + 71),
+          period: 0.9 + disasterSeed(objectId, i + 83) * 0.5,
+        })
+      }
+      puddleParts.push({
+        position: new THREE.Vector3(lot.accessX, 0.05, lot.accessZ),
+        quaternion: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2),
+        scale: new THREE.Vector3(size * 1.9, size * 1.9, 1),
+        baseY: 0.05,
+      })
+      animatedDisasters += 1
+    }
+
+    /*
+     * Wreckage sits under the crash pin the incident layer already placed, so the two are the same
+     * measurement rather than two that happen to agree. Only a *recorded* deadlock gets wreckage:
+     * live blocking may clear on its own and has not wrecked anything.
+     */
+    for (const marker of currentIncidents) {
+      if (marker.severity !== 'deadlock') continue
+      const placement = incidentPlacements.get(marker.id)
+      if (!placement) continue
+      for (let i = 0; i < 2; i += 1) {
+        const spin = disasterSeed(marker.id, i + 97) * Math.PI * 2
+        const offset = i === 0 ? 0 : 3.4
+        wreckParts.push({
+          position: new THREE.Vector3(
+            placement.x + Math.cos(spin) * offset,
+            flat ? 0.5 : 1.1,
+            placement.z + Math.sin(spin) * offset,
+          ),
+          quaternion: new THREE.Quaternion().setFromEuler(new THREE.Euler(
+            (disasterSeed(marker.id, i + 101) - 0.5) * 0.5,
+            spin,
+            (disasterSeed(marker.id, i + 103) - 0.5) * 0.6,
+          )),
+          scale: new THREE.Vector3(5.6, 2.8, 3.2),
+          baseY: flat ? 0.5 : 1.1,
+        })
+      }
+    }
+
+    const addInstanced = (
+      geometry: THREE.BufferGeometry,
+      material: THREE.Material,
+      count: number,
+    ): THREE.InstancedMesh | null => {
+      if (count === 0) {
+        geometry.dispose()
+        return null
+      }
+      const mesh = new THREE.InstancedMesh(track(geometry), material, count)
+      // Never a caster and never a receiver: see the block comment above. A moving caster here is
+      // the exact defect issue #90 removed, and it would be re-armed on every animated frame.
+      mesh.castShadow = false
+      mesh.receiveShadow = false
+      mesh.frustumCulled = false
+      mesh.renderOrder = 5
+      disasterGroup.add(mesh)
+      return mesh
+    }
+
+    flameMesh = addInstanced(new THREE.ConeGeometry(0.5, 1, 6), disasterMaterials.flame, flameParts.length)
+    smokeMesh = addInstanced(new THREE.SphereGeometry(0.5, 7, 5), disasterMaterials.smoke, smokeParts.length)
+    jetMesh = addInstanced(new THREE.ConeGeometry(0.42, 1, 6), disasterMaterials.water, jetParts.length)
+    puddleMesh = addInstanced(new THREE.CircleGeometry(0.5, 14), disasterMaterials.puddle, puddleParts.length)
+    wreckMesh = addInstanced(new THREE.BoxGeometry(1, 1, 1), disasterMaterials.wreck, wreckParts.length)
+
+    // Place once immediately, so a disaster is on screen on the very next frame whether or not the
+    // animation loop ever runs — which is the state `prefers-reduced-motion` leaves it in for good.
+    placeDisasters()
+  }
+
+  /**
+   * Writes every animated disaster instance for the current clock.
+   *
+   * Called from {@link draw} rather than only from the loop, for the reason `placeVehicles` is: a
+   * camera-only frame must redraw the flames where the clock already had them, instead of leaving
+   * them behind or advancing them because the camera moved.
+   *
+   * The pulse is `sin(pi * t)` — zero at both ends of the cycle — so a smoke puff grows out of
+   * nothing and shrinks back into nothing as it rises. That is what lets every puff share one
+   * material: the alternative, fading each puff's opacity, needs a material per puff and turns four
+   * draw calls into one per instance.
+   */
+  function placeDisasters() {
+    const seconds = disasterClock / 1000
+
+    /*
+     * One shared magnification for every disaster part, for the reason the vehicle block gives: the
+     * ratio between a plume, a jet and a wreck is the reading, so it is preserved by scaling all of
+     * them by the same factor rather than clamping each one to its own floor.
+     *
+     * Recomputed here — not cached at build time — because it is a function of the camera, and this
+     * runs on every frame the camera moves. A factor frozen when the fire started would be wrong the
+     * moment the reader zoomed.
+     */
+    const magnify = labelScreenScale(
+      DISASTER_REFERENCE_HEIGHT,
+      camera.position.distanceTo(controls.target),
+      camera.fov,
+      Math.max(canvas.clientHeight, 1),
+      DISASTER_MIN_PX,
+      DISASTER_MAX_GROWTH,
+    )
+
+    if (flameMesh) {
+      for (let i = 0; i < flameParts.length; i += 1) {
+        const part = flameParts[i]
+        const t = ((seconds / part.period) + part.phase) % 1
+        const pulse = FLAME_PULSE_FLOOR + (1 - FLAME_PULSE_FLOOR) * (0.5 + Math.sin(t * Math.PI * 2) * 0.5)
+        const height = part.size * FLAME_ASPECT * pulse * magnify
+        const width = part.size * (1.16 - pulse * 0.16) * magnify
+        disasterPosition.set(part.x, part.baseY + height / 2, part.z)
+        disasterQuaternion.setFromAxisAngle(UP, t * Math.PI * 2)
+        disasterScale.set(width, height, width)
+        flameMesh.setMatrixAt(i, disasterMatrix.compose(disasterPosition, disasterQuaternion, disasterScale))
+      }
+      flameMesh.instanceMatrix.needsUpdate = true
+    }
+
+    if (smokeMesh) {
+      for (let i = 0; i < smokeParts.length; i += 1) {
+        const part = smokeParts[i]
+        const t = ((seconds / part.period) + part.phase) % 1
+        const swell = Math.sin(t * Math.PI)
+        const size = part.size * (0.35 + swell * 0.95) * magnify
+        const drift = part.size * 0.35 * magnify
+        const travelled = part.rise * t * magnify
+        disasterPosition.set(
+          part.x + Math.sin(t * Math.PI * 2) * drift + travelled * DISASTER_WIND.x,
+          part.baseY + travelled,
+          part.z + Math.cos(t * Math.PI * 2) * drift + travelled * DISASTER_WIND.z,
+        )
+        disasterQuaternion.identity()
+        disasterScale.set(size, size, size)
+        smokeMesh.setMatrixAt(i, disasterMatrix.compose(disasterPosition, disasterQuaternion, disasterScale))
+      }
+      smokeMesh.instanceMatrix.needsUpdate = true
+    }
+
+    if (jetMesh) {
+      for (let i = 0; i < jetParts.length; i += 1) {
+        const part = jetParts[i]
+        const t = ((seconds / part.period) + part.phase) % 1
+        const pulse = JET_PULSE_FLOOR + (1 - JET_PULSE_FLOOR) * (0.5 + Math.sin(t * Math.PI * 2) * 0.5)
+        const height = part.size * JET_ASPECT * pulse * magnify
+        const width = part.size * magnify
+        disasterPosition.set(part.x, part.baseY + height / 2, part.z)
+        // Point the cone up: a jet is a spray, so the wide end is at the top.
+        disasterQuaternion.setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI)
+        disasterScale.set(width, height, width)
+        jetMesh.setMatrixAt(i, disasterMatrix.compose(disasterPosition, disasterQuaternion, disasterScale))
+      }
+      jetMesh.instanceMatrix.needsUpdate = true
+    }
+
+    /*
+     * The two that hold still. A puddle spreads on the ground so it is magnified in x and z only —
+     * growing its thickness would lift a flat disc off the plate it is sunk into. Wreckage is a
+     * solid, so it grows in every axis and is lifted by the same factor to keep it sitting on the
+     * road rather than buried halfway into it.
+     */
+    if (puddleMesh) {
+      for (let i = 0; i < puddleParts.length; i += 1) {
+        const part = puddleParts[i]
+        disasterScale.set(part.scale.x * magnify, part.scale.y * magnify, part.scale.z)
+        puddleMesh.setMatrixAt(i, disasterMatrix.compose(part.position, part.quaternion, disasterScale))
+      }
+      puddleMesh.instanceMatrix.needsUpdate = true
+    }
+
+    if (wreckMesh) {
+      for (let i = 0; i < wreckParts.length; i += 1) {
+        const part = wreckParts[i]
+        disasterPosition.set(part.position.x, part.baseY * magnify, part.position.z)
+        disasterScale.copy(part.scale).multiplyScalar(magnify)
+        wreckMesh.setMatrixAt(i, disasterMatrix.compose(disasterPosition, part.quaternion, disasterScale))
+      }
+      wreckMesh.instanceMatrix.needsUpdate = true
+    }
+  }
+
+  /**
+   * The disaster loop, bounded exactly as the vehicle loop is.
+   *
+   * Its own handle, so the damping loop cannot orphan it. `draw()` directly, so an hour of a burning
+   * city never re-arms the shadow pass. And a guard re-tested on every frame, so the moment the last
+   * fire is put out the loop ends rather than scheduling empty frames for ever.
+   */
+  const runDisasterLoop = () => {
+    if (disasterHandle !== 0 || disposed || reducedMotion || animatedDisasters === 0) return
+    let previous = performance.now()
+    const step = (now: number) => {
+      if (disposed || animatedDisasters === 0) {
+        disasterHandle = 0
+        return
+      }
+      // Clamped for the reason the vehicle clock is: a backgrounded tab hands back the whole gap at
+      // once, and an unclamped flame would jump a random distance through its cycle on resume.
+      disasterClock += Math.min(now - previous, 100)
+      previous = now
+      draw()
+      disasterHandle = requestAnimationFrame(step)
+    }
+    disasterHandle = requestAnimationFrame(step)
+  }
+
+  const stopDisasterLoop = () => {
+    if (disasterHandle === 0) return
+    cancelAnimationFrame(disasterHandle)
+    disasterHandle = 0
+  }
+
+  /** Rebuilds the disaster overlay and starts or stops its loop to match what is now on screen. */
+  function refreshDisasters() {
+    buildDisasters()
+    if (animatedDisasters === 0) stopDisasterLoop()
+    else runDisasterLoop()
   }
 
   controls.addEventListener('change', () => {
@@ -2839,6 +3407,7 @@ export function createDatabaseCityScene(
   function buildBuildings(objects: readonly DatabaseCityObject[], cityPlan: CityPlan) {
     clearGroup(buildingGroup)
     clearGroup(buildingLabelGroup)
+    buildingTops.clear()
     pickable.length = 0
     // Every building in a schema takes the same hue, which is what makes a neighbourhood read as one
     // place from the air rather than as a run of unrelated blocks that happen to be adjacent.
@@ -2882,6 +3451,9 @@ export function createDatabaseCityScene(
 
       const character = cityPlan.terrain.characters.get(lot.districtId)
       const geometry = buildBuildingGeometry(lot, character)
+      // The roof the fire overlay stands on. Recorded for every building, burning or not, because
+      // the fire set changes far more often than the massing does.
+      buildingTops.set(object.objectId, known ? geometry.height : 0)
       const tint = tints.get(lot.districtId)
       const isWeathered = weathered(object.objectId)
       const cleanBodyColor = buildingColor(lot.archetype, character, tint)
@@ -3524,6 +4096,8 @@ export function createDatabaseCityScene(
       buildInfrastructure(currentFacilities)
       buildRoute(currentRoute)
       buildIncidents(currentIncidents)
+      // After the incidents, because wreckage is placed at the pins they just computed.
+      refreshDisasters()
       applySelection()
       // A re-plan can resize the city, and the zoom stops are measured against its bounds. Refresh
       // them on every update, not just the first, so a city that grows stays reachable.
@@ -3579,6 +4153,28 @@ export function createDatabaseCityScene(
       }
       staleStatsObjectIds = new Set(objectIds)
       if (plan) buildBuildings(currentObjects, plan)
+      // Rebuilding the massing invalidated the roof heights the fires stand on.
+      refreshDisasters()
+      requestRender()
+    },
+    setFireObjects(objectIds) {
+      // Content-compared for the same reason `setStaleStatsObjects` is: the projection hands back a
+      // fresh array every render, so an identity check would rebuild the overlay continuously.
+      if (fireObjectIds.size === objectIds.length &&
+          objectIds.every(objectId => fireObjectIds.has(objectId))) {
+        return
+      }
+      fireObjectIds = new Set(objectIds)
+      refreshDisasters()
+      requestRender()
+    },
+    setWaterMainBreaks(objectIds) {
+      if (waterMainObjectIds.size === objectIds.length &&
+          objectIds.every(objectId => waterMainObjectIds.has(objectId))) {
+        return
+      }
+      waterMainObjectIds = new Set(objectIds)
+      refreshDisasters()
       requestRender()
     },
     setLayers(next) {
@@ -3599,6 +4195,8 @@ export function createDatabaseCityScene(
       // The pins just moved, and a blocked vehicle stops at its pin. Rebuilding the roster here is
       // what keeps the two the same measurement rather than two that happen to agree.
       refreshVehicles()
+      // Wreckage is placed at the deadlock pins, which the rebuild above just recomputed.
+      refreshDisasters()
       requestRender()
     },
     setVehicles(events, families) {
@@ -3711,6 +4309,7 @@ export function createDatabaseCityScene(
       disposed = true
       if (animationHandle !== 0) cancelAnimationFrame(animationHandle)
       if (vehicleHandle !== 0) cancelAnimationFrame(vehicleHandle)
+      if (disasterHandle !== 0) cancelAnimationFrame(disasterHandle)
       if (hoverHandle !== 0) cancelAnimationFrame(hoverHandle)
       resize.disconnect()
       stopWatchingClock()
@@ -3724,6 +4323,7 @@ export function createDatabaseCityScene(
       disposables.clear()
       trailMaterial.dispose()
       for (const material of Object.values(materials)) material.dispose()
+      for (const material of Object.values(disasterMaterials)) material.dispose()
       for (const material of archetypeMaterials.values()) material.dispose()
       for (const material of roadMaterials.values()) material.dispose()
       for (const material of poiMaterials.values()) material.dispose()

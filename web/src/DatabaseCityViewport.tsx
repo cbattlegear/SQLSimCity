@@ -60,6 +60,16 @@ type Props = {
   /** Objects whose statistics are stale enough to weather their building facades. */
   staleStatsObjectIds?: readonly string[]
   /**
+   * Objects the workload is burning through — a large missing index the optimiser asked for, on a
+   * plan that actually runs. Drawn as a roof fire.
+   */
+  fireObjectIds?: readonly string[]
+  /**
+   * Objects a plan is spilling or scanning around, which the city draws as a burst water main at
+   * the kerb rather than on the building, because the damage is to the street the traffic uses.
+   */
+  waterMainObjectIds?: readonly string[]
+  /**
    * The executions the live feed has observed, newest first, and the families they are matched
    * against.
    *
@@ -111,6 +121,8 @@ const COMPASS_POINTS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 // A module-level constant so the default prop is referentially stable. A fresh `[]` literal would
 // be a new array on every render, re-running the effect and rebuilding every building each time.
 const EMPTY_STALE_STATS: readonly string[] = Object.freeze([])
+const EMPTY_FIRES: readonly string[] = Object.freeze([])
+const EMPTY_WATER_MAINS: readonly string[] = Object.freeze([])
 
 /**
  * The folded incident chip. Its wording lives in {@link incidentSummaryLabel} beside the projection
@@ -157,6 +169,8 @@ export function DatabaseCityViewport({
   feedState,
   incidents,
   staleStatsObjectIds = EMPTY_STALE_STATS,
+  fireObjectIds = EMPTY_FIRES,
+  waterMainObjectIds = EMPTY_WATER_MAINS,
   liveQueries = null,
   families,
   onVehicleRoster,
@@ -228,6 +242,11 @@ export function DatabaseCityViewport({
   useEffect(
     () => sceneRef.current?.setStaleStatsObjects(staleStatsObjectIds),
     [staleStatsObjectIds],
+  )
+  useEffect(() => sceneRef.current?.setFireObjects(fireObjectIds), [fireObjectIds])
+  useEffect(
+    () => sceneRef.current?.setWaterMainBreaks(waterMainObjectIds),
+    [waterMainObjectIds],
   )
   useEffect(() => sceneRef.current?.setLayers(layers), [layers])
   useEffect(() => sceneRef.current?.setViewMode(viewMode), [viewMode])
@@ -315,10 +334,19 @@ export function DatabaseCityViewport({
    * the tray chip is already the disclosure, so the legend opens with it rather than asking for a
    * second tap. It used to be `display: none` under 900px, which meant the phone drawing disclosed
    * nothing about what its own colours and widths meant.
+   *
+   * `.legend-scroll` exists because the wide home had no cap. The tray has bounded the narrow one
+   * since it was built, but bottom-left simply grew upward: opened at 1440x900 the legend measured
+   * 1128px against a 900px viewport and, being anchored to its bottom edge, put its own summary at
+   * y = -240 -- off the top of the window, so it could not be closed again. That is invisible to the
+   * usual overflow check, because `scrollHeight === clientHeight` when a box is clipped by the
+   * viewport rather than by its own overflow. Adding the disaster rows made it certain rather than
+   * merely likely, at every viewport height worth testing.
    */
   const legend = (
     <details className="hud-legend" open={narrow || undefined}>
       <summary>Legend · what encodes evidence</summary>
+      <div className="legend-scroll">
       <ul className="legend-encoded">
         <li>
           <i className="legend-swatch legend-footprint" /> Footprint — log₂ of exact reserved 8-KiB pages
@@ -364,9 +392,33 @@ export function DatabaseCityViewport({
           already recorded and resolved, read from <code>system_health</code>
         </li>
         <li>
+          <i className="legend-swatch legend-disaster-fire" /> Flame and smoke on a roof — a plan
+          that ran against this table asked for an index the engine could not find
+        </li>
+        <li>
+          <i className="legend-swatch legend-disaster-water" /> Water jet and puddle — a plan against
+          this table compiled with a warning the optimiser raised about it
+        </li>
+        <li>
+          <i className="legend-swatch legend-disaster-wreck" /> Wreckage on a road — both of that
+          road&apos;s tables were named in the same recorded deadlock
+        </li>
+        <li>
+          <i className="legend-swatch legend-disaster-weathered" /> Grimy facade, boarded windows —
+          this table&apos;s own statistics are past the engine&apos;s auto-update threshold
+        </li>
+        <li>
           <i className="legend-swatch legend-unknown">×</i> Wireframe — unavailable evidence, no quantity claimed
         </li>
       </ul>
+      <p className="legend-caveat">
+        Disasters are drawn far larger than true scale, for the same reason vehicles are: at true
+        scale a plume is a few pixels and nothing that cannot be seen is evidence of anything. Their
+        sizes are a legibility floor and encode no quantity — a bigger fire is not a worse one, and
+        two fires are not comparable by eye. What is being claimed is only <em>which</em> object the
+        evidence named. Every plume leans the same way because one fixed wind makes an overhead
+        plume readable as a smear rather than a dot; the direction means nothing.
+      </p>
       <p className="legend-caveat">
         Road colour is graded from one measured ratio: captured wait milliseconds per captured
         execution. It accounts for <strong>every</strong> wait category Query Store captured for the
@@ -385,6 +437,7 @@ export function DatabaseCityViewport({
         says which schema owns it and nothing more: hues are handed out in catalogue order, so
         one is never warmer, larger or busier than another.
       </p>
+      </div>
     </details>
   )
 
