@@ -42,6 +42,10 @@ assuming 2.5 seconds contains enough frames. Hosted SwiftShader produced only fo
 in that interval. A bounded 60-second wait fails if rendering stops; it does not
 set a frame-rate target. Disposal also crosses a raw native-frame barrier so a
 slow renderer cannot pass merely because the observation window missed its next frame.
+Orbit damping settles per update rather than per second. Before measuring idle,
+the gate requires three consecutive raw native frames with no application callbacks,
+within a 60-second bound, and reports the settling callbacks separately. An orphan
+loop therefore times out instead of being mistaken for slow settling or silently ignored.
 
 `--baseline` records the original duplicate submissions without rejecting them; normal mode
 requires at most one submission per frame, zero idle/disposed callbacks, nonzero shadow

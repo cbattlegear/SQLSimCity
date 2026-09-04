@@ -156,7 +156,9 @@ jobs:
       - name: Verify scene lifecycle
         # The harness starts its own temporary Vite server; no fixture is exposed
         # by the production build or by the separate connected container smoke.
-        run: node tools/measure-browser/scene-lifecycle.js --out artifacts/scene-lifecycle
+        run: |
+          node --test tools/measure-browser/lib/frameSampling.test.js
+          node tools/measure-browser/scene-lifecycle.js --out artifacts/scene-lifecycle
 
       - name: Upload scene lifecycle diagnostics
         if: ${{ !cancelled() && (success() || failure()) }}

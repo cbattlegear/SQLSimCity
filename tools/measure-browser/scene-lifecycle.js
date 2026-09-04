@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { createServer } from '../../web/node_modules/vite/dist/node/index.js'
 import { launch, instrument, VIEWPORTS } from './lib/city.js'
+import { waitForSceneIdle } from './lib/frameSampling.js'
 
 const { values } = parseArgs({ options: {
   out: { type: 'string' }, baseline: { type: 'boolean', default: false },
@@ -83,7 +84,9 @@ try {
     await page.waitForTimeout(300)
     await page.screenshot({ path: resolve(values.out, `${viewport.name}-map.png`) })
     await page.evaluate(() => { window.__sceneFixture.mode('city'); window.__sceneFixture.stop() })
-    await page.waitForTimeout(1800)
+    // Orbit damping converges per update, not per wall-clock second. An orphan loop
+    // never reaches this bounded quiescence barrier, even if it submits no draws.
+    result.settling = await page.evaluate(waitForSceneIdle)
     const beforeIdle = await page.evaluate(() => window.__measure.rafTotal)
     await page.evaluate(() => new Promise(resolve => window.__measure.sampleFrame(() => resolve())))
     await page.waitForTimeout(600)
