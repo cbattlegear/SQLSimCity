@@ -132,8 +132,11 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
   const roadInvokerRef = useRef<HTMLElement | null>(null)
   const focusSidebar = useCallback(() => document.querySelector<HTMLButtonElement>('.sidebar-back')?.focus(), [])
   useEffect(() => {
-    if (activePlan || selectedRoadId) focusSidebar()
-  }, [activePlan, selectedRoadId, focusSidebar])
+    if (activePlan) focusSidebar()
+  }, [activePlan, focusSidebar])
+  useEffect(() => {
+    if (selectedRoadId) focusSidebar()
+  }, [selectedRoadId, focusSidebar])
   useEffect(() => {
     setSelectedId(new URLSearchParams(window.location.search).get('object'))
     setSelectedRoadId(null)
