@@ -39,6 +39,14 @@ function code(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
 }
 
+function region(start: string, end: string): string {
+  const from = scene.indexOf(start)
+  const to = scene.indexOf(end)
+  expect(from, `${start} must exist`).toBeGreaterThan(-1)
+  expect(to, `${end} must follow ${start}`).toBeGreaterThan(from)
+  return code(scene.slice(from, to))
+}
+
 /** The body of one method of the returned controller object, which sits at four-space indent. */
 function controllerMethod(name: string): string {
   const start = scene.indexOf(`\n    ${name}(`)
@@ -56,17 +64,17 @@ describe('the shadow map is invalidated by whatever changed what casts', () => {
   })
 
   it('marks the map stale on the path every scene change already takes', () => {
-    const requestRender = scene.slice(
-      scene.indexOf('const requestRender = ()'),
-      scene.indexOf('const requestCameraRender = ()'),
+    const requestRender = region(
+      'const requestRender = ()',
+      'const requestCameraRender = ()',
     )
     expect(requestRender).toMatch(/renderer\.shadowMap\.needsUpdate\s*=\s*true/)
   })
 
   it('skips it only where the camera moved and nothing under it did', () => {
-    const cameraRender = scene.slice(
-      scene.indexOf('const requestCameraRender = ()'),
-      scene.indexOf('const runDampingLoop'),
+    const cameraRender = region(
+      'const requestCameraRender = ()',
+      'const runDampingLoop',
     )
     expect(cameraRender).not.toMatch(/needsUpdate/)
     expect(cameraRender).toMatch(/scheduleFrame\(\)/)
@@ -116,12 +124,8 @@ describe('the shadow map is invalidated by whatever changed what casts', () => {
   })
 
   it('leaves the damping loop drawing without asking for a new shadow pass', () => {
-    const loop = code(scene.slice(
-      scene.indexOf('const runDampingLoop'),
-      scene.indexOf('const runVehicleLoop'),
-    ))
-    // The loop calls draw() straight, so an orbit renders many frames and invalidates on none.
-    expect(loop).toMatch(/\n\s*draw\(\)/)
+    const loop = region('const runDampingLoop', 'const runVehicleLoop')
+    expect(loop).toMatch(/\n\s*scheduleFrame\(\)/)
     expect(loop).not.toMatch(/requestRender\(\)/)
     expect(loop).not.toMatch(/needsUpdate/)
   })
@@ -137,34 +141,29 @@ describe('the shadow map is invalidated by whatever changed what casts', () => {
    * to begin with.
    */
   it('leaves the vehicle loop drawing without asking for a new shadow pass', () => {
-    const loop = code(scene.slice(
-      scene.indexOf('const runVehicleLoop'),
-      scene.indexOf('const stopVehicleLoop'),
-    ))
-    expect(loop).toMatch(/\n\s*draw\(\)/)
+    const loop = region('const runVehicleLoop', 'const stopVehicleLoop')
+    expect(loop).toMatch(/\n\s*scheduleFrame\(\)/)
     expect(loop).not.toMatch(/requestRender\(\)/)
-    expect(loop).not.toMatch(/scheduleFrame\(\)/)
     expect(loop).not.toMatch(/needsUpdate/)
   })
 
-  /*
-   * Two handles, not one.
-   *
-   * `runDampingLoop` zeroes `animationHandle` the moment damping settles. A vehicle loop sharing it
-   * would be orphaned by that — a second rAF chain still running with nothing left holding its
-   * handle, so neither `stopVehicleLoop` nor `dispose()` could ever cancel it, and the frames it
-   * kept drawing would outlive the scene. The two loops therefore keep separate handles, and
-   * `dispose()` cancels both.
-   */
-  it('gives the vehicle loop its own handle, and cancels it on dispose', () => {
-    const loop = code(scene.slice(
-      scene.indexOf('const runVehicleLoop'),
-      scene.indexOf('const stopVehicleLoop'),
-    ))
-    expect(loop).not.toMatch(/animationHandle/)
-    expect(loop).toMatch(/vehicleHandle = requestAnimationFrame/)
-    const dispose = code(controllerMethod('dispose'))
-    expect(dispose).toMatch(/vehicleHandle !== 0\) cancelAnimationFrame\(vehicleHandle\)/)
+  it('gives the frame owner exclusive submission and disposal responsibility', () => {
+    // Ticket independence and cancellation are exercised in sceneFrames.test.ts; the real-browser
+    // controller fixture checks this wiring with simultaneous motion, empty rosters and disposal.
+    const source = code(scene)
+    expect(source).toMatch(/createSceneFrames\(draw\)/)
+    expect(source).not.toMatch(/\bdraw\(\)/)
+    for (const [start, end] of [
+      ['const runDampingLoop', 'const runVehicleLoop'],
+      ['const runVehicleLoop', 'const stopVehicleLoop'],
+      ['const runDisasterLoop', 'const stopDisasterLoop'],
+      ['const runTourLoop', 'const stopTourLoop'],
+    ]) {
+      const loop = region(start, end)
+      expect(loop).toMatch(/frames\.requestUpdate\(step\)/)
+      expect(loop).not.toMatch(/\brequestAnimationFrame\(/)
+    }
+    expect(code(controllerMethod('dispose'))).toMatch(/frames\.dispose\(\)/)
   })
 
   /*
@@ -175,10 +174,7 @@ describe('the shadow map is invalidated by whatever changed what casts', () => {
    * scene's on-demand design exists to avoid, reintroduced at the moment there is least to show.
    */
   it('stops the vehicle loop when nothing is moving', () => {
-    const loop = code(scene.slice(
-      scene.indexOf('const runVehicleLoop'),
-      scene.indexOf('const stopVehicleLoop'),
-    ))
+    const loop = region('const runVehicleLoop', 'const stopVehicleLoop')
     // Guarded before the first frame is ever requested…
     expect(loop).toMatch(/movingVehicles === 0\) return/)
     // …and re-tested inside the step, so it ends whenever the roster drains.
@@ -203,30 +199,10 @@ describe('the shadow map is invalidated by whatever changed what casts', () => {
     expect(to, 'stopTourLoop has been renamed or moved above the loop, inverting this slice')
       .toBeGreaterThan(from)
     const loop = code(scene.slice(from, to))
-    expect(loop).toMatch(/\n\s*draw\(\)/)
+    expect(loop).toMatch(/\n\s*scheduleFrame\(\)/)
     expect(loop).not.toMatch(/requestRender\(\)/)
     expect(loop).not.toMatch(/requestCameraRender\(\)/)
-    expect(loop).not.toMatch(/scheduleFrame\(\)/)
     expect(loop).not.toMatch(/needsUpdate/)
-  })
-
-  /*
-   * Three handles now, and the argument for the third is the argument for the second.
-   *
-   * Whichever `cancelAnimationFrame` runs last silently orphans the others if they share a handle,
-   * and an orphaned tour is worse than an orphaned vehicle loop: it keeps *writing to the camera*,
-   * so a scene that has been disposed goes on flying over a city nothing can stop.
-   */
-  it('gives the tour loop its own handle, and cancels it on dispose', () => {
-    const loop = code(scene.slice(
-      scene.indexOf('const runTourLoop'),
-      scene.indexOf('const stopTourLoop'),
-    ))
-    expect(loop).not.toMatch(/animationHandle/)
-    expect(loop).not.toMatch(/vehicleHandle/)
-    expect(loop).toMatch(/tourHandle = requestAnimationFrame/)
-    const dispose = code(controllerMethod('dispose'))
-    expect(dispose).toMatch(/tourHandle !== 0\) cancelAnimationFrame\(tourHandle\)/)
   })
 
   /*
@@ -238,10 +214,7 @@ describe('the shadow map is invalidated by whatever changed what casts', () => {
    * because `dispose()` has already run by then.
    */
   it('stops the tour loop when the tour is switched off, emptied or disposed', () => {
-    const loop = code(scene.slice(
-      scene.indexOf('const runTourLoop'),
-      scene.indexOf('const stopTourLoop'),
-    ))
+    const loop = region('const runTourLoop', 'const stopTourLoop')
     // Guarded before the first frame is ever requested…
     expect(loop).toMatch(/if \(tourHandle !== 0 \|\| disposed \|\| !tourActive/)
     // …and re-tested inside the step, so the next frame after any of them ends the chain.
@@ -355,29 +328,9 @@ describe('the shadow map is invalidated by whatever changed what casts', () => {
       .toBeGreaterThan(-1)
     expect(to, 'stopDisasterLoop has been renamed and this slice is unbounded').toBeGreaterThan(from)
     const loop = code(scene.slice(from, to))
-    expect(loop).toMatch(/\n\s*draw\(\)/)
+    expect(loop).toMatch(/\n\s*scheduleFrame\(\)/)
     expect(loop).not.toMatch(/requestRender\(\)/)
-    expect(loop).not.toMatch(/scheduleFrame\(\)/)
     expect(loop).not.toMatch(/needsUpdate/)
-  })
-
-  /*
-   * Three handles now, not two.
-   *
-   * Every pair of these loops can orphan the other by sharing a handle, and the failure is silent:
-   * whichever `cancelAnimationFrame` runs last wins, and the loser keeps drawing frames that nothing
-   * holds a handle to — surviving `dispose()`, and outliving the canvas it was drawing into.
-   */
-  it('gives the disaster loop its own handle, and cancels it on dispose', () => {
-    const from = scene.indexOf('const runDisasterLoop')
-    const to = scene.indexOf('const stopDisasterLoop')
-    expect(to).toBeGreaterThan(from)
-    const loop = code(scene.slice(from, to))
-    expect(loop).not.toMatch(/animationHandle/)
-    expect(loop).not.toMatch(/vehicleHandle/)
-    expect(loop).toMatch(/disasterHandle = requestAnimationFrame/)
-    const dispose = code(controllerMethod('dispose'))
-    expect(dispose).toMatch(/disasterHandle !== 0\) cancelAnimationFrame\(disasterHandle\)/)
   })
 
   /*

@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { createSceneFrames } from './sceneFrames'
 import { directActivityWidth } from './databaseCity'
 import type { DatabaseCityObject, DatabaseCityQueryFamily } from './databaseCityContracts'
 import { ARTERIAL_WIDTH, streetPitch, streetRoute, type CityLot, type CityPlan, type StreetClass } from './cityPlan'
@@ -1341,15 +1342,8 @@ export function createDatabaseCityScene(
   let disposed = false
   let assets: CityAssets | null = null
   let animationHandle = 0
-  let renderRequested = false
-  /*
-   * Vehicle state.
-   *
-   * `vehicleHandle` is deliberately *not* `animationHandle`. The damping loop zeroes that handle the
-   * moment the camera settles, so a vehicle loop sharing it would either refuse to start (the guard
-   * sees a non-zero handle) or leave a second, never-terminating rAF chain running behind it. Two
-   * loops, two handles, each responsible for stopping itself.
-   */
+  // Each controller owns a separate update ticket; the frame owner holds the only rendering rAF.
+  // Settling orbit damping must never clear the ticket that keeps live vehicles moving.
   let vehicleHandle = 0
   /** Animated time consumed so far, in ms. Only ever advanced by the vehicle loop. */
   let vehicleClock = 0
@@ -1382,12 +1376,6 @@ export function createDatabaseCityScene(
    * place a plume without rebuilding, or re-deriving, the massing it has to sit on.
    */
   const buildingTops = new Map<string, number>()
-  /**
-   * Disaster animation state.
-   *
-   * `disasterHandle` is its own handle for exactly the reason `vehicleHandle` is — see
-   * {@link runVehicleLoop}. Three loops, three handles, each responsible for cancelling itself.
-   */
   let disasterHandle = 0
   /** Animated time consumed by the disaster loop, in ms. Never the wall clock. */
   let disasterClock = 0
@@ -1551,15 +1539,8 @@ export function createDatabaseCityScene(
     renderer.render(scene, camera)
   }
 
-  // Rendering is on demand; a frame loop runs only while damping is still settling the camera.
-  const scheduleFrame = () => {
-    if (disposed || renderRequested) return
-    renderRequested = true
-    requestAnimationFrame(() => {
-      renderRequested = false
-      if (!disposed) draw()
-    })
-  }
+  const frames = createSceneFrames(draw)
+  const scheduleFrame = () => frames.requestRender()
 
   const requestRender = () => {
     // Anything that asks for a frame through this path may have changed what casts, so the shadow
@@ -1585,27 +1566,21 @@ export function createDatabaseCityScene(
     const step = () => {
       if (disposed) return
       const moving = controls.update()
-      draw()
-      animationHandle = moving ? requestAnimationFrame(step) : 0
+      scheduleFrame()
+      animationHandle = moving ? frames.requestUpdate(step) : 0
     }
-    animationHandle = requestAnimationFrame(step)
+    animationHandle = frames.requestUpdate(step)
   }
 
   /**
-   * The one continuous frame loop in this scene, and the reason it is safe.
+   * A controller advances its own clock, requests a draw and queues only its next update. The frame
+   * owner runs all queued updates before drawing once, so overlapping motion never submits twice.
    *
-   * Rendering here is on demand: `scheduleFrame` coalesces to a single frame and then stops, and the
-   * only other loop — {@link runDampingLoop} — ends as soon as the camera settles. A loop that runs
-   * while vehicles are moving is a genuine exception to that, so it is bounded three ways.
-   *
-   * - **It has its own handle.** `animationHandle` is zeroed by the damping loop the instant damping
-   *   settles, so a vehicle loop sharing it would either refuse to start (the `!== 0` guard sees the
-   *   damping loop's handle) or, worse, be silently orphaned when damping zeroed the handle out from
-   *   under it — leaving a second rAF chain that nothing can ever cancel, including `dispose()`.
+   * - **It has its own update ticket.** Settling damping cannot orphan the vehicle controller.
    * - **It stops itself.** The guard is re-tested every frame, so the loop ends on the frame after
    *   the last moving vehicle goes away, whether that is because the roster emptied, because every
    *   remaining request is blocked, or because the scene was disposed.
-   * - **It calls `draw()` directly.** Not `requestRender()`, which would set
+   * - **It requests a coalesced frame.** Not `requestRender()`, which would set
    *   `renderer.shadowMap.needsUpdate` on every single frame and re-arm the 948-draw-call shadow
    *   pass issue #90 removed. Nothing under this loop casts a shadow, so nothing it does can
    *   invalidate a shadow map, and it must not claim otherwise.
@@ -1630,15 +1605,15 @@ export function createDatabaseCityScene(
        */
       vehicleClock += Math.min(now - previous, 100)
       previous = now
-      draw()
-      vehicleHandle = requestAnimationFrame(step)
+      scheduleFrame()
+      vehicleHandle = frames.requestUpdate(step)
     }
-    vehicleHandle = requestAnimationFrame(step)
+    vehicleHandle = frames.requestUpdate(step)
   }
 
   const stopVehicleLoop = () => {
     if (vehicleHandle === 0) return
-    cancelAnimationFrame(vehicleHandle)
+    frames.cancelUpdate(vehicleHandle)
     vehicleHandle = 0
   }
 
@@ -1656,7 +1631,7 @@ export function createDatabaseCityScene(
    *
    * 1. **Nothing here casts or receives a shadow.** Flames and smoke move every frame, so a caster
    *    would re-arm the 948-draw-call shadow pass issue #90 removed, once per frame, forever.
-   * 2. **The loop has its own handle** (`disasterHandle`) and calls `draw()` directly, never
+   * 2. **The loop has its own update ticket** (`disasterHandle`) and coalesces its frame, never
    *    `requestRender()`.
    * 3. **The loop ends itself** when there is nothing burning or spraying, so a city with no
    *    disasters goes fully idle rather than scheduling an empty frame for ever.
@@ -2132,7 +2107,7 @@ export function createDatabaseCityScene(
   /**
    * The disaster loop, bounded exactly as the vehicle loop is.
    *
-   * Its own handle, so the damping loop cannot orphan it. `draw()` directly, so an hour of a burning
+   * Its own update ticket, so the damping loop cannot orphan it. A coalesced frame, so a burning
    * city never re-arms the shadow pass. And a guard re-tested on every frame, so the moment the last
    * fire is put out the loop ends rather than scheduling empty frames for ever.
    */
@@ -2148,15 +2123,15 @@ export function createDatabaseCityScene(
       // once, and an unclamped flame would jump a random distance through its cycle on resume.
       disasterClock += Math.min(now - previous, 100)
       previous = now
-      draw()
-      disasterHandle = requestAnimationFrame(step)
+      scheduleFrame()
+      disasterHandle = frames.requestUpdate(step)
     }
-    disasterHandle = requestAnimationFrame(step)
+    disasterHandle = frames.requestUpdate(step)
   }
 
   const stopDisasterLoop = () => {
     if (disasterHandle === 0) return
-    cancelAnimationFrame(disasterHandle)
+    frames.cancelUpdate(disasterHandle)
     disasterHandle = 0
   }
 
@@ -2170,20 +2145,19 @@ export function createDatabaseCityScene(
   /*
    * ---------------------------------------------------------------- the guided tour
    *
-   * The third frame loop, and the third handle. Placed below `stopVehicleLoop` deliberately:
+   * Tour updates keep their own ticket and clock. Placed below `stopVehicleLoop` deliberately:
    * `shadowInvalidation.test.ts` slices this file by named anchors, and a function inserted between
    * `runDampingLoop` and `runVehicleLoop` would silently extend the slice above it so the guard
    * started asserting about code it was never written for.
    *
    * It obeys the same three rules the vehicle loop documents, for the same reasons:
    *
-   * - **Its own handle.** `tourHandle`, cancelled in `dispose()` alongside the other two. Sharing
-   *   `animationHandle` would orphan whichever loop the damping loop zeroed the handle out from
-   *   under, leaving an rAF chain nothing could ever cancel.
+   * - **Its own update ticket.** Stopping one controller cannot cancel another; disposing the frame
+   *   owner cancels all queued updates and the pending render together.
    * - **It stops itself.** The guard is re-tested every frame, so switching the tour off, emptying
    *   the itinerary, or disposing the scene all end it on the next frame rather than leaving a
    *   callback scheduled forever against a scene that has gone.
-   * - **It calls `draw()` directly.** A tour is minutes of continuous camera movement, and a
+   * - **It requests a coalesced frame.** A tour is minutes of continuous camera movement, and a
    *   `requestRender()` in here would re-arm the 948-caster shadow pass on every one of those
    *   frames — restoring far more than issue #90 removed. A directional sun's shadow map is drawn
    *   from the light, so a camera flying around underneath it cannot change a texel of it.
@@ -2343,15 +2317,15 @@ export function createDatabaseCityScene(
       }
       placeTourCamera()
       reportTourHeading(now)
-      draw()
-      tourHandle = requestAnimationFrame(step)
+      scheduleFrame()
+      tourHandle = frames.requestUpdate(step)
     }
-    tourHandle = requestAnimationFrame(step)
+    tourHandle = frames.requestUpdate(step)
   }
 
   const stopTourLoop = () => {
     if (tourHandle === 0) return
-    cancelAnimationFrame(tourHandle)
+    frames.cancelUpdate(tourHandle)
     tourHandle = 0
   }
 
@@ -4310,7 +4284,7 @@ export function createDatabaseCityScene(
    * nine in the morning.
    */
   applyAtmosphere()
-  draw()
+  requestRender()
 
   /*
    * Follow the clock while the tab stays open.
@@ -4619,10 +4593,7 @@ export function createDatabaseCityScene(
     getPlan: () => plan,
     dispose() {
       disposed = true
-      if (animationHandle !== 0) cancelAnimationFrame(animationHandle)
-      if (vehicleHandle !== 0) cancelAnimationFrame(vehicleHandle)
-      if (disasterHandle !== 0) cancelAnimationFrame(disasterHandle)
-      if (tourHandle !== 0) cancelAnimationFrame(tourHandle)
+      frames.dispose()
       if (hoverHandle !== 0) cancelAnimationFrame(hoverHandle)
       resize.disconnect()
       stopWatchingClock()

@@ -48,6 +48,11 @@ export const INSTRUMENT_SOURCE = `(() => {
      * (No backticks in here: this whole file is one template literal.)
      */
     rafTotal: 0,
+    browserFrames: [],
+    currentFrame: null,
+    renderTotal: 0,
+    // Workbench sampling uses the original scheduler and is never counted as application work.
+    sampleFrame: rawRaf,
   };
   window.__measure = state;
 
@@ -151,6 +156,12 @@ export const INSTRUMENT_SOURCE = `(() => {
   window.requestAnimationFrame = function (callback) {
     return rawRaf((timestamp) => {
       state.rafTotal += 1;
+      let frame = state.browserFrames.at(-1);
+      if (state.collecting && (!frame || frame.timestamp !== timestamp)) {
+        frame = { timestamp, callbacks: 0, renders: 0, calls: 0, offCalls: 0, cpuMs: 0 };
+        state.browserFrames.push(frame);
+      }
+      state.currentFrame = state.collecting ? frame : null;
       const before = state.live;
       state.live = { calls: 0, tris: 0, offCalls: 0, offTris: 0, offMs: 0, instanced: 0 };
       const started = now();
@@ -167,6 +178,12 @@ export const INSTRUMENT_SOURCE = `(() => {
         before.offTris += drawn.offTris;
         before.offMs += drawn.offMs;
         before.instanced += drawn.instanced;
+        if (state.currentFrame) {
+          state.currentFrame.callbacks += 1;
+          state.currentFrame.calls += drawn.calls;
+          state.currentFrame.offCalls += drawn.offCalls;
+          state.currentFrame.cpuMs += cpuMs;
+        }
         if (state.collecting && drawn.calls > 0) {
           state.frames.push({
             at: started,
@@ -181,12 +198,14 @@ export const INSTRUMENT_SOURCE = `(() => {
           });
           previousStart = started;
         }
+        state.currentFrame = null;
       }
     });
   };
 
   state.resetFrames = () => {
     state.frames.length = 0;
+    state.browserFrames.length = 0;
     previousStart = null;
   };
 
@@ -250,6 +269,7 @@ export const INSTRUMENT_SOURCE = `(() => {
 
   state.start = () => {
     state.frames.length = 0;
+    state.browserFrames.length = 0;
     state.keys.length = 0;
     state.longTasks.length = 0;
     state.events.length = 0;
@@ -261,6 +281,7 @@ export const INSTRUMENT_SOURCE = `(() => {
     state.collecting = false;
     return {
       frames: state.frames.slice(),
+      browserFrames: state.browserFrames.slice(),
       keys: state.keys.slice(),
       longTasks: state.longTasks.slice(),
       events: state.events.slice(),
