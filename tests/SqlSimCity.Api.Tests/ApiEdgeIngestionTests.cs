@@ -106,12 +106,14 @@ public sealed class ApiEdgeIngestionTests : IDisposable
                 "Connector captured one point-in-time sample.", 0, 0));
 
         var builder = new ObservationBatchBuilder("edge-1", "target-1", "epoch-1", "boot-1");
+        var capabilities = (await FixtureCapabilitiesSource.CreateAsync(new FakeTimeProvider(now))).GetCurrent();
+        capabilities = capabilities with { Targets = [capabilities.Targets[0] with { TargetId = "target-1" }] };
         builder.AddSection(
             ObservationSection.Atlas, 1, now, freshness,
             new AtlasObservationV1(atlas, atlasSource.GetStatus()));
         builder.AddSection(
             ObservationSection.Capabilities, 1, now, freshness,
-            new CapabilitiesSnapshotV1("1", now, []));
+            capabilities);
         builder.AddSection(
             ObservationSection.QueryStore, 1, now, freshness,
             new QueryStoreObservationV1(
@@ -271,6 +273,7 @@ public sealed class ApiEdgeIngestionTests : IDisposable
             Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
 
         var atlas = await client.GetStringAsync("/api/v1/atlas");
+        var capabilities = await client.GetStringAsync("/api/v1/capabilities");
         var query = await client.GetStringAsync("/api/v1/query-store/queries?metric=cpu&pageSize=10");
         var city = await client.GetStringAsync("/api/v1/database-city");
         var live = await client.GetStringAsync("/api/v1/live");
@@ -278,6 +281,9 @@ public sealed class ApiEdgeIngestionTests : IDisposable
 
         Assert.Contains("\"mode\":\"Edge\"", atlas, StringComparison.Ordinal);
         Assert.Contains("\"targetId\":\"target-1\"", atlas, StringComparison.Ordinal);
+        Assert.Contains("\"targetId\":\"target-1\"", capabilities, StringComparison.Ordinal);
+        Assert.Contains("\"sourceTimestamp\":\"2026-08-18T01:00:00+00:00\"", capabilities, StringComparison.Ordinal);
+        Assert.DoesNotContain("azure-sql-managed-instance", capabilities, StringComparison.Ordinal);
         Assert.Contains("\"source\":\"EdgeConnector\"", query, StringComparison.Ordinal);
         Assert.Contains("\"status\":\"Disconnected\"", query, StringComparison.Ordinal);
         Assert.Contains("\"source\":\"EdgeConnector\"", city, StringComparison.Ordinal);

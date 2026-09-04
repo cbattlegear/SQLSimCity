@@ -96,9 +96,6 @@ else if (edgeMode)
 }
 else
 {
-    var capabilitiesSource = await FixtureCapabilitiesSource.CreateAsync(
-        cancellationToken: CancellationToken.None);
-    builder.Services.AddSingleton<ICapabilitiesSource>(capabilitiesSource);
     // LiveIncidents:Mode defaults to Fixture (no credentials); Connected opts a real
     // SqlConnectionFactory-backed collector in and fails closed before the host serves traffic.
     builder.Services.AddLiveIncidents(builder.Configuration, probeCatalog);
@@ -116,6 +113,10 @@ if (acquisitionMode == AcquisitionMode.Fixture && atlasConnected)
     var connectionProfile = AtlasConfiguration.BuildProfile(builder.Configuration, atlasConnectionString);
     builder.Services.AddSingleton(atlasOptions);
     builder.Services.AddSingleton(connectionProfile);
+    builder.Services.AddSingleton(new ConnectedCapabilityTarget(
+        atlasOptions.TargetId, connectionProfile, atlasOptions.KnownDatabases,
+        atlasOptions.RefreshInterval,
+        atlasConnectionString is null ? null : SqlSimCityConnectionString.DefaultPlatform(atlasConnectionString)));
     builder.Services.AddSingleton(TimeProvider.System);
     builder.Services.AddSingleton(
         AtlasConfiguration.BuildSecretProvider(builder.Configuration, atlasConnectionString));
@@ -184,6 +185,9 @@ else if (acquisitionMode == AcquisitionMode.Fixture)
     builder.Services.AddSingleton<IQueryStoreHistorySource, FixtureQueryStoreHistorySource>();
     builder.Services.AddSingleton<IDatabaseCitySource, FixtureDatabaseCitySource>();
 }
+
+if (!archiveMode && !edgeMode)
+    await builder.Services.AddLocalCapabilitiesAsync(builder.Configuration, probeCatalog);
 
 var app = builder.Build();
 

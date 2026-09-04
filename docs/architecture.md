@@ -707,3 +707,13 @@ Primary read-only groups:
 `/api/v1/edge/ingest` is the sole bounded POST route and exists only when edge ingestion is explicitly
 enabled. All responses are same-origin, rate/body bounded, and carry evidence/status fields rather
 than success-shaped empty values.
+
+Capabilities use the acquisition source, never fixture profiles for a connected target. A host-owned
+collector negotiates on startup and after each Atlas refresh interval (60 seconds for live-only
+connections); HTTP reads only return its latest bounded snapshot. The profile's feature fields refer
+to the configured initial database. Query Store availability also covers configured or discovered
+databases, up to the Atlas 100-database bound, with truncation disclosed. Observation timestamps
+remain those of negotiation, including explicit permission/unavailable results. Before the first
+cycle, the configured target is `NotProbed` with no evidence observation time; the required snapshot
+and profile timestamp fields use the Unix epoch, not a fabricated current observation.
+Archive and edge modes retain their captured capability identities and observation times.

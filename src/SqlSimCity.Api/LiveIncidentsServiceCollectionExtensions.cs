@@ -112,7 +112,8 @@ public static class LiveIncidentsServiceCollectionExtensions
                 break;
 
             case LiveIncidentsMode.Connected:
-                RegisterConnected(services, options.Connection, options.SampleBounds, probeCatalog, sectionName, connectionString);
+                RegisterConnected(services, options.Connection, options.SampleBounds, probeCatalog, sectionName, connectionString,
+                    registerCapabilities: !AtlasConfiguration.IsConnected(configuration));
                 break;
 
             default:
@@ -129,7 +130,8 @@ public static class LiveIncidentsServiceCollectionExtensions
         LiveIncidentsSampleBoundsOptions sampleBounds,
         ProbeCatalog probeCatalog,
         string sectionName,
-        string? connectionString)
+        string? connectionString,
+        bool registerCapabilities)
     {
         var connectionSection = $"{sectionName}:{nameof(LiveIncidentsOptions.Connection)}";
         var boundsSection = $"{sectionName}:{nameof(LiveIncidentsOptions.SampleBounds)}";
@@ -168,6 +170,10 @@ public static class LiveIncidentsServiceCollectionExtensions
         var displayName = parsed is null
             ? RequireNonBlank(connection.DisplayName, connectionSection, nameof(LiveIncidentsConnectionOptions.DisplayName))
             : connection.DisplayName is { Length: > 0 } ? connection.DisplayName : DefaultDisplayName;
+
+        if (registerCapabilities)
+            services.AddSingleton(new ConnectedCapabilityTarget(
+                targetId, profile, [profile.InitialDatabase], TimeSpan.FromMinutes(1), platform));
 
         var secretOptions = new SecretFileProviderOptions
         {

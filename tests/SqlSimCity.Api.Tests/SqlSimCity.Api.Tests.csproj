@@ -15,6 +15,10 @@
     <Using Include="Xunit" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="..\SqlSimCity.Archive.Tests\Fixtures\format1-findings-before-removal.ssca"
+          Link="Fixtures\format1-findings-before-removal.ssca" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\src\SqlSimCity.Api\SqlSimCity.Api.csproj" />
     <ProjectReference Include="..\..\src\SqlSimCity.Domain\SqlSimCity.Domain.csproj" />
     <ProjectReference Include="..\..\src\SqlSimCity.Contracts\SqlSimCity.Contracts.csproj" />

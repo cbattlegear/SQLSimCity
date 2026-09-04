@@ -1,10 +1,41 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.DependencyInjection;
+using SqlSimCity.Archive;
+using SqlSimCity.Domain;
 
 namespace SqlSimCity.Api.Tests;
 
 public sealed class AcquisitionModeTests
 {
+    [Fact]
+    public async Task ArchiveCompositionServesCapturedCapabilitiesWithoutConnectedCollectors()
+    {
+        var directory = Path.Combine(AppContext.BaseDirectory, "Fixtures");
+        const string fileName = "format1-findings-before-removal.ssca";
+        using var archive = ArchiveSource.Open(new ArchiveSourceOptions(directory, fileName));
+        var expected = ((ICapabilitiesSource)archive).GetCurrent();
+        await using var factory = new WebApplicationFactory<ApiAssemblyMarker>()
+            .WithWebHostBuilder(builder =>
+            {
+                builder.UseSetting("Acquisition:Mode", "Archive");
+                builder.UseSetting("Acquisition:Archive:AllowedDirectory", directory);
+                builder.UseSetting("Acquisition:Archive:FileName", fileName);
+            });
+        using var client = factory.CreateClient();
+        var source = Assert.IsType<ArchiveSource>(factory.Services.GetRequiredService<ICapabilitiesSource>());
+        var actual = ((ICapabilitiesSource)source).GetCurrent();
+        Assert.NotEmpty(actual.Targets);
+        Assert.Equal(expected.GeneratedAt, actual.GeneratedAt);
+        Assert.Equal(expected.Targets.Select(target => target.TargetId), actual.Targets.Select(target => target.TargetId));
+        Assert.Equal(expected.Targets.Select(target => target.SourceTimestamp), actual.Targets.Select(target => target.SourceTimestamp));
+        Assert.Null(factory.Services.GetService<ConnectedCapabilitiesSource>());
+        using var response = await client.GetAsync(new Uri("/api/v1/capabilities", UriKind.Relative));
+        response.EnsureSuccessStatusCode();
+        Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
+        Assert.Equal("{\"status\":\"ready\"}", await client.GetStringAsync("/readyz"));
+    }
+
     [Fact]
     public void ArchiveModeRejectsEdgeIngestionBeforeServing()
     {
