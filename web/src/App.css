@@ -1647,6 +1647,7 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
   font-variant-numeric: tabular-nums;
 }
 .sidebar-drawer-body { min-height: 0; overflow: auto; }
+.sidebar-drawer-body .detail { position: static; }
 .sidebar-drawer-body > * { margin-block: 0; }
 
 /*

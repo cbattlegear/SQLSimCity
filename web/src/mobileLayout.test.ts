@@ -1094,6 +1094,9 @@ describe('three drawers in one rail share one height budget', () => {
     expect(rendered, 'the feed is not below the place card')
       .toBeGreaterThan(cityMarkup.indexOf('className={`sidebar-place-card'))
   })
+  it('keeps embedded detail cards in the drawer flow instead of covering later road links', () => {
+    expect(desktopRule('.sidebar-drawer-body .detail')).toMatch(/position:\s*static/)
+  })
 
   /**
    * The atlas is deliberately not wrapped. It renders one drawer, so it has nothing to divide, and
