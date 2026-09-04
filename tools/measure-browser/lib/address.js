@@ -210,7 +210,7 @@ export async function walkSidebarRegions(page, { populatePlanFinder = true } = {
      * any particular term matches anything.
      */
     if (populatePlanFinder) {
-      const submit = drawer.getByRole('button', { name: 'Route it' })
+      const submit = drawer.getByRole('button', { name: /^(?:Route it|Find plans)$/ })
       if ((await submit.count()) > 0) {
         const submittedAt = Date.now()
         try {
@@ -273,7 +273,7 @@ export async function openRoutedPlan(page) {
     }
     const results = page.locator('.hud-results li')
     if ((await results.count()) === 0) {
-      await drawer.getByRole('button', { name: 'Route it' }).click({ timeout: TRUSTED_CLICK_TIMEOUT_MS })
+      await drawer.getByRole('button', { name: /^(?:Route it|Find plans)$/ }).click({ timeout: TRUSTED_CLICK_TIMEOUT_MS })
       await results.first().waitFor({ state: 'visible', timeout: 30000 })
     }
     await results.first().click({ timeout: TRUSTED_CLICK_TIMEOUT_MS })

@@ -145,6 +145,28 @@ jobs:
         working-directory: web
         run: npm run build
 
+      - name: Install existing scene browser harness dependencies
+        working-directory: tools/measure-browser
+        run: npm ci
+
+      - name: Install Chromium for scene lifecycle
+        working-directory: tools/measure-browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Verify scene lifecycle
+        # The harness starts its own temporary Vite server; no fixture is exposed
+        # by the production build or by the separate connected container smoke.
+        run: node tools/measure-browser/scene-lifecycle.js --out artifacts/scene-lifecycle
+
+      - name: Upload scene lifecycle diagnostics
+        if: ${{ !cancelled() && (success() || failure()) }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scene-lifecycle
+          path: artifacts/scene-lifecycle
+          if-no-files-found: ignore
+          retention-days: 7
+
   scripts:
     # The catalog and shell guards need neither the .NET SDK nor web/'s
     # node_modules -- the root package has no dependencies at all -- so they
@@ -198,3 +220,36 @@ jobs:
 
       - name: Smoke fixture and fail-closed modes
         run: tools/container-smoke.sh "sqlsimcity-ci:${GITHUB_SHA}"
+
+      - name: Set up Node.js for connected smoke
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tools/measure-browser/package-lock.json
+
+      - name: Test disposable connected rig
+        run: node --test tools/connected-smoke/run.test.mjs
+
+      - name: Install existing browser harness dependencies
+        working-directory: tools/measure-browser
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: tools/measure-browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Smoke connected SQL, API, and browser
+        run: >-
+          node tools/connected-smoke/run.mjs
+          --image "sqlsimcity-ci:${GITHUB_SHA}"
+          --out artifacts/connected-smoke
+
+      - name: Upload connected smoke diagnostics
+        if: ${{ !cancelled() && (success() || failure()) }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: connected-smoke
+          path: artifacts/connected-smoke
+          if-no-files-found: ignore
+          retention-days: 7

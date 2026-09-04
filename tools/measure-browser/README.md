@@ -9,9 +9,42 @@ measured in a running browser*. The suite in `web/` reads `App.css` as source te
 renders nothing, so it can confirm a declaration exists and cannot see the layout — or the
 frame time — that results. Two real defects here were invisible to a green suite.
 
-Nothing here runs in CI. It is a workbench, and it is one of three: `tools/measure/`
-measures what the same product costs the SQL Server it watches, and `tools/measure-api/`
-measures what a request costs the API process in between.
+The large-city GPU measurements stay manual. The small connected smoke and deterministic scene
+lifecycle fixture below also run in CI, using this same Playwright stack. `tools/measure/` measures
+SQL Server costs, and `tools/measure-api/` measures the API process in between.
+
+## Small connected smoke and scene lifecycle gate
+
+`node smoke.js --origin <API origin> --database SmokeCity --out <artifact-directory>` walks the
+actual atlas into a populated city, opens the directory and table evidence, populates the plan
+finder, routes a captured plan and goes back. It checks real API catalog, query families and
+multi-table routes, not fixture responses. Every click is trusted and timed. Rail and sheet
+geometry, renderer identity, screenshots and failures are written to the output directory.
+Use `tools\connected-smoke\run.mjs` to supply its disposable SQL/API target; never seed a shared target.
+
+`node scene-lifecycle.js --out <artifact-directory>` runs the real scene in Chromium with a
+small, explicitly synthetic controller fixture. It needs the existing `web` dependencies as
+well as this package's Playwright dependencies. The fixture is outside the app and served only
+by a loopback Vite server owned and closed by the command; it is not an application entry point
+and no debug hook ships. It overlaps vehicles, fires, water mains, tour and residual damping
+from a trusted drag, switches flat/3D modes, drains every controller and disposes the scene.
+
+The fixture counts `THREE.Scene.onBeforeRender`, once for each full `renderer.render` call,
+and groups those counts and WebGL submissions by **native rAF timestamp**, not by callback.
+`browserFrames` therefore differs from the existing callback-level `frames` series. Sampling
+uses the saved raw scheduler, so the measurement's own callbacks never inflate idle counts.
+Do not use Playwright clock interception here: even `setFixedTime` replaces rAF timing and can
+silently split one native frame into apparently distinct timestamps. Neither host nor page
+clock is changed by this gate.
+
+`--baseline` records the original duplicate submissions without rejecting them; normal mode
+requires at most one submission per frame, zero idle/disposed callbacks, nonzero shadow
+submissions after a content change, and median zero during camera/vehicle motion. `--headed`
+is optional. Hosted headless results prove invariants/counts, **not real-GPU latency**. Reports
+identify the actual renderer, including SwiftShader when software rendering is used.
+
+The coalescing mutation is deliberately simple: insert `draw()` in `sceneFrames.requestRender`.
+Both the unit coalescing assertion and this browser gate must fail. Restore it before committing.
 
 ## What it measures, and why each number is trustworthy
 
