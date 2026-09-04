@@ -246,7 +246,14 @@ public sealed record DatabaseCityRecentActivityV1(
     string ExecutionCount,
     string TotalDurationMicroseconds,
     string TotalWaitMilliseconds,
-    string Rationale);
+    string Rationale)
+{
+    /// <summary>Recent per-plan waits apportioned by compiled cost; absent when wait capture is incomplete.</summary>
+    public DatabaseCityWaitAttributionV1? WaitAttribution { get; init; }
+
+    /// <summary>Categories from exactly the same recent intervals; absent is unknown, not zero waiting.</summary>
+    public IReadOnlyDictionary<string, string>? WaitMillisecondsByCategory { get; init; }
+}
 
 public sealed record DatabaseCityQueryFamilyV1(
     string FamilyId,

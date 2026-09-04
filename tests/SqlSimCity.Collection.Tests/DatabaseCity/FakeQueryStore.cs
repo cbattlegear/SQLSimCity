@@ -46,7 +46,8 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
     public sealed record PlanNode(
         ShowplanObjectV1 Reference,
         decimal? EstimatedRows = null,
-        decimal? EstimatedRowSizeBytes = null);
+        decimal? EstimatedRowSizeBytes = null,
+        decimal? EstimatedCpu = null);
 
     /// <summary>
     /// One retained runtime bucket at an explicit interval, for tests about the recent traffic
@@ -59,7 +60,9 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
         DateTimeOffset End,
         string Executions = "1",
         string DurationMicroseconds = "1",
-        string WaitMilliseconds = "0");
+        string WaitMilliseconds = "0",
+        string? PlanId = null,
+        IReadOnlyDictionary<string, string>? WaitCategories = null);
 
     private static readonly DateTimeOffset Observed = new(2026, 8, 17, 17, 0, 0, TimeSpan.Zero);
 
@@ -73,6 +76,7 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
     public string? TotalCount { get; init; }
     public bool ThrowOnQueries { get; init; }
     public bool ReturnNullPlans { get; init; }
+    public HashSet<string> UnavailablePlanIds { get; } = new(StringComparer.Ordinal);
     public Func<string, CancellationToken, Task<NormalizedShowplanV1?>>? ReadPlanOverride { get; init; }
     public int PlansRequested { get; private set; }
 
@@ -115,11 +119,11 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
                 QueryStoreExecutionType.Regular, "primary", "1", 1m, 1m, 1m, "1", "1", "1",
                 new ReadOnlyDictionary<string, string>(waits.ToDictionary()), Evidence))
             .Concat((runtimeIntervals ?? []).Select((interval, i) => new RuntimeBucketV1(
-                plans[0].PlanId, $"window-{i}", "epoch:1", interval.Start, interval.End,
+                interval.PlanId ?? plans[0].PlanId, $"window-{i}", "epoch:1", interval.Start, interval.End,
                 QueryStoreExecutionType.Regular, "primary", interval.Executions, 1m, 1m, 1m,
                 interval.DurationMicroseconds, "1", "1",
                 new ReadOnlyDictionary<string, string>(
-                    new Dictionary<string, string> { ["CPU"] = interval.WaitMilliseconds }),
+                    (interval.WaitCategories ?? new Dictionary<string, string> { ["CPU"] = interval.WaitMilliseconds }).ToDictionary()),
                 Evidence)))
             .ToArray();
 
@@ -130,7 +134,7 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
             var nodes = plan.Nodes
                 .Select((node, i) => new ShowplanNodeV1(
                     i + 1, i == 0 ? null : 1, "Scan", "Index Scan",
-                    node.EstimatedRows, null, null, null, false, node.Reference, null, [],
+                    node.EstimatedRows, node.EstimatedCpu, null, null, false, node.Reference, null, [],
                     node.EstimatedRowSizeBytes))
                 .ToArray();
             _plans[plan.PlanId] = new NormalizedShowplanV1(
@@ -162,7 +166,7 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
     {
         PlansRequested++;
         if (ReadPlanOverride is not null) return ReadPlanOverride(planId, cancellationToken);
-        return Task.FromResult(ReturnNullPlans ? null : _plans.GetValueOrDefault(planId));
+        return Task.FromResult(ReturnNullPlans || UnavailablePlanIds.Contains(planId) ? null : _plans.GetValueOrDefault(planId));
     }
 
     public Task<PlanComparisonV1?> ComparePlansAsync(
