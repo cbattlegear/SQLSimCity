@@ -73,6 +73,7 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
     public string? TotalCount { get; init; }
     public bool ThrowOnQueries { get; init; }
     public bool ReturnNullPlans { get; init; }
+    public Func<string, CancellationToken, Task<NormalizedShowplanV1?>>? ReadPlanOverride { get; init; }
     public int PlansRequested { get; private set; }
 
     /// <summary>The database filter the last families read asked for.</summary>
@@ -160,6 +161,7 @@ internal sealed class FakeQueryStore : IQueryStoreHistorySource
     public Task<NormalizedShowplanV1?> GetPlanAsync(string planId, CancellationToken cancellationToken)
     {
         PlansRequested++;
+        if (ReadPlanOverride is not null) return ReadPlanOverride(planId, cancellationToken);
         return Task.FromResult(ReturnNullPlans ? null : _plans.GetValueOrDefault(planId));
     }
 

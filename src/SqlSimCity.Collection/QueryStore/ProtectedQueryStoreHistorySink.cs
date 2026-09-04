@@ -386,7 +386,7 @@ public sealed class ProtectedQueryStoreHistorySink(
         {
             var aggregate = QueryStoreRuntimeAggregator.Aggregate(group.Select(bucket =>
                 new RuntimeStatInput(
-                    bucket.PlanId, bucket.IntervalId, bucket.IntervalStart, bucket.IntervalEnd,
+                    bucket.PlanId, $"hour:{group.Key.Hour.UtcTicks}", group.Key.Hour, group.Key.Hour.AddHours(1),
                     bucket.ExecutionType, bucket.ReplicaGroupId,
                     BigInteger.Parse(bucket.ExecutionCount, CultureInfo.InvariantCulture),
                     bucket.AverageDurationMicroseconds, bucket.AverageCpuMicroseconds,
@@ -730,7 +730,9 @@ public sealed class ProtectedQueryStoreHistorySink(
     private static string RuntimeKey(string epoch, RuntimeBucketKey key) =>
         $"{epoch}|{key.PlanId}|{key.IntervalId}|{(int)key.ExecutionType}|{key.ReplicaGroupId}";
     private static string WaitKey(string epoch, QueryWaitFact wait) =>
-        $"{epoch}|{wait.PlanId}|{wait.IntervalId}|{(int)wait.ExecutionType}|{wait.ReplicaGroupId}|{wait.WaitCategoryId}";
+        // Published history carries category names, not numeric catalog IDs. Use that same
+        // identity for both restored and newly collected waits so overlap remains an upsert.
+        $"{epoch}|{wait.PlanId}|{wait.IntervalId}|{(int)wait.ExecutionType}|{wait.ReplicaGroupId}|{wait.WaitCategory}";
     private static WaitBucketIdentity WaitBucketKey(EpochRuntimeBucket runtime) =>
         new(runtime.Epoch, runtime.Bucket.Key.PlanId, runtime.Bucket.Key.IntervalId,
             runtime.Bucket.Key.ExecutionType, runtime.Bucket.Key.ReplicaGroupId);
@@ -836,7 +838,7 @@ public sealed class ProtectedQueryStoreHistorySink(
                     foreach (var wait in runtime.WaitMilliseconds)
                     {
                         var fact = new QueryWaitFact(
-                            runtime.PlanId, intervalId, runtime.ExecutionType, runtime.ReplicaGroupId,
+                            key.PlanId, intervalId, runtime.ExecutionType, runtime.ReplicaGroupId,
                             0, wait.Key, BigInteger.Parse(wait.Value, CultureInfo.InvariantCulture));
                         state.Waits[WaitKey(epoch, fact)] = new EpochWaitFact(epoch, fact);
                     }

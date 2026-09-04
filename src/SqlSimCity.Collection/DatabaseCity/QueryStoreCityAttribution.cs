@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Numerics;
+using System.Xml;
 using SqlSimCity.Collection.Probes;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
@@ -241,12 +242,14 @@ public sealed class QueryStoreCityAttribution(
         var hydrated = 0;
         var skipped = 0;
         var unreadable = 0;
+        var normalizationFailures = 0;
 
         foreach (var plan in detail.Plans.OrderBy(item => item.PlanId, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (hydrated >= MaxPlansPerFamily || hydrated >= planBudget) { skipped++; continue; }
             NormalizedShowplanV1? showplan;
+            hydrated++;
             try
             {
                 showplan = await queryStore.GetPlanAsync(plan.PlanId, cancellationToken).ConfigureAwait(false);
@@ -260,8 +263,13 @@ public sealed class QueryStoreCityAttribution(
                 unreadable++;
                 continue;
             }
+            catch (XmlException)
+            {
+                unreadable++;
+                normalizationFailures++;
+                continue;
+            }
 
-            hydrated++;
             if (showplan is null) { unreadable++; continue; }
 
             var planLocal = new SortedSet<string>(StringComparer.Ordinal);
@@ -297,9 +305,15 @@ public sealed class QueryStoreCityAttribution(
 
         var objectIds = local.Concat(crossDatabase).ToArray();
         var namedElsewhere = offPage.Count + crossDatabase.Count + unresolved.Count;
+        var incomplete = unreadable > 0 || skipped > 0;
         var confidence = Confidence(local, namedElsewhere, index);
+        if (incomplete && confidence == QueryAttributionConfidence.Confirmed)
+            confidence = QueryAttributionConfidence.Probable;
         var rationale = Rationale(
-            local, offPage, crossDatabase, unresolved, namedElsewhere, index, hydrated, skipped, unreadable);
+            local, offPage, crossDatabase, unresolved, namedElsewhere, index,
+            hydrated - unreadable, skipped, unreadable);
+        if (normalizationFailures > 0)
+            rationale += $" {normalizationFailures} compiled plan(s) failed bounded XML normalization.";
         return new ResolvedFamily(
             new DatabaseCityQueryEvidence(
                 counters.FamilyId,
@@ -314,14 +328,17 @@ public sealed class QueryStoreCityAttribution(
                 rationale)
             {
                 WaitMillisecondsByCategory = waits,
-                WaitAttribution = costs.Build(counters.TotalWaitMilliseconds),
+                WaitAttribution = incomplete
+                    ? new DatabaseCityWaitAttributionV1([], counters.TotalWaitMilliseconds, hydrated - unreadable,
+                        "Plan coverage is incomplete; measured waits remain unassigned rather than being transferred to readable plans.")
+                    : costs.Build(counters.TotalWaitMilliseconds),
                 PlanDataVolume = volumes.Build(),
                 RecentActivity = RecentActivity(detail),
             },
             hydrated,
             // Totals belong to one building only when the plans named that building and nothing
             // else at all: not another page, not another database, not something unresolvable.
-            ExposureEligible: local.Count == 1 && namedElsewhere == 0);
+            ExposureEligible: local.Count == 1 && namedElsewhere == 0 && !incomplete);
     }
 
     /// <summary>

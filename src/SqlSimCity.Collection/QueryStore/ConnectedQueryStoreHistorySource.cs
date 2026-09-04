@@ -16,8 +16,13 @@ public sealed class ConnectedQueryStoreHistorySource(
     SecureShowplanParser showplanParser,
     QueryStoreCollectionStatusTracker statusTracker,
     TimeProvider timeProvider,
-    bool allowRawPayloadHydration = true) : IQueryStoreHistorySource
+    bool allowRawPayloadHydration = true) : IQueryStoreHistorySource, IDisposable
 {
+    private readonly SemaphoreSlim _textHydrationGate = new(1, 1);
+    internal static readonly TimeSpan TextRetryDelay = TimeSpan.FromMinutes(1);
+
+    public void Dispose() => _textHydrationGate.Dispose();
+
     public Task<PageV1<QueryFamilySummaryV1>> GetQueriesAsync(
         string? databaseId,
         string metric,
@@ -173,38 +178,7 @@ public sealed class ConnectedQueryStoreHistorySource(
                     physical.Add(identity with { Text = descriptor });
                     continue;
                 }
-                descriptor = await reader.ReadTextDescriptorAsync(
-                    identity.DatabaseId, identity.QueryTextId, cancellationToken).ConfigureAwait(false);
-                if (descriptor is null)
-                {
-                    try
-                    {
-                        var payload = await incrementalSource.ReadQueryTextAsync(
-                            identity.DatabaseId, identity.QueryTextId, cancellationToken).ConfigureAwait(false);
-                        descriptor = SqlTextNormalizer.Normalize(
-                            payload.Text, payload.IsEncrypted, payload.IsRestricted,
-                            QuotedIdentifiers(identity.Context.SetOptions));
-                        if (descriptor.Availability == QueryTextAvailability.Available && payload.Text is not null)
-                            await repository.StoreQueryTextAsync(
-                                identity.DatabaseId, identity.QueryTextId, timeProvider.GetUtcNow(),
-                                payload.Text, cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (ProbePermissionDeniedException)
-                    {
-                        descriptor = new QueryTextDescriptorV1(
-                            QueryTextAvailability.Restricted, null, null,
-                            "The configured principal cannot fetch this Query Store text.");
-                    }
-                    catch (ProbeExecutionException)
-                    {
-                        descriptor = new QueryTextDescriptorV1(
-                            QueryTextAvailability.Missing, null, null,
-                            "Query Store text is unavailable from the connected source.");
-                    }
-                    await repository.StoreTextDescriptorAsync(
-                        identity.DatabaseId, identity.QueryTextId, descriptor,
-                        timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
-                }
+                descriptor = await HydrateTextAsync(reader, identity, cancellationToken).ConfigureAwait(false);
             }
             physical.Add(identity with { Text = descriptor });
         }
@@ -228,6 +202,61 @@ public sealed class ConnectedQueryStoreHistorySource(
             },
             Plans = plans,
         };
+    }
+
+    private async Task<QueryTextDescriptorV1> HydrateTextAsync(
+        ProtectedQueryStoreRepository reader, PhysicalQueryIdentityV1 identity, CancellationToken cancellationToken)
+    {
+        // Serialize the cache check and probe, so concurrent city/family requests cannot all
+        // retry the same failed text before its backoff record is visible.
+        await _textHydrationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var descriptor = await reader.ReadTextDescriptorAsync(
+                identity.DatabaseId, identity.QueryTextId, cancellationToken).ConfigureAwait(false);
+            if (descriptor is not null) return descriptor;
+            var retry = await reader.ReadTextRetryAsync(
+                identity.DatabaseId, identity.QueryTextId, cancellationToken).ConfigureAwait(false);
+            if (retry is not null && retry.RetryAfter > timeProvider.GetUtcNow()) return retry.Descriptor;
+            try
+            {
+                var payload = await incrementalSource.ReadQueryTextAsync(
+                    identity.DatabaseId, identity.QueryTextId, cancellationToken).ConfigureAwait(false);
+                descriptor = SqlTextNormalizer.Normalize(payload.Text, payload.IsEncrypted, payload.IsRestricted,
+                    QuotedIdentifiers(identity.Context.SetOptions));
+                if (descriptor.Availability == QueryTextAvailability.Available && payload.Text is not null)
+                    await repository.StoreQueryTextAsync(
+                        identity.DatabaseId, identity.QueryTextId, timeProvider.GetUtcNow(),
+                        payload.Text, cancellationToken).ConfigureAwait(false);
+            }
+            catch (ProbePermissionDeniedException)
+            {
+                descriptor = new(QueryTextAvailability.Restricted, null, null,
+                    "The configured principal cannot fetch this Query Store text.");
+            }
+            catch (ProbeObjectUnavailableException)
+            {
+                descriptor = new(QueryTextAvailability.Missing, null, null,
+                    "Query Store text is unsupported by the connected source.");
+            }
+            catch (ProbeExecutionException exception) when (
+                exception is ProbeTimeoutException or ProbeTransientConnectionException)
+            {
+                descriptor = new(QueryTextAvailability.Missing, null, null,
+                    "Query Store text is temporarily unavailable; a later request can retry after one minute.");
+                var now = timeProvider.GetUtcNow();
+                await repository.StoreTextRetryAsync(identity.DatabaseId, identity.QueryTextId,
+                    new(descriptor, now + TextRetryDelay), now, cancellationToken).ConfigureAwait(false);
+                return descriptor;
+            }
+            await repository.StoreTextDescriptorAsync(identity.DatabaseId, identity.QueryTextId, descriptor,
+                timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
+            return descriptor;
+        }
+        finally
+        {
+            _textHydrationGate.Release();
+        }
     }
 
     public async Task<NormalizedShowplanV1?> GetPlanAsync(

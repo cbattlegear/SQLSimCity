@@ -59,9 +59,11 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     /// declaration prefix would otherwise only help stores that had never been written to.
     ///
     /// Bump it whenever <see cref="SqlTextNormalizer"/> changes what it accepts or how it renders
-    /// what it accepts.
+    /// what it accepts. V3 also retires permanent Missing descriptors written for transient probe
+    /// failures; those now use a separately classified, expiring retry entry at the same id.
     /// </summary>
-    internal const string TextDescriptorKind = "query-store-text-descriptor-v2";
+    internal const string TextDescriptorKind = "query-store-text-descriptor-v3";
+    internal const string TextRetryKind = "query-store-text-retry";
 
     /// <summary>
     /// Descriptor kinds this type no longer writes. Unlike the current kind, these are evictable:
@@ -71,7 +73,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     /// re-normalization at worst.
     /// </summary>
     internal static readonly IReadOnlyList<string> SupersededTextDescriptorKinds =
-        ["query-store-text-descriptor"];
+        ["query-store-text-descriptor", "query-store-text-descriptor-v2"];
 
     /// <summary>
     /// The record kinds written only when something is hydrated on demand -- the plan cache.
@@ -87,7 +89,7 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
     /// superseded stamp are included, because nothing can read them.
     /// </summary>
     public static readonly IReadOnlyList<string> PlanCacheRecordKinds =
-        [RawQueryTextKind, RawShowplanKind, NormalizedPlanKind, NormalizedPlanChunkKind,
+        [RawQueryTextKind, RawShowplanKind, NormalizedPlanKind, NormalizedPlanChunkKind, TextRetryKind,
          .. SupersededNormalizedPlanKinds, .. SupersededTextDescriptorKinds];
 
     private readonly IProtectedRecordReadSession? _session;
@@ -214,10 +216,29 @@ public sealed class ProtectedQueryStoreRepository(IProtectedRecordStore store)
         PutJsonAsync(Id(TextDescriptorKind, databaseId, queryTextId),
             TextDescriptorKind, capturedAt, StorageResolution.Detail, descriptor, cancellationToken);
 
-    public Task<QueryTextDescriptorV1?> ReadTextDescriptorAsync(
-        string databaseId, string queryTextId, CancellationToken cancellationToken = default) =>
-        ReadJsonAsync<QueryTextDescriptorV1>(
-            Id(TextDescriptorKind, databaseId, queryTextId), cancellationToken);
+    public async Task<QueryTextDescriptorV1?> ReadTextDescriptorAsync(
+        string databaseId, string queryTextId, CancellationToken cancellationToken = default)
+    {
+        using var record = await GetRecordAsync(
+            Id(TextDescriptorKind, databaseId, queryTextId), cancellationToken).ConfigureAwait(false);
+        return record is null || record.RecordKind == TextRetryKind
+            ? null : JsonSerializer.Deserialize<QueryTextDescriptorV1>(record.Payload.Span);
+    }
+
+    public Task StoreTextRetryAsync(
+        string databaseId, string queryTextId, QueryStoreTextRetry retry, DateTimeOffset capturedAt,
+        CancellationToken cancellationToken = default) =>
+        PutJsonAsync(Id(TextDescriptorKind, databaseId, queryTextId),
+            TextRetryKind, capturedAt, StorageResolution.Detail, retry, cancellationToken);
+
+    public async Task<QueryStoreTextRetry?> ReadTextRetryAsync(
+        string databaseId, string queryTextId, CancellationToken cancellationToken = default)
+    {
+        using var record = await GetRecordAsync(
+            Id(TextDescriptorKind, databaseId, queryTextId), cancellationToken).ConfigureAwait(false);
+        return record?.RecordKind == TextRetryKind
+            ? JsonSerializer.Deserialize<QueryStoreTextRetry>(record.Payload.Span) : null;
+    }
 
     public Task StoreNormalizedFactAsync<T>(
         string databaseId, string factId, DateTimeOffset capturedAt,
@@ -1018,6 +1039,8 @@ public sealed record QueryStoreDatabaseObservation(
     QueryStoreDatabaseState? LastSuccess,
     QueryStoreCollectionState AttemptState,
     string Reason);
+
+public sealed record QueryStoreTextRetry(QueryTextDescriptorV1 Descriptor, DateTimeOffset RetryAfter);
 
 public sealed record QueryStoreFamilyChunk(IReadOnlyList<QueryFamilyDetailV1> Families);
 public sealed record QueryStoreStoredFamily(
