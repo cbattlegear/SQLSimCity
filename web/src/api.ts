@@ -68,13 +68,23 @@ export async function fetchLiveIncidents(signal?: AbortSignal): Promise<LiveInci
 
 async function fetchJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(path, { headers: { Accept: 'application/json' }, credentials: 'same-origin', signal })
-  if (!response.ok) throw new Error(`Query Store request failed with status ${response.status}`)
+  if (!response.ok) {
+    const detail: unknown = response.headers.get('content-type')?.includes('application/json') ? await response.json() : null
+    const message = detail && typeof detail === 'object' && 'error' in detail && typeof detail.error === 'string'
+      ? detail.error : `Query Store request failed with status ${response.status}`
+    throw new QueryStoreRequestError(response.status, message)
+  }
   return response.json() as Promise<T>
 }
 
-export const fetchQueryFamilies = (metric: string, pageToken?: string | null, signal?: AbortSignal) =>
+export class QueryStoreRequestError extends Error {
+  readonly status: number
+  constructor(status: number, message: string) { super(message); this.status = status }
+}
+
+export const fetchQueryFamilies = (metric: string, pageToken?: string | null, signal?: AbortSignal, databaseId?: string) =>
   fetchJson<QueryFamilyPage>(
-    `/api/v1/query-store/queries?metric=${encodeURIComponent(metric)}&pageSize=100${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`,
+    `/api/v1/query-store/queries?metric=${encodeURIComponent(metric)}&pageSize=100${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}${databaseId ? `&databaseId=${encodeURIComponent(databaseId)}` : ''}`,
     signal,
   )
 
