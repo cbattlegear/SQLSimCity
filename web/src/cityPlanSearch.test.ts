@@ -91,6 +91,13 @@ describe('bounded city plan search', () => {
     await unavailable.search('123', 'plan')
     expect(unavailable.getSnapshot()).toMatchObject({ status: 'error', error: 'Plan is too large' })
   })
+  it.each(['Unknown', 'Disconnected', 'Disabled', 'PermissionDenied', 'Unsupported'] as const)('does not call an empty %s source exhausted', async status => {
+    const response = { ...page([]), evidence: { ...detail().family.evidence, status, reason: 'No readable history' } }
+    const finder = new CityPlanSearch('db', 'cpu', api({ fetchFamilies: async () => response }))
+    await finder.search('', 'family')
+    expect(finder.getSnapshot()).toMatchObject({ status: 'error', canContinue: true })
+    expect(finder.getSnapshot().error).toContain('No readable history')
+  })
   it('discards superseded searches even if the fetch ignores abort', async () => {
     let resolve!: (page: QueryFamilyPage) => void
     const fetchFamilies = vi.fn().mockReturnValueOnce(new Promise<QueryFamilyPage>(done => { resolve = done })).mockResolvedValueOnce(page([]))

@@ -221,9 +221,10 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
   }, [focusSidebar, selectedRoadId])
 
   const closeRoad = useCallback(() => {
+    navigation.clear(false)
     setSelectedRoadId(null)
     restoreRoadFocus()
-  }, [restoreRoadFocus])
+  }, [navigation, restoreRoadFocus])
 
   const selectRoadEndpoint = useCallback((objectId: string) => {
     selectObject(objectId)
@@ -685,6 +686,9 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
         </form>
         {search.status === 'loading' && <p className="hud-note" role="status">Searching captured plans…</p>}
         {search.error && <p className="hud-note is-error" role="alert">{search.error}</p>}
+        {search.evidence && <p className="hud-note">
+          {search.evidence.source} · {search.evidence.status} · Query index observed {observationTime(search.evidence.observedAt)}
+        </p>}
         {search.status !== 'idle' && search.status !== 'loading' && (
           <p className="hud-note" role="status">
             {search.searched} families searched in this database.{' '}

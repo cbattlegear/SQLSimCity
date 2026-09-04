@@ -39,4 +39,11 @@ describe('city evidence and navigation surface wiring', () => {
     expect(view).toContain('restoreNavigationFocus(')
     expect(view).toContain('if (target) target.focus()')
   })
+  it('cancels a pending contributor request before closing its road without restoring contributor focus', () => {
+    const start = view.indexOf('const closeRoad =')
+    const end = view.indexOf('const selectRoadEndpoint =', start)
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+    expect(view.slice(start, end)).toContain('navigation.clear(false)')
+  })
 })

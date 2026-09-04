@@ -86,7 +86,7 @@ export class CityEvidenceController {
     return () => { this.listeners.delete(listener) }
   }
   private update(update: Partial<CityEvidenceState>) {
-    this.state = { ...this.state, ...update }
+    this.state = { ...this.state, ...update, ...('page' in update ? { now: Date.now() } : {}) }
     this.listeners.forEach(listener => listener())
     if ('page' in update) this.scheduleExpiry()
   }

@@ -1,4 +1,4 @@
-import type { NormalizedShowplan, QueryFamilyDetail, QueryFamilyPage, QueryFamilySummary } from './contracts'
+import type { NormalizedShowplan, QueryFamilyDetail, QueryFamilyPage, QueryFamilySummary, QueryStoreEvidence } from './contracts'
 import type { DatabaseCityQueryFamily } from './databaseCityContracts'
 import { QueryStoreRequestError } from './api'
 import type { TrafficBasis } from './cityTrafficWindow'
@@ -29,10 +29,11 @@ export interface PlanSearchState {
   failures: string[]
   error: string | null
   canContinue: boolean
+  evidence: QueryStoreEvidence | null
 }
 const FAMILY_READ_LIMIT = 8
 const RESULT_LIMIT = 200
-const INITIAL: PlanSearchState = { status: 'idle', choices: [], searched: 0, failures: [], error: null, canContinue: false }
+const INITIAL: PlanSearchState = { status: 'idle', choices: [], searched: 0, failures: [], error: null, canContinue: false, evidence: null }
 
 export function planChoice(detail: QueryFamilyDetail, planId: string, cityFamily?: DatabaseCityQueryFamily): PlanChoice {
   return {
@@ -126,6 +127,10 @@ export class CityPlanSearch {
         const page = await this.api.fetchFamilies(this.metric, this.token, controller.signal, databaseId)
         if (!current()) return
         if (page.items.some(family => family.databaseId !== databaseId)) throw new Error('The search response belongs to another database.')
+        this.update({ evidence: page.evidence })
+        if (page.evidence && page.evidence.status !== 'Available' && page.evidence.status !== 'Stale') {
+          throw new Error(`${page.evidence.status}: ${page.evidence.reason}`)
+        }
         this.pending = page.items
         this.token = page.nextPageToken
         this.started = true

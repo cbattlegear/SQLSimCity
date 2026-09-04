@@ -56,6 +56,23 @@ describe('city evidence lifecycle', () => {
     expect(owner.getSnapshot().page).toBe(recovered)
     expect(owner.getSnapshot().error).toBeNull()
   })
+  it('publishes an already-expired first page as stale while backfill is pending', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-04T10:00:00Z'))
+    const first = deferred<DatabaseCityPage>()
+    const more = deferred<DatabaseCityPage>()
+    const fetch = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(more.promise)
+    const owner = new CityEvidenceController('db', 'cpu', 'live', fetch)
+    const load = owner.refresh()
+    vi.setSystemTime(new Date('2026-09-04T10:02:00Z'))
+    first.resolve(page({ nextPageToken: 'next' }))
+    await Promise.resolve()
+    expect(owner.getSnapshot().phase).toBe('backfill')
+    expect(cityEvidenceDisclosure(owner.getSnapshot(), 'live').status).toBe('Stale')
+    owner.dispose()
+    more.resolve(page())
+    await load
+  })
 
   it('a superseded continuation cannot overwrite a newer generation even if abort is ignored', async () => {
     const slow = deferred<DatabaseCityPage>()
