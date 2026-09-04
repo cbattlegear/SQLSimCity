@@ -53,6 +53,10 @@ try {
     await page.mouse.up()
     await page.evaluate(() => { window.__sceneFixture.start(); window.__measure.start() })
     await page.waitForTimeout(2500)
+    // SwiftShader may produce fewer than the five warm-up frames in 2.5 seconds.
+    // Require actual native-frame evidence, not a minimum rendering speed.
+    await page.waitForFunction(() => window.__measure.browserFrames.length >= 16,
+      undefined, { polling: 100, timeout: 60000 })
     const active = await page.evaluate(() => ({
       ...window.__measure.stop(), state: window.__sceneFixture.state(),
     }))
@@ -66,10 +70,13 @@ try {
 
     await page.evaluate(() => { window.__measure.start(); window.__sceneFixture.invalidate() })
     await page.waitForTimeout(500)
+    await page.waitForFunction(() => window.__measure.browserFrames.some(frame => frame.renders > 0),
+      undefined, { polling: 100, timeout: 60000 })
     const invalidation = await page.evaluate(() => window.__measure.stop())
     result.invalidation = invalidation
     assert(invalidation.browserFrames.some(frame => frame.offCalls > 0), 'Content change must redraw shadows')
     const steady = active.browserFrames.slice(5).map(frame => frame.offCalls).sort((a, b) => a - b)
+    assert(steady.length >= 11, 'Shadow median requires at least eleven measured post-warmup frames')
     assert.equal(steady[Math.floor(steady.length / 2)], 0, 'Camera/vehicles must not continuously invalidate shadows')
     await page.screenshot({ path: resolve(values.out, `${viewport.name}-city.png`) })
     await page.evaluate(() => window.__sceneFixture.mode('map'))
@@ -88,6 +95,7 @@ try {
     await page.waitForTimeout(200)
     await page.evaluate(() => window.__sceneFixture.dispose())
     const beforeDispose = await page.evaluate(() => window.__measure.rafTotal)
+    await page.evaluate(() => new Promise(resolve => window.__measure.sampleFrame(() => resolve())))
     await page.waitForTimeout(400)
     const disposedCallbacks = await page.evaluate(before => window.__measure.rafTotal - before, beforeDispose)
     result.disposedCallbacks = disposedCallbacks

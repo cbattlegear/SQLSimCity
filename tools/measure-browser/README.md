@@ -37,6 +37,12 @@ Do not use Playwright clock interception here: even `setFixedTime` replaces rAF 
 silently split one native frame into apparently distinct timestamps. Neither host nor page
 clock is changed by this gate.
 
+Sampling waits for at least 16 native frames, leaving 11 after warm-up, rather than
+assuming 2.5 seconds contains enough frames. Hosted SwiftShader produced only four
+in that interval. A bounded 60-second wait fails if rendering stops; it does not
+set a frame-rate target. Disposal also crosses a raw native-frame barrier so a
+slow renderer cannot pass merely because the observation window missed its next frame.
+
 `--baseline` records the original duplicate submissions without rejecting them; normal mode
 requires at most one submission per frame, zero idle/disposed callbacks, nonzero shadow
 submissions after a content change, and median zero during camera/vehicle motion. `--headed`
