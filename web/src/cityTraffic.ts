@@ -355,13 +355,13 @@ export interface TrafficWindowDisclosure {
  * where the window is published but capture is missing. That is grey, unlike a covered zero.
  *
  * `observedAt` is the workload evidence timestamp, never the time an HTTP request completed.
- * Archive and edge sources show captured windows, not a promise to refresh or a reading of now.
+ * Fixture, archive and edge sources show captured windows, not a promise to refresh or a reading of now.
  */
 export function describeTrafficWindow(
   families: readonly DatabaseCityQueryFamily[],
   observedAt: string | null,
   refreshIntervalMs: number,
-  sourceMode: 'live' | 'archive' | 'edge' = 'live',
+  sourceMode: 'live' | 'archive' | 'edge' | 'fixture' = 'live',
 ): TrafficWindowDisclosure {
   const staticSource = sourceMode !== 'live'
   const basis = trafficBasis(families)

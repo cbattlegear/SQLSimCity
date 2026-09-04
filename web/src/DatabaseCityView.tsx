@@ -1180,8 +1180,12 @@ function LegendDrawer({
    */
   const [showUnmappedFamilies, setShowUnmappedFamilies] = useState(false)
   const trafficWindow = useMemo(
-    () => describeTrafficWindow(page.topQueryFamilies, observedAt, CITY_REFRESH_INTERVAL_MS, sourceMode),
-    [page.topQueryFamilies, observedAt, sourceMode],
+    () => describeTrafficWindow(
+      page.topQueryFamilies, observedAt, CITY_REFRESH_INTERVAL_MS,
+      sourceMode !== 'live' ? sourceMode : page.evidence.source === 'Fixture' ? 'fixture'
+        : page.evidence.source === 'ImportedArchive' ? 'archive' : 'live',
+    ),
+    [page.topQueryFamilies, page.evidence.source, observedAt, sourceMode],
   )
   const placedIds = useMemo(() => placedObjectIds(objects), [objects])
   const familySplit = useMemo(

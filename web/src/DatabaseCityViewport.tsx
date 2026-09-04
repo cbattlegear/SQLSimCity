@@ -459,13 +459,13 @@ export function DatabaseCityViewport({
         plume readable as a smear rather than a dot; the direction means nothing.
       </p>
       <p className="legend-caveat">
-        Road colour is graded from one measured ratio: captured wait milliseconds per captured
-        execution. It accounts for <strong>every</strong> wait category Query Store captured for the
-        queries on that road, not a chosen few — the per-facility split that used to be drawn as
-        separate coloured lanes is now in the road&apos;s hover readout and in the evidence tables
-        instead of competing with the road for the same piece of map. A road with no colour is grey,
-        not green: grey means no captured family named both of its endpoints, which is not a claim
-        that the road is quiet. {facilityTraffic.note}
+        Road colour divides captured wait milliseconds by executions from the same disclosed window.
+        Ordinary street placement is modelled from plan cost shares, not measured per-street waiting.
+        Query paths use whole-family totals. All captured wait categories contribute when available;
+        the resource split is in the hover readout and evidence tables, not separate overlapping lanes.
+        Grey means unknown: missing runtime coverage or same-window wait allocation can leave a road
+        ungraded, even when families named its endpoints. It is not a claim that the road is quiet.
+        {' '}{facilityTraffic.note}
         {facilityTraffic.unmapped.length > 0 &&
           ` ${facilityTraffic.unmapped.length} captured wait category/categories have no facility` +
           ' on this map and are listed in the evidence tables rather than folded into one.'}
