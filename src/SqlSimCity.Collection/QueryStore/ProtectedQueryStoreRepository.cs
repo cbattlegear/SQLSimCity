@@ -1011,7 +1011,13 @@ public sealed record QueryStorePublishedSnapshot(
     QueryStoreCollectorStatusV1 Status,
     IReadOnlyList<string>? FamilyChunkRecordIds = null,
     IReadOnlyList<QueryStoreIndexSet>? IndexSets = null,
-    string? StorageSlot = null);
+    string? StorageSlot = null,
+    IReadOnlyDictionary<string, QueryStoreDatabaseObservation>? DatabaseObservations = null);
+
+public sealed record QueryStoreDatabaseObservation(
+    QueryStoreDatabaseState? LastSuccess,
+    QueryStoreCollectionState AttemptState,
+    string Reason);
 
 public sealed record QueryStoreFamilyChunk(IReadOnlyList<QueryFamilyDetailV1> Families);
 public sealed record QueryStoreStoredFamily(

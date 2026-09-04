@@ -83,6 +83,8 @@ public sealed class ProtectedQueryStoreHistorySink(
                      activeWaitKeys.Contains(WaitBucketKey(pair.Value))).Select(pair => pair.Key).ToArray())
             current.Waits.Remove(wait);
         current.State = state;
+        current.AttemptState = state.State;
+        current.AttemptReason = state.Reason;
         current.CurrentEpoch = storageEpoch;
         _staged[state.DatabaseId] = current;
     }
@@ -158,7 +160,8 @@ public sealed class ProtectedQueryStoreHistorySink(
             var key = RuntimeKey(state.CurrentEpoch, bucket.Key);
             // Both active and closed rows are deterministic upserts. Replaying an active interval
             // replaces its complete logical bucket instead of adding another in-memory/flushed row.
-            state.Runtime[key] = new EpochRuntimeBucket(state.CurrentEpoch, bucket, activeInterval);
+            state.Runtime[key] = new EpochRuntimeBucket(
+                state.CurrentEpoch, bucket, activeInterval, state.State?.ObservedAt);
         }
         return Task.CompletedTask;
     }
@@ -199,6 +202,12 @@ public sealed class ProtectedQueryStoreHistorySink(
             removedDatabases = _committed.Keys.Where(databaseId => !requested.Contains(databaseId)).ToArray();
         }
         var inspections = new List<QueryStoreBuildInspection>();
+        foreach (var attempt in result.Databases)
+        {
+            var facts = _committed.GetOrAdd(attempt.DatabaseId, id => new DatabaseFacts(id));
+            facts.AttemptState = attempt.State;
+            facts.AttemptReason = attempt.Reason;
+        }
         var details = _committed.Values
             .Where(state => requested is null || requested.Contains(state.DatabaseId))
             .SelectMany(state => BuildFamilies(state, publishedAt, _retention, inspections))
@@ -213,7 +222,7 @@ public sealed class ProtectedQueryStoreHistorySink(
             var state = _committed.TryGetValue(item.DatabaseId, out var facts) ? facts.State : null;
             return new QueryStoreDatabaseStatusV1(
                 item.DatabaseId, ContractState(item.State),
-                state?.ResetEpoch ?? "", state is null ? null : result.CompletedAt,
+                state?.ResetEpoch ?? "", state?.ObservedAt,
                 oldestCollected.TryGetValue(item.DatabaseId, out var oldest) ? oldest : null,
                 item.Reason);
         }).ToArray();
@@ -225,7 +234,11 @@ public sealed class ProtectedQueryStoreHistorySink(
                 ? "Connected Query Store history cycle published atomically."
                 : $"{failures} database collections failed; their prior published history was retained.");
         var snapshot = new QueryStorePublishedSnapshot(
-            "1.0", Guid.NewGuid().ToString("N"), sequence, publishedAt, details, status);
+            "1.0", Guid.NewGuid().ToString("N"), sequence, publishedAt, details, status,
+            DatabaseObservations: _committed.Values
+                .Where(state => requested is null || requested.Contains(state.DatabaseId))
+                .ToDictionary(state => state.DatabaseId, state => new QueryStoreDatabaseObservation(
+                    state.State, state.AttemptState, state.AttemptReason), StringComparer.Ordinal));
 
         var cost = await repository.PublishSnapshotAsync(snapshot, cancellationToken).ConfigureAwait(false);
         LastPublishCost = cost;
@@ -279,7 +292,16 @@ public sealed class ProtectedQueryStoreHistorySink(
         }
         Interlocked.Exchange(ref _sequence, snapshot.Sequence);
         foreach (var group in snapshot.Families.GroupBy(detail => detail.Family.DatabaseId))
-            _committed.TryAdd(group.Key, DatabaseFacts.FromPublished(group.Key, group));
+            _committed.TryAdd(group.Key, DatabaseFacts.FromPublished(
+                group.Key, group, snapshot.DatabaseObservations is not null));
+        if (snapshot.DatabaseObservations is { } observations)
+            foreach (var pair in observations)
+            {
+                var state = _committed.GetOrAdd(pair.Key, id => new DatabaseFacts(id));
+                state.State = pair.Value.LastSuccess;
+                state.AttemptState = pair.Value.AttemptState;
+                state.AttemptReason = pair.Value.Reason;
+            }
     }
 
     private DatabaseFacts GetStage(string databaseId) =>
@@ -508,7 +530,7 @@ public sealed class ProtectedQueryStoreHistorySink(
                     identity.SetOptions),
                 state.Text.TryGetValue(identity.QueryTextId, out var value) ? value : TextDescriptor(identity)))
                 .ToArray();
-            var evidence = Evidence(state, observedAt);
+            var evidence = Evidence(state, observedAt, state.State?.ObservedAt);
             var summary = new QueryFamilySummaryV1(
                 group.Key, state.DatabaseId, primaryIdentity.QueryHash,
                 descriptor.NormalizedTextFingerprint, descriptor, physical,
@@ -608,7 +630,7 @@ public sealed class ProtectedQueryStoreHistorySink(
             bucket.AverageDurationMicroseconds, bucket.AverageCpuMicroseconds,
             bucket.AverageLogicalReads8KiBPages, bucket.TotalDurationMicroseconds,
             bucket.TotalCpuMicroseconds, bucket.TotalLogicalReads8KiBPages, waits,
-            Evidence(state, observedAt));
+            Evidence(state, observedAt, value.ObservedAt));
     }
 
     private static Dictionary<WaitBucketIdentity, Dictionary<string, BigInteger>> BuildWaitIndex(
@@ -660,6 +682,7 @@ public sealed class ProtectedQueryStoreHistorySink(
                 value.Bucket.AverageLogicalReads8KiBPages));
             yield return new EpochRuntimeBucket(
                 group.Key.Epoch, QueryStoreRuntimeAggregator.Aggregate(rows).Single(), false,
+                group.Any(value => value.ObservedAt is null) ? null : group.Min(value => value.ObservedAt),
                 group.Select(value => value.Bucket.Key.IntervalId).ToHashSet(StringComparer.Ordinal));
         }
     }
@@ -678,11 +701,23 @@ public sealed class ProtectedQueryStoreHistorySink(
                 : new(QueryTextAvailability.Missing, null, null,
                     "Raw text has not been requested and this physical query is not merged by hash alone.");
 
-    private static QueryStoreEvidenceV1 Evidence(DatabaseFacts state, DateTimeOffset observedAt) =>
-        new(QueryStoreSource.QueryStore,
-            state.State?.State == QueryStoreCollectionState.ReadOnly ? DataStatus.Stale : DataStatus.Available,
-            observedAt, observedAt.AddMinutes(3), state.State?.Reason ?? "Connected Query Store history.",
-            "Aggregate query runtime only; no actual operator metrics.");
+    private static QueryStoreEvidenceV1 Evidence(
+        DatabaseFacts state, DateTimeOffset publishedAt, DateTimeOffset? observedAt)
+    {
+        var freshUntil = observedAt?.AddMinutes(3);
+        var status = state.AttemptState switch
+        {
+            QueryStoreCollectionState.PermissionDenied => DataStatus.PermissionDenied,
+            QueryStoreCollectionState.Off => DataStatus.Disabled,
+            QueryStoreCollectionState.Unsupported => DataStatus.Unsupported,
+            QueryStoreCollectionState.Error or QueryStoreCollectionState.ReadOnly => DataStatus.Stale,
+            QueryStoreCollectionState.Unknown => DataStatus.Unknown,
+            _ => observedAt is null ? DataStatus.Unknown
+                : publishedAt >= freshUntil ? DataStatus.Stale : DataStatus.Available,
+        };
+        return new(QueryStoreSource.QueryStore, status, observedAt, freshUntil,
+            state.AttemptReason, "Aggregate query runtime only; no actual operator metrics.");
+    }
 
     private static string SumExact(IEnumerable<string> values)
     {
@@ -718,6 +753,9 @@ public sealed class ProtectedQueryStoreHistorySink(
     {
         public string DatabaseId { get; } = databaseId;
         public QueryStoreDatabaseState? State { get; set; }
+        public QueryStoreCollectionState AttemptState { get; set; } = QueryStoreCollectionState.Unknown;
+        public string AttemptReason { get; set; } =
+            "Legacy history has no reliable collection timestamp; awaiting a successful collection.";
         public string CurrentEpoch { get; set; } = "";
         public Dictionary<string, QueryIdentityFact> Identities { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, QueryPlanFact> Plans { get; } = new(StringComparer.Ordinal);
@@ -730,7 +768,11 @@ public sealed class ProtectedQueryStoreHistorySink(
 
         public DatabaseFacts Clone()
         {
-            var clone = new DatabaseFacts(DatabaseId) { State = State, CurrentEpoch = CurrentEpoch };
+            var clone = new DatabaseFacts(DatabaseId)
+            {
+                State = State, CurrentEpoch = CurrentEpoch,
+                AttemptState = AttemptState, AttemptReason = AttemptReason,
+            };
             Copy(Identities, clone.Identities); Copy(Plans, clone.Plans); Copy(Runtime, clone.Runtime);
             Copy(Waits, clone.Waits); Copy(Variants, clone.Variants); Copy(Replicas, clone.Replicas);
             Copy(Text, clone.Text);
@@ -740,7 +782,8 @@ public sealed class ProtectedQueryStoreHistorySink(
 
         public static DatabaseFacts FromPublished(
             string databaseId,
-            IEnumerable<QueryFamilyDetailV1> details)
+            IEnumerable<QueryFamilyDetailV1> details,
+            bool hasObservationMetadata)
         {
             var state = new DatabaseFacts(databaseId);
             foreach (var detail in details)
@@ -786,7 +829,10 @@ public sealed class ProtectedQueryStoreHistorySink(
                         runtime.AverageDurationMicroseconds, runtime.AverageCpuMicroseconds,
                         runtime.AverageLogicalReads8KiBPages, runtime.TotalDurationMicroseconds,
                         runtime.TotalCpuMicroseconds, runtime.TotalLogicalReads8KiBPages);
-                    state.Runtime[RuntimeKey(epoch, key)] = new EpochRuntimeBucket(epoch, bucket, false);
+                    // Older publications renewed their evidence timestamps even on failure.
+                    // They cannot establish when the source was last successfully observed.
+                    state.Runtime[RuntimeKey(epoch, key)] = new EpochRuntimeBucket(
+                        epoch, bucket, false, hasObservationMetadata ? runtime.Evidence.ObservedAt : null);
                     foreach (var wait in runtime.WaitMilliseconds)
                     {
                         var fact = new QueryWaitFact(
@@ -823,6 +869,7 @@ public sealed class ProtectedQueryStoreHistorySink(
         string Epoch,
         AggregatedRuntimeBucket Bucket,
         bool ActiveInterval,
+        DateTimeOffset? ObservedAt,
         IReadOnlySet<string>? SourceIntervalIds = null);
 
     private sealed record EpochWaitFact(string Epoch, QueryWaitFact Value);

@@ -368,7 +368,7 @@ public sealed class IncrementalQueryStoreCollector : IDisposable
             await _sink.AbortDatabaseCycleAsync(databaseId, cancellationToken).ConfigureAwait(false);
             return new QueryStoreDatabaseCollectionResult(
                 databaseId, QueryStoreCollectionState.Error, 0, 0, false,
-                "Collection failed for this database; its prior published history remains current.",
+                "Collection failed for this database; prior history is retained without renewing its observation time.",
                 ex.GetType().Name);
         }
     }
