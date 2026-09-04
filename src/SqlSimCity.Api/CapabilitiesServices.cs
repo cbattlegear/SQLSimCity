@@ -1,5 +1,4 @@
 using SqlSimCity.Collection.Catalog;
-using SqlSimCity.Collection.Negotiation;
 using SqlSimCity.Collection.Probes;
 using SqlSimCity.Domain;
 using SqlSimCity.SqlServer;
@@ -30,7 +29,6 @@ internal static class CapabilitiesServices
                     LiveIncidentsServiceCollectionExtensions.ConnectionFactoryServiceKey);
             return new SqlClientProbeExecutor(factory, target.Profile, catalog, target.Platform);
         });
-        services.AddSingleton<ICapabilityNegotiator, CapabilityNegotiator>();
         services.AddSingleton<ConnectedCapabilitiesSource>();
         services.AddSingleton<ICapabilitiesSource>(provider => provider.GetRequiredService<ConnectedCapabilitiesSource>());
         services.AddHostedService(provider => provider.GetRequiredService<ConnectedCapabilitiesSource>());

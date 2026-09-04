@@ -34,6 +34,12 @@ public sealed class AcquisitionModeTests
         response.EnsureSuccessStatusCode();
         Assert.Equal("no-store", response.Headers.CacheControl?.ToString());
         Assert.Equal("{\"status\":\"ready\"}", await client.GetStringAsync("/readyz"));
+        var info = await client.GetStringAsync("/api/v1/archive");
+        Assert.DoesNotContain("findings", info, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ruleVersions", info, StringComparison.Ordinal);
+        using var retired = await client.GetAsync(new Uri("/api/v1/findings/export", UriKind.Relative));
+        Assert.Equal(System.Net.HttpStatusCode.Gone, retired.StatusCode);
+        Assert.Equal("application/json", retired.Content.Headers.ContentType?.MediaType);
     }
 
     [Fact]

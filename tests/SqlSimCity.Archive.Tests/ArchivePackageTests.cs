@@ -10,7 +10,7 @@ namespace SqlSimCity.Archive.Tests;
 
 public sealed class ArchivePackageTests : IDisposable
 {
-    private readonly string _directory = Path.Combine(Path.GetTempPath(), "sqlsimcity-archive-tests", Guid.NewGuid().ToString("N"));
+    private readonly string _directory = Path.Combine(AppContext.BaseDirectory, "archive-test-work", Guid.NewGuid().ToString("N"));
 
     public ArchivePackageTests() => Directory.CreateDirectory(_directory);
 

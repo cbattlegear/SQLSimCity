@@ -11,7 +11,29 @@ SimCity assets are included.
 
 ## [Unreleased]
 
-_Nothing since v1.0.0._
+### Breaking - next major release
+
+- Removed the Findings engine, rules, evidence-provider interfaces, public Findings contracts,
+  and Findings API responses. `/api/v1/findings` and every descendant now return a small JSON
+  **410 Gone** response, including status, rule, detail, and export routes. Consumers must use
+  the retained atlas, capabilities, Query Store, database-city, and live evidence APIs instead;
+  there is no replacement assessment engine.
+- New archives no longer emit Findings entries, required features, or reevaluation claims.
+  Existing format-1 archives containing `findings-evidence-v1` remain readable for all other
+  evidence, with bounded reader-private validation of legacy Findings sections. Legacy Findings
+  payloads and descriptors are neither evaluated nor exposed. No archive conversion or
+  protected-storage migration is required.
+
+### Fixed
+
+- Connected capability snapshots now negotiate the actual configured target and database
+  context on a bounded host-owned refresh cadence instead of returning fixture profiles.
+  Reads preserve observation times and explicit permission/unavailable states without
+  negotiating on every HTTP request.
+- Expected missing-secret and Microsoft Entra authentication failures remain explicit unavailable
+  observations instead of stopping capability collection. Azure SQL routing now treats field-based
+  profiles and connection strings consistently. Optional `Atlas:Platform` selects the database
+  context for private aliases or Managed Instance overrides without fabricating capability evidence.
 
 ## [1.0.0] - 2026-08-28
 

@@ -8,7 +8,6 @@
     <Project Path="src/SqlSimCity.Domain/SqlSimCity.Domain.csproj" />
     <Project Path="src/SqlSimCity.Edge/SqlSimCity.Edge.csproj" />
     <Project Path="src/SqlSimCity.Edge.Connector/SqlSimCity.Edge.Connector.csproj" />
-    <Project Path="src/SqlSimCity.Findings/SqlSimCity.Findings.csproj" />
     <Project Path="src/SqlSimCity.SqlServer/SqlSimCity.SqlServer.csproj" />
     <Project Path="src/SqlSimCity.Storage/SqlSimCity.Storage.csproj" />
   </Folder>
@@ -18,7 +17,6 @@
     <Project Path="tests/SqlSimCity.Collection.Tests/SqlSimCity.Collection.Tests.csproj" />
     <Project Path="tests/SqlSimCity.Contracts.Tests/SqlSimCity.Contracts.Tests.csproj" />
     <Project Path="tests/SqlSimCity.Edge.Tests/SqlSimCity.Edge.Tests.csproj" />
-    <Project Path="tests/SqlSimCity.Findings.Tests/SqlSimCity.Findings.Tests.csproj" />
     <Project Path="tests/SqlSimCity.SqlServer.Tests/SqlSimCity.SqlServer.Tests.csproj" />
     <Project Path="tests/SqlSimCity.Storage.Tests/SqlSimCity.Storage.Tests.csproj" />
   </Folder>

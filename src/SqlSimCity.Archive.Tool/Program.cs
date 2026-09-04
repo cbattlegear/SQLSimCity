@@ -9,8 +9,6 @@ using SqlSimCity.Collection.Probes;
 using SqlSimCity.Collection.QueryStore;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
-using SqlSimCity.Findings.Engine;
-using SqlSimCity.Findings.Evidence;
 
 return await ArchiveTool.RunAsync(args, CancellationToken.None);
 
@@ -180,28 +178,6 @@ internal static class FixtureArchiveBuilder
         Add(payloads, ArchiveSource.CityIndexEntry, "database-city", cityIndex,
             cityIndex.Pages.Count, summaries.GeneratedAt, null);
 
-        var findingsProvider = new SourceBackedFindingsEvidenceProvider(
-            new FixedAtlasSource(atlas),
-            new RedactedQueryStoreSource(querySource, redactor),
-            new FixedCapabilitiesSource(capabilities),
-            () => live.Snapshot,
-            new FixedTimeProvider(createdAt));
-        var findingsEvaluation = new FindingsEngine(FindingRules.Default()).Evaluate(
-            await findingsProvider.GetBundleAsync(cancellationToken));
-        var (findingsExport, _) = FindingsRedactor.Build(
-            findingsEvaluation.Findings,
-            findingsEvaluation.Status.GeneratedAt,
-            FindingsEngine.EngineVersion);
-        Add(payloads, "findings/snapshot.json", "findings",
-            new ArchiveFindingsSnapshot(findingsEvaluation.Status, findingsExport),
-            findingsExport.Findings.Count, createdAt, null);
-        var findingsDescriptor = new FindingsArchiveDescriptor(
-            "ReevaluateImportedEvidence",
-            FindingsEngine.EngineVersion,
-            FindingRules.Default().ToDictionary(rule => rule.RuleId, rule => rule.RuleVersion, StringComparer.Ordinal));
-        Add(payloads, ArchiveSource.FindingsDescriptorEntry, "findings", findingsDescriptor,
-            findingsDescriptor.RuleVersions.Count, createdAt, null);
-
         var payloadMap = payloads.ToDictionary(payload => payload.Name, payload => payload.Bytes, StringComparer.Ordinal);
         var redaction = new ArchiveRedactionPolicy(
             "sqlsimcity-default-v1",
@@ -222,10 +198,10 @@ internal static class FixtureArchiveBuilder
             redaction,
             [
                 "atlas-v1", "capabilities-v1", "query-store-v1", "database-city-v1",
-                "live-point-in-time-v1", "findings-evidence-v1", "canonical-json-v1",
+                "live-point-in-time-v1", "canonical-json-v1",
                 "uncompressed-container-v1",
             ],
-            ["paged-query-store", "normalized-plans", "static-live-sample", "offline-findings-reevaluation"],
+            ["paged-query-store", "normalized-plans", "static-live-sample"],
             limits,
             payloads);
         return (manifest, payloadMap);
@@ -390,57 +366,4 @@ internal static class FixtureArchiveBuilder
 internal sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider
 {
     public override DateTimeOffset GetUtcNow() => value;
-}
-
-internal sealed class FixedCapabilitiesSource(CapabilitiesSnapshotV1 value) : ICapabilitiesSource
-{
-    public CapabilitiesSnapshotV1 GetCurrent() => value;
-}
-
-internal sealed class FixedAtlasSource(AtlasSnapshotV1 value) : IAtlasSnapshotSource
-{
-    public AtlasSnapshotV1 GetCurrent() => value;
-}
-
-internal sealed class RedactedQueryStoreSource(
-    IQueryStoreHistorySource source,
-    ArchiveRedactor redactor) : IQueryStoreHistorySource
-{
-    public async Task<PageV1<QueryFamilySummaryV1>> GetQueriesAsync(
-        string? databaseId,
-        string metric,
-        int pageSize,
-        string? pageToken,
-        CancellationToken cancellationToken)
-    {
-        var page = await source.GetQueriesAsync(databaseId, metric, pageSize, pageToken, cancellationToken);
-        return page with { Items = page.Items.Select(redactor.Redact).ToArray() };
-    }
-
-    public async Task<QueryFamilyDetailV1?> GetFamilyAsync(
-        string familyId,
-        CancellationToken cancellationToken) =>
-        await source.GetFamilyAsync(familyId, cancellationToken) is { } value
-            ? redactor.Redact(value)
-            : null;
-
-    public async Task<NormalizedShowplanV1?> GetPlanAsync(
-        string planId,
-        CancellationToken cancellationToken) =>
-        await source.GetPlanAsync(planId, cancellationToken) is { } value
-            ? redactor.Redact(value)
-            : null;
-
-    public async Task<PlanComparisonV1?> ComparePlansAsync(
-        string leftPlanId,
-        string rightPlanId,
-        CancellationToken cancellationToken)
-    {
-        var left = await GetPlanAsync(leftPlanId, cancellationToken);
-        var right = await GetPlanAsync(rightPlanId, cancellationToken);
-        return left is null || right is null ? null : PlanComparer.Compare(left, right);
-    }
-
-    public Task<QueryStoreCollectorStatusV1> GetStatusAsync(CancellationToken cancellationToken) =>
-        source.GetStatusAsync(cancellationToken);
 }

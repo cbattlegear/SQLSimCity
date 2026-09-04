@@ -3,7 +3,6 @@
     <ProjectReference Include="..\SqlSimCity.Collection\SqlSimCity.Collection.csproj" />
     <ProjectReference Include="..\SqlSimCity.Contracts\SqlSimCity.Contracts.csproj" />
     <ProjectReference Include="..\SqlSimCity.Domain\SqlSimCity.Domain.csproj" />
-    <ProjectReference Include="..\SqlSimCity.Findings\SqlSimCity.Findings.csproj" />
   </ItemGroup>
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>

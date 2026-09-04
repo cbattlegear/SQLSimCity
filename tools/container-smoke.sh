@@ -73,11 +73,17 @@ fi
 check_endpoint() {
   local path="$1"
   local shape="$2"
+  local expected_status="${3:-200}"
   local output="${work_dir}/${shape}.json"
-  curl --fail --silent --show-error \
+  local status
+  status="$(curl --silent --show-error \
     --connect-timeout 2 --max-time 5 \
     "http://127.0.0.1:${port}${path}" \
-    --output "${output}"
+    --output "${output}" --write-out '%{http_code}')"
+  if [[ "${status}" != "${expected_status}" ]]; then
+    echo "${path}: expected HTTP ${expected_status}, received ${status}" >&2
+    exit 1
+  fi
   node "${script_dir}/validate-smoke-response.mjs" "${output}" "${shape}"
 }
 
@@ -87,8 +93,10 @@ check_endpoint /api/v1/atlas atlas
 check_endpoint /api/v1/live live
 check_endpoint /api/v1/query-store/status query-store-status
 check_endpoint "/api/v1/query-store/queries?pageSize=1" query-store-queries
-check_endpoint /api/v1/findings/status findings-status
-check_endpoint /api/v1/findings/export findings-export
+check_endpoint /api/v1/capabilities capabilities
+check_endpoint /api/v1/database-city database-city
+check_endpoint /api/v1/findings/status findings-retired 410
+check_endpoint /api/v1/findings/export findings-retired 410
 
 docker stop --time 10 "${container_id}" >/dev/null
 docker rm "${container_id}" >/dev/null

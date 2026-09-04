@@ -1,4 +1,5 @@
 using SqlSimCity.Collection.Atlas;
+using SqlSimCity.Contracts.V1;
 using SqlSimCity.SqlServer;
 using SqlSimCity.SqlServer.Auth;
 using SqlSimCity.SqlServer.Secrets;
@@ -64,11 +65,11 @@ public static class AtlasConfiguration
         var parsed = parsedConnectionString ?? TryParseConnectionString(configuration);
 
         // Azure SQL Database enumerates only the connected database, so a
-        // connection-string-only setup that named none falls back to the single
-        // database the connection string already identifies. On-premises and
-        // Managed Instance targets enumerate for themselves and need no default.
-        var knownDatabases = configuredDatabases.Length == 0 && parsed is { IsAzureSqlHost: true }
-            ? new[] { parsed.InitialDatabase }
+        // profile that named none falls back to its configured initial database.
+        // On-premises and Managed Instance targets enumerate and need no default.
+        var knownDatabases = configuredDatabases.Length == 0 &&
+            BuildPlatform(configuration, parsed) == EnginePlatform.AzureSqlDatabase
+            ? new[] { parsed?.InitialDatabase ?? configuration["Atlas:Connection:InitialDatabase"] ?? "master" }
             : configuredDatabases;
 
         var refreshInterval = TimeSpan.FromSeconds(section.GetValue<int?>("RefreshIntervalSeconds") ?? 60);
@@ -94,6 +95,24 @@ public static class AtlasConfiguration
     }
 
     private static TimeSpan Max(TimeSpan left, TimeSpan right) => left > right ? left : right;
+
+    public static EnginePlatform? BuildPlatform(
+        IConfiguration configuration, ConnectionStringProfile? parsedConnectionString = null)
+    {
+        if (configuration["Atlas:Platform"] is { } configured)
+        {
+            if (Enum.TryParse<EnginePlatform>(configured, ignoreCase: true, out var platform) &&
+                platform is EnginePlatform.SqlServerOnPremises or EnginePlatform.AzureSqlDatabase or EnginePlatform.AzureSqlManagedInstance)
+                return platform;
+            throw new InvalidOperationException(
+                "Atlas:Platform must be SqlServerOnPremises, AzureSqlDatabase, or AzureSqlManagedInstance.");
+        }
+        var parsed = parsedConnectionString ?? TryParseConnectionString(configuration);
+        var host = parsed?.Profile.Server.Host ?? configuration["Atlas:Connection:Host"];
+        return host is null ? null : ConnectionStringProfile.IsAzureSqlHostName(host)
+            ? EnginePlatform.AzureSqlDatabase
+            : EnginePlatform.SqlServerOnPremises;
+    }
 
     public static ConnectionProfile BuildProfile(
         IConfiguration configuration,

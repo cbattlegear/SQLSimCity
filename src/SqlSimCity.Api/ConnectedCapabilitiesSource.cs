@@ -1,5 +1,6 @@
 using SqlSimCity.Collection.Atlas;
 using SqlSimCity.Collection.Negotiation;
+using SqlSimCity.Collection.Probes;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
 using SqlSimCity.SqlServer;
@@ -15,7 +16,7 @@ internal sealed record ConnectedCapabilityTarget(
 
 internal sealed class ConnectedCapabilitiesSource(
     ConnectedCapabilityTarget target,
-    ICapabilityNegotiator negotiator,
+    IProbeExecutor probes,
     TimeProvider timeProvider) : BackgroundService, ICapabilitiesSource
 {
     private CapabilitiesSnapshotV1 _snapshot = Pending(target);
@@ -40,6 +41,7 @@ internal sealed class ConnectedCapabilitiesSource(
 
     internal async Task RefreshAsync(CancellationToken cancellationToken)
     {
+        var negotiator = new CapabilityNegotiator(new CapabilityCycleProbeExecutor(probes), timeProvider);
         var profile = await negotiator.NegotiateAsync(
             new CapabilityNegotiationRequest(target.TargetId, target.Profile.InitialDatabase),
             cancellationToken).ConfigureAwait(false);

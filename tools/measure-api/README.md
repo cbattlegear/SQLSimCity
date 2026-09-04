@@ -9,12 +9,16 @@ wire.
 `tools/measure-browser/` measures what the app costs the browser. This is the tier in
 between, and it was the one nobody could measure without rebuilding a harness first.
 
-PR #94 needed exactly this to size the findings recompute. `/api/v1/findings/status`
+Historically, PR #94 needed exactly this to size the Findings recompute. `/api/v1/findings/status`
 measured **388.59 ms**, of which the rules were **1.67 ms** — that split was the entire
 argument for the change, and fixture mode reported **0.72 ms** and would have proved
 nothing. That harness was scratch and was correctly deleted before the pull request
 (`AGENTS.md`: one-off scaffolding does not get committed), which left the next person
 rebuilding it from zero. This is that harness, kept.
+
+Findings has since been removed. Its routes return JSON `410 Gone` and are excluded from the
+default route list. The old measurements below are historical records, not reproducible endpoints
+in the current version. Active measurements cover atlas, capabilities, city, Query Store, and live evidence.
 
 Nothing here runs in CI. It is a workbench.
 
@@ -46,8 +50,8 @@ a trap below.
 Useful variations:
 
 ```powershell
-# The pair from the issue: something that does no work, against something that does.
-./Measure-Api.ps1 -Route '/healthz', '/api/v1/findings/status' -Iterations 30
+# Something that does no work, against retained Query Store evidence.
+./Measure-Api.ps1 -Route '/healthz', '/api/v1/query-store/queries?pageSize=50' -Iterations 30
 
 # What compression saves on the wire and what it costs in time.
 ./Measure-Api.ps1 -AcceptEncoding 'br, gzip', 'identity'
@@ -109,8 +113,8 @@ reach for by accident.
 
 ### A connected server is not a ready one
 
-A connected API serves an **empty** evidence bundle until the first Atlas collection lands,
-and an empty bundle makes every `/api/v1/findings/*` route cost almost nothing. Measuring in
+A connected API serves **empty** evidence until the first Atlas collection lands.
+Measuring in
 that window produces fixture-shaped numbers from a genuinely connected server — the same
 wrong answer, reached by a route the mode check cannot catch. Query Store is the slower half
 and the one that actually costs anything, and it publishes asynchronously after that.

@@ -104,25 +104,27 @@ else
         services => services.GetRequiredService<LiveIncidentSamplerService>());
     builder.Services.AddHostedService(services => services.GetRequiredService<LiveIncidentSamplerService>());
 }
-builder.Services.AddFindings();
 
 if (acquisitionMode == AcquisitionMode.Fixture && atlasConnected)
 {
     var atlasConnectionString = AtlasConfiguration.TryParseConnectionString(builder.Configuration);
     var atlasOptions = AtlasConfiguration.BuildCollectionOptions(builder.Configuration, atlasConnectionString);
     var connectionProfile = AtlasConfiguration.BuildProfile(builder.Configuration, atlasConnectionString);
+    var atlasPlatform = AtlasConfiguration.BuildPlatform(builder.Configuration, atlasConnectionString);
     builder.Services.AddSingleton(atlasOptions);
     builder.Services.AddSingleton(connectionProfile);
     builder.Services.AddSingleton(new ConnectedCapabilityTarget(
         atlasOptions.TargetId, connectionProfile, atlasOptions.KnownDatabases,
         atlasOptions.RefreshInterval,
-        atlasConnectionString is null ? null : SqlSimCityConnectionString.DefaultPlatform(atlasConnectionString)));
+        atlasPlatform));
     builder.Services.AddSingleton(TimeProvider.System);
     builder.Services.AddSingleton(
         AtlasConfiguration.BuildSecretProvider(builder.Configuration, atlasConnectionString));
     builder.Services.AddSingleton<ISqlConnectionFactory>(services =>
         new SqlConnectionFactory(services.GetRequiredService<ISecretFileProvider>()));
-    builder.Services.AddSingleton<IAtlasProbeExecutor, SqlClientAtlasProbeExecutor>();
+    builder.Services.AddSingleton<IAtlasProbeExecutor>(services => new SqlClientAtlasProbeExecutor(
+        services.GetRequiredService<ISqlConnectionFactory>(),
+        connectionProfile, probeCatalog, services.GetRequiredService<TimeProvider>(), atlasPlatform));
     builder.Services.AddSingleton<ILiveAtlasActivitySource>(services =>
         new LiveIncidentAtlasActivitySource(
             () => services.GetRequiredService<LiveIncidentSamplerService>().GetCurrentResponse(),
@@ -149,7 +151,9 @@ if (acquisitionMode == AcquisitionMode.Fixture && atlasConnected)
         builder.Services.AddSingleton(QueryStoreHistoryConfiguration.BuildCollectionOptions(builder.Configuration));
         builder.Services.AddSingleton(QueryStoreHistoryConfiguration.BuildRetentionOptions(builder.Configuration));
         builder.Services.AddSingleton(QueryStoreHistoryConfiguration.BuildHostOptions(builder.Configuration));
-        builder.Services.AddSingleton<IQueryStoreIncrementalSource, SqlQueryStoreIncrementalSource>();
+        builder.Services.AddSingleton<IQueryStoreIncrementalSource>(services => new SqlQueryStoreIncrementalSource(
+            services.GetRequiredService<ISqlConnectionFactory>(),
+            connectionProfile, probeCatalog, services.GetRequiredService<TimeProvider>(), atlasPlatform));
         builder.Services.AddSingleton<ProtectedQueryStoreRepository>();
         builder.Services.AddSingleton<QueryStoreCollectionStatusTracker>();
         builder.Services.AddSingleton<SecureShowplanParser>();
@@ -418,7 +422,13 @@ else
     app.MapGet("/api/v1/archive", () => Results.NotFound());
     app.MapHub<CurrentSnapshotHub>("/hubs/current-snapshot");
 }
-app.MapFindings();
+app.Map("/api/v1/findings/{**path}", (HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    return Results.Json(
+        new { error = "Findings has been removed. Use the retained evidence APIs." },
+        statusCode: StatusCodes.Status410Gone);
+});
 app.MapEdgeIngestion();
 if (edgeMode)
 {

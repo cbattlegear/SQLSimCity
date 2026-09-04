@@ -3,7 +3,7 @@ namespace SqlSimCity.Edge.Envelope;
 /// <summary>
 /// The source-neutral evidence section a chunk carries. These map one-to-one onto the
 /// existing SQLSimCity V1 contract seams; the edge connector never invents a new evidence
-/// class, and findings are always re-evaluated centrally from delivered evidence.
+/// class. Delivered evidence is projected without running an assessment engine.
 /// </summary>
 public enum ObservationSection
 {

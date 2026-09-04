@@ -251,8 +251,7 @@
         "dependencies": {
           "SqlSimCity.Collection": "[1.0.0, )",
           "SqlSimCity.Contracts": "[1.0.0, )",
-          "SqlSimCity.Domain": "[1.0.0, )",
-          "SqlSimCity.Findings": "[1.0.0, )"
+          "SqlSimCity.Domain": "[1.0.0, )"
         }
       },
       "sqlsimcity.collection": {
@@ -274,13 +273,6 @@
         "type": "Project",
         "dependencies": {
           "SqlSimCity.Contracts": "[1.0.0, )"
-        }
-      },
-      "sqlsimcity.findings": {
-        "type": "Project",
-        "dependencies": {
-          "SqlSimCity.Contracts": "[1.0.0, )",
-          "SqlSimCity.Domain": "[1.0.0, )"
         }
       },
       "sqlsimcity.sqlserver": {

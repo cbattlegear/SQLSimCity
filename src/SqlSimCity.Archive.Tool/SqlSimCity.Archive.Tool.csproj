@@ -3,9 +3,9 @@
     <ProjectReference Include="..\SqlSimCity.Archive\SqlSimCity.Archive.csproj" />
     <ProjectReference Include="..\SqlSimCity.Collection\SqlSimCity.Collection.csproj" />
     <ProjectReference Include="..\SqlSimCity.Domain\SqlSimCity.Domain.csproj" />
-    <ProjectReference Include="..\SqlSimCity.Findings\SqlSimCity.Findings.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="SqlSimCity.Archive.Tests" />
     <Content Include="..\..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\NOTICE" Link="NOTICE" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

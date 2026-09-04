@@ -10,9 +10,9 @@
 
     This is the tier between the two existing workbenches: tools/measure measures what a
     probe costs the SQL Server being watched, tools/measure-browser measures what the app
-    costs the browser, and nothing measured the process in the middle. PR #94 needed
-    exactly this to size the findings recompute -- /api/v1/findings/status at 388.59 ms
-    against 1.67 ms of rules -- built it as scratch, and correctly deleted it.
+    costs the browser, and this measures the process in the middle. The default routes
+    cover retained evidence only; retired Findings routes return HTTP 410 and are not
+    evidence benchmarks.
 
     Four things this does that a curl loop does not, each of which produced a wrong
     number at least once on this repository:
@@ -20,7 +20,7 @@
     * One process, one connection, one warmed HttpClient. Measure-Probe.ps1 reports
       server-side elapsed separately because `docker exec` and sqlcmd start-up add
       roughly 300 ms per invocation. `curl.exe` in a loop has the same problem, and it
-      swamps every route here except the findings ones.
+      can swamp the cost of the routes being measured.
     * The floor is measured, not assumed. /healthz does no work, so its median is the
       loopback-plus-Kestrel-plus-harness cost, and OverFloorMs is what the route added.
     * Accept-Encoding is honoured and the response is NOT auto-decompressed, so Bytes is
@@ -51,7 +51,7 @@
     ./Measure-Api.ps1
 
 .EXAMPLE
-    ./Measure-Api.ps1 -Route '/healthz', '/api/v1/findings/status' -Iterations 30
+    ./Measure-Api.ps1 -Route '/healthz', '/api/v1/query-store/queries?pageSize=50' -Iterations 30
 
 .EXAMPLE
     ./Measure-Api.ps1 -AcceptEncoding 'br, gzip', 'identity' -Json after.json -Label after
@@ -97,9 +97,8 @@ $DefaultRoutes = @(
     '/api/v1/database-city'
     '/api/v1/query-store/status'
     '/api/v1/query-store/queries?pageSize=50'
-    '/api/v1/findings/'
-    '/api/v1/findings/status'
-    '/api/v1/findings/export'
+    '/api/v1/query-store/queries?metric=waits&pageSize=200'
+    '/api/v1/live'
 )
 
 if (-not $Route -or $Route.Count -eq 0) { $Route = $DefaultRoutes }
@@ -357,10 +356,8 @@ function Wait-ApiReady {
 function Wait-CollectorReady {
     param($Client)
 
-    # A connected API serves an empty evidence bundle until the first Atlas collection
-    # lands, and an empty bundle makes /api/v1/findings/* cost almost nothing. Measuring
-    # before this point produces fixture-shaped numbers from a connected server, which is
-    # the failure this whole workbench exists to avoid.
+    # Atlas and Query Store begin empty until their first collection publishes.
+    # Measuring empty evidence produces misleadingly cheap connected-mode numbers.
     $deadline = (Get-Date).AddSeconds($ReadySeconds)
     $atlas = $null
     $lastReason = 'no status yet'
@@ -516,8 +513,7 @@ try {
             Write-Host ("  {0,-45} {1}" -f $path, $encoding)
 
             # The warm-up is discarded, and it is not padding. The first request to a route
-            # pays JIT for its handler and its serializer, and on the findings routes it
-            # also pays for the first evidence bundle. Folding that into a median
+            # pays JIT for its handler and its serializer. Folding that into a median
             # attributes a one-off to every request.
             for ($i = 0; $i -lt $WarmUp; $i++) {
                 $warm = Invoke-MeasuredRequest -Client $client -Path $path -Encoding $encoding

@@ -12,12 +12,12 @@ using Microsoft.Extensions.Time.Testing;
 using SqlSimCity.Api;
 using SqlSimCity.Collection.Atlas;
 using SqlSimCity.Collection.LiveIncidents;
-using SqlSimCity.Collection.Negotiation;
 using SqlSimCity.Collection.Probes;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
 using SqlSimCity.SqlServer;
 using SqlSimCity.SqlServer.Auth;
+using SqlSimCity.SqlServer.Secrets;
 
 namespace SqlSimCity.Api.Tests;
 
@@ -63,6 +63,8 @@ public sealed class ConnectedCapabilitiesTests
         Assert.Equal(calls, probes.Calls);
         Assert.Equal("{\"status\":\"healthy\"}", await client.GetStringAsync("/healthz"));
         Assert.Equal("{\"status\":\"ready\"}", await client.GetStringAsync("/readyz"));
+        using var retired = await client.GetAsync(new Uri("/api/v1/findings/status", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.Gone, retired.StatusCode);
     }
 
     [Theory]
@@ -98,6 +100,63 @@ public sealed class ConnectedCapabilitiesTests
         Assert.Same(observed, source.GetCurrent());
     }
 
+    [Theory]
+    [InlineData("contained.database.windows.net", null, "contained-db")]
+    [InlineData("private-alias.example.test", "AzureSqlDatabase", "contained-db")]
+    [InlineData("managed.database.windows.net", "AzureSqlManagedInstance", "master")]
+    public async Task FieldConfiguredAzureContextUsesContainedDatabaseAndAuthFailureDoesNotStopHost(
+        string host, string? platform, string metadataDatabase)
+    {
+        var clock = new FakeTimeProvider(ObservedAt);
+        var connection = new AuthenticationFailureConnectionFactory();
+        await using var factory = Factory(new CapabilityProbes(), clock)
+            .WithWebHostBuilder(builder =>
+            {
+                builder.UseSetting("Atlas:Connection:Host", host);
+                builder.UseSetting("Atlas:Connection:InitialDatabase", "contained-db");
+                if (platform is not null)
+                    builder.UseSetting("Atlas:Platform", platform);
+                builder.ConfigureTestServices(services =>
+                {
+                    services.RemoveAll<IProbeExecutor>();
+                    services.AddSingleton<IProbeExecutor>(provider =>
+                    {
+                        var target = provider.GetRequiredService<ConnectedCapabilityTarget>();
+                        return new SqlClientProbeExecutor(connection, target.Profile,
+                            provider.GetRequiredService<SqlSimCity.Collection.Catalog.ProbeCatalog>(), target.Platform);
+                    });
+                });
+            });
+        using var client = factory.CreateClient();
+        var source = Assert.IsType<ConnectedCapabilitiesSource>(factory.Services.GetRequiredService<ICapabilitiesSource>());
+        await WaitForSnapshotAsync(source, ObservedAt);
+        Assert.NotEmpty(connection.OpenedDatabases);
+        Assert.All(connection.OpenedDatabases.Take(2), database => Assert.Equal(metadataDatabase, database));
+        Assert.All(connection.OpenedDatabases.Skip(2), database => Assert.Equal("contained-db", database));
+        var snapshot = Assert.Single(source.GetCurrent().Targets);
+        Assert.Equal(CapabilityState.Unavailable, snapshot.Platform.Evidence.State);
+        Assert.DoesNotContain("private secret", JsonSerializer.Serialize(snapshot), StringComparison.Ordinal);
+        Assert.False(factory.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping.IsCancellationRequested);
+        Assert.Equal("{\"status\":\"healthy\"}", await client.GetStringAsync("/healthz"));
+        var attempts = connection.OpenedDatabases.Count;
+        clock.Advance(TimeSpan.FromMinutes(2));
+        await WaitForSnapshotAsync(source, clock.GetUtcNow());
+        Assert.True(connection.OpenedDatabases.Count > attempts);
+        Assert.False(factory.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping.IsCancellationRequested);
+    }
+
+    [Theory]
+    [InlineData("Unknown")]
+    [InlineData("Unsupported")]
+    [InlineData("999")]
+    public void InvalidAtlasRoutingPlatformFailsBeforeServing(string platform)
+    {
+        using var factory = Factory(new CapabilityProbes(), new FakeTimeProvider(ObservedAt))
+            .WithWebHostBuilder(builder => builder.UseSetting("Atlas:Platform", platform));
+        var error = Assert.Throws<InvalidOperationException>(() => factory.CreateClient());
+        Assert.Contains("Atlas:Platform must be", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task SnapshotAndNegotiationWorkRespectTheAtlasDatabaseBound()
     {
@@ -109,7 +168,7 @@ public sealed class ConnectedCapabilitiesTests
         };
         using var source = new ConnectedCapabilitiesSource(
             new ConnectedCapabilityTarget("target", Profile(), [], TimeSpan.FromMinutes(1)),
-            new CapabilityNegotiator(probes, clock), clock);
+            probes, clock);
 
         await source.RefreshAsync(CancellationToken.None);
 
@@ -117,7 +176,19 @@ public sealed class ConnectedCapabilitiesTests
         Assert.Equal(AtlasCollectionOptions.MaximumDatabases, target.Databases.Count);
         Assert.Equal(AtlasCollectionOptions.MaximumDatabases, target.QueryStoreByDatabase.Count);
         Assert.Equal(AtlasCollectionOptions.MaximumDatabases, probes.RequestedDatabases.Count);
+        Assert.Equal(1, probes.IdentityCalls);
+        Assert.Equal(1, probes.DiscoveryCalls);
+        Assert.Equal(2, probes.ServerPermissionCalls);
+        Assert.Equal(2 * AtlasCollectionOptions.MaximumDatabases, probes.DatabasePermissionCalls);
         Assert.Contains("bounded to 100", target.DatabaseDiscovery.Reason, StringComparison.Ordinal);
+
+        clock.Advance(TimeSpan.FromMinutes(1));
+        await source.RefreshAsync(CancellationToken.None);
+        Assert.Equal(2, probes.IdentityCalls);
+        Assert.Equal(2, probes.DiscoveryCalls);
+        Assert.Equal(4, probes.ServerPermissionCalls);
+        Assert.Equal(4 * AtlasCollectionOptions.MaximumDatabases, probes.DatabasePermissionCalls);
+        Assert.Equal(clock.GetUtcNow(), Assert.Single(source.GetCurrent().Targets).SourceTimestamp);
     }
 
     [Fact]
@@ -127,7 +198,7 @@ public sealed class ConnectedCapabilitiesTests
         var probes = new CapabilityProbes();
         using var source = new ConnectedCapabilitiesSource(
             new ConnectedCapabilityTarget("target", Profile(), [], TimeSpan.FromMinutes(1)),
-            new CapabilityNegotiator(probes, clock), clock);
+            probes, clock);
         var pending = Assert.Single(source.GetCurrent().Targets);
         Assert.Equal("target", pending.TargetId);
         Assert.Equal(EnginePlatform.Unknown, pending.Platform.Platform);
@@ -193,6 +264,10 @@ public sealed class ConnectedCapabilitiesTests
     {
         public ProbeExecutionException? Failure { get; set; }
         public int Calls { get; private set; }
+        public int IdentityCalls { get; private set; }
+        public int DiscoveryCalls { get; private set; }
+        public int ServerPermissionCalls { get; private set; }
+        public int DatabasePermissionCalls { get; private set; }
         public List<string> RequestedDatabases { get; } = [];
         public IReadOnlyList<DatabaseDiscoveryRow> Databases { get; init; } =
             [new(5, "app", "ONLINE", 160, true), new(6, "restricted", "ONLINE", 160, true)];
@@ -204,11 +279,17 @@ public sealed class ConnectedCapabilitiesTests
             return Failure is null ? Task.FromResult(value) : Task.FromException<T>(Failure);
         }
 
-        public Task<ServerIdentityResult> GetServerIdentityAsync(CancellationToken cancellationToken) =>
-            Result(new ServerIdentityResult(null, "16.0.1000.1", null, "Developer", 3, false, 2, 2, null, null), cancellationToken);
+        public Task<ServerIdentityResult> GetServerIdentityAsync(CancellationToken cancellationToken)
+        {
+            IdentityCalls++;
+            return Result(new ServerIdentityResult(null, "16.0.1000.1", null, "Developer", 3, false, 2, 2, null, null), cancellationToken);
+        }
 
-        public Task<IReadOnlyList<DatabaseDiscoveryRow>> GetDatabaseDiscoveryAsync(CancellationToken cancellationToken) =>
-            Result(Databases, cancellationToken);
+        public Task<IReadOnlyList<DatabaseDiscoveryRow>> GetDatabaseDiscoveryAsync(CancellationToken cancellationToken)
+        {
+            DiscoveryCalls++;
+            return Result(Databases, cancellationToken);
+        }
 
         public Task<QueryStoreOptionsRow?> GetQueryStoreOptionsAsync(string databaseName, CancellationToken cancellationToken)
         {
@@ -220,10 +301,16 @@ public sealed class ConnectedCapabilitiesTests
 
         public Task<QueryStorePlanMetadataResult> GetQueryStorePlanMetadataAsync(string databaseName, CancellationToken cancellationToken) =>
             Result(new QueryStorePlanMetadataResult(false, false, false, false), cancellationToken);
-        public Task<bool?> CheckServerPermissionAsync(string permission, CancellationToken cancellationToken) =>
-            Result<bool?>(true, cancellationToken);
-        public Task<bool?> CheckDatabasePermissionAsync(string databaseName, string permission, CancellationToken cancellationToken) =>
-            Result<bool?>(true, cancellationToken);
+        public Task<bool?> CheckServerPermissionAsync(string permission, CancellationToken cancellationToken)
+        {
+            ServerPermissionCalls++;
+            return Result<bool?>(true, cancellationToken);
+        }
+        public Task<bool?> CheckDatabasePermissionAsync(string databaseName, string permission, CancellationToken cancellationToken)
+        {
+            DatabasePermissionCalls++;
+            return Result<bool?>(true, cancellationToken);
+        }
         public Task<AzureResourceGovernanceRow?> GetAzureResourceGovernanceAsync(string databaseName, CancellationToken cancellationToken) =>
             Result<AzureResourceGovernanceRow?>(null, cancellationToken);
     }
@@ -238,5 +325,22 @@ public sealed class ConnectedCapabilitiesTests
             string databaseName, AtlasProbeSelection selection, DateTimeOffset queryStoreWindowStart,
             DateTimeOffset queryStoreWindowEnd, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("No atlas database should be probed.");
+    }
+
+    private sealed class AuthenticationFailureConnectionFactory : ISqlConnectionFactory
+    {
+        public List<string> OpenedDatabases { get; } = [];
+        public Task<SqlConnectionOpenResult> OpenAsync(ConnectionProfile profile, CancellationToken cancellationToken)
+        {
+            OpenedDatabases.Add(profile.InitialDatabase);
+            throw new SecretResolutionException("private secret");
+        }
+        public Task InvalidateSqlLoginProfileAsync(ConnectionProfile profile, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+        public Task InvalidateEntraProfileAsync(ConnectionProfile profile, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+        public Task RetryPendingCleanupAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public void Dispose() { }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

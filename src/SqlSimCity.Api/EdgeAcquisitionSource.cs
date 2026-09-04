@@ -6,8 +6,6 @@ using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
 using SqlSimCity.Edge.Envelope;
 using SqlSimCity.Edge.Ingestion;
-using SqlSimCity.Findings.Engine;
-using SqlSimCity.Findings.Evidence;
 
 namespace SqlSimCity.Api;
 
@@ -45,8 +43,7 @@ public sealed class EdgeAcquisitionSource :
     ICapabilitiesSource,
     IQueryStoreHistorySource,
     IDatabaseCitySource,
-    ILiveIncidentResponseSource,
-    IFindingsEvidenceProvider
+    ILiveIncidentResponseSource
 {
     private readonly Lock _gate = new();
     private readonly EdgeObservationStore _store;
@@ -250,24 +247,6 @@ public sealed class EdgeAcquisitionSource :
         return Task.FromResult(left is null || right is null
             ? null
             : PlanComparer.Compare(Import(left, state), Import(right, state)));
-    }
-
-    public async Task<FindingsEvidenceBundle> GetBundleAsync(CancellationToken cancellationToken)
-    {
-        var provider = new SourceBackedFindingsEvidenceProvider(
-            this,
-            this,
-            this,
-            () => GetCurrentResponse().Snapshot,
-            _timeProvider);
-        for (var attempt = 0; attempt < 2; attempt++)
-        {
-            var generation = Current().Generation?.PublicationGeneration;
-            var bundle = await provider.GetBundleAsync(cancellationToken).ConfigureAwait(false);
-            if (generation == Current().Generation?.PublicationGeneration)
-                return bundle;
-        }
-        throw new QueryStoreSnapshotChangedException();
     }
 
     public Task<QueryStoreCollectorStatusV1> GetStatusAsync(CancellationToken cancellationToken)

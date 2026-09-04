@@ -14,5 +14,9 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\SqlSimCity.Archive\SqlSimCity.Archive.csproj" />
+    <ProjectReference Include="..\..\src\SqlSimCity.Archive.Tool\SqlSimCity.Archive.Tool.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="Fixtures\*.ssca" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

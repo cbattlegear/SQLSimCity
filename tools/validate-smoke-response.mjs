@@ -28,14 +28,16 @@ switch (shape) {
     assert.equal(value.schemaVersion, '1.0');
     assert.ok(Array.isArray(value.items) && value.items.length > 0);
     break;
-  case 'findings-status':
-    assert.equal(value.schemaVersion, '1.0');
-    assert.ok(Array.isArray(value.rules) && value.rules.length > 0);
+  case 'capabilities':
+    assert.equal(value.schemaVersion, '1');
+    assert.ok(Array.isArray(value.targets) && value.targets.length > 0);
     break;
-  case 'findings-export':
+  case 'database-city':
     assert.equal(value.schemaVersion, '1.0');
-    assert.ok(Array.isArray(value.findings));
-    assert.equal(typeof value.redactionNote, 'string');
+    assert.ok(Array.isArray(value.databases) && value.databases.length > 0);
+    break;
+  case 'findings-retired':
+    assert.deepEqual(value, { error: 'Findings has been removed. Use the retained evidence APIs.' });
     break;
   default:
     assert.fail(`unknown smoke response shape: ${shape}`);

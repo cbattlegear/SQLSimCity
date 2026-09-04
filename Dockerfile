@@ -25,8 +25,6 @@ COPY src/SqlSimCity.SqlServer/SqlSimCity.SqlServer.csproj src/SqlSimCity.SqlServ
 COPY src/SqlSimCity.SqlServer/packages.lock.json src/SqlSimCity.SqlServer/
 COPY src/SqlSimCity.Collection/SqlSimCity.Collection.csproj src/SqlSimCity.Collection/
 COPY src/SqlSimCity.Collection/packages.lock.json src/SqlSimCity.Collection/
-COPY src/SqlSimCity.Findings/SqlSimCity.Findings.csproj src/SqlSimCity.Findings/
-COPY src/SqlSimCity.Findings/packages.lock.json src/SqlSimCity.Findings/
 COPY src/SqlSimCity.Edge/SqlSimCity.Edge.csproj src/SqlSimCity.Edge/
 COPY src/SqlSimCity.Edge/packages.lock.json src/SqlSimCity.Edge/
 RUN dotnet restore src/SqlSimCity.Api/SqlSimCity.Api.csproj --locked-mode

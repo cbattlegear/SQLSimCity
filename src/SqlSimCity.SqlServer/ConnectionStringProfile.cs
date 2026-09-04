@@ -159,7 +159,8 @@ public sealed class ConnectionStringProfile
         new(builder.MinPoolSize,
             builder.ShouldSerialize("Max Pool Size") ? builder.MaxPoolSize : DefaultMaxPoolSize);
 
-    private static bool IsAzureSqlHostName(string host) =>
+    /// <summary>A routing hint only; Managed Instance shares this suffix and needs an explicit platform.</summary>
+    public static bool IsAzureSqlHostName(string host) =>
         host.EndsWith(AzureSqlHostSuffix, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>

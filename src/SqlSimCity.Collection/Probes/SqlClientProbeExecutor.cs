@@ -1,8 +1,10 @@
 using System.Data;
 using System.Globalization;
+using Azure.Identity;
 using Microsoft.Data.SqlClient;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.SqlServer;
+using SqlSimCity.SqlServer.Secrets;
 
 namespace SqlSimCity.Collection.Probes;
 
@@ -250,6 +252,21 @@ public sealed class SqlClientProbeExecutor : IProbeExecutor
         catch (SqlException ex)
         {
             throw SqlExceptionClassifier.Classify(ex, probeId);
+        }
+        catch (SecretResolutionException ex)
+        {
+            throw new ProbeAuthenticationException(
+                "A configured authentication secret was unavailable.", null, null, ex);
+        }
+        catch (CredentialUnavailableException ex)
+        {
+            throw new ProbeAuthenticationException(
+                "The configured Microsoft Entra credential was unavailable.", null, null, ex);
+        }
+        catch (AuthenticationFailedException ex)
+        {
+            throw new ProbeAuthenticationException(
+                "The configured Microsoft Entra authentication failed.", null, null, ex);
         }
 
         await using (openResult.ConfigureAwait(false))

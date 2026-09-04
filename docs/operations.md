@@ -91,7 +91,8 @@ tools/container-smoke.sh ghcr.io/cbattlegear/sqlsimcity@sha256:<digest>
 ```
 
 The script binds an ephemeral loopback port, validates health, readiness, atlas,
-live, Query Store status/query, and findings status/export contracts, then
+live, capabilities, database-city, and Query Store status/query contracts, plus the JSON `410 Gone`
+responses from retired Findings routes, then
 removes only the exact containers it created. It also proves that connected
 Query Store history without protected storage exits nonzero.
 
@@ -126,7 +127,7 @@ The restore validates wrapper paths, manifest version, checksum, payload paths,
 and file types before writing to the still-empty target. Run it as the target
 owner/group or as root; root restores assign the target's existing owner/group
 to the restored tree. After restoring, start the exact image version that created
-the data. Confirm `/readyz`, then exercise Query Store status and findings export.
+the data. Confirm `/readyz`, then exercise Query Store status and query history.
 The CI operations test performs a deterministic backup/restore round trip and
 negative tests for symlinks, traversal, non-empty targets, and tampering. Paths
 that the restore format cannot represent safely are rejected at backup time.
@@ -154,8 +155,15 @@ cannot open it, and says so at startup rather than serving nothing.
 2. Resolve the release image to a digest and record the current digest.
 3. Review release notes and deploy the new digest with the existing read-only,
    capability-drop, and no-new-privileges settings.
-4. Wait for `/readyz`; then check atlas, Query Store, and findings status.
+4. Wait for `/readyz`; then check atlas, capabilities, and Query Store status.
 5. Keep the previous image digest and pre-upgrade backup until acceptance.
+
+The next major release removes Findings: migrate clients and monitoring away from
+`/api/v1/findings` and all its descendants, which now return JSON `410 Gone`. Use atlas,
+capabilities, Query Store, database-city, and live evidence directly; there is no replacement
+assessment engine. New archives omit Findings. Existing format-1 archives are still accepted
+after full legacy-section validation, but their Findings content is not evaluated or exposed.
+No archive conversion or protected-store reset is required for this removal.
 
 Step 3 is not only a formality. A configuration key that is *removed* rather than
 renamed-with-a-fallback stops startup by design, so an upgrade can fail on a

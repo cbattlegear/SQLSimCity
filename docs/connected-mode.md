@@ -52,7 +52,7 @@ What a connection string cannot express, and what SQLSimCity does about it:
 
 | Concern | Behavior |
 | --- | --- |
-| Engine platform | Inferred from the host name: `*.database.windows.net` is taken as Azure SQL Database, everything else as SQL Server on-premises. Managed Instance shares that suffix, so it must be stated explicitly. |
+| Engine platform | Inferred from the host name for both connection strings and field profiles: `*.database.windows.net` is taken as Azure SQL Database, everything else as SQL Server on-premises. Override with `Atlas:Platform` and `LiveIncidents:Connection:Platform`; Managed Instance shares that suffix, so it must be stated explicitly. |
 | `Atlas:KnownDatabases` | Defaults to the connection string's own `Database` when the host is Azure SQL. Explicit configuration always wins. |
 | `Encrypt=false` | Rejected. SQLSimCity supports only `Mandatory` (the SqlClient default) and `Strict`. |
 | Workload identity, service principal, `Active Directory Default` | Rejected. These need a tenant id a connection string cannot carry, or are banned outright; use the settings below. |
@@ -106,6 +106,13 @@ Atlas__Connection__Host=sql01.example.internal
 Atlas__Connection__Port=1433
 Atlas__Connection__InitialDatabase=master
 ```
+
+`Atlas:Platform` optionally selects `SqlServerOnPremises`, `AzureSqlDatabase`, or
+`AzureSqlManagedInstance` for Atlas, Query Store history, and capability probe routing.
+For an Azure SQL private alias that does not use the public hostname suffix, explicitly set
+`Atlas__Platform=AzureSqlDatabase` and the contained `InitialDatabase`. For Managed Instance use
+`Atlas__Platform=AzureSqlManagedInstance`. The setting controls routing, not evidence: the
+capability negotiator still reads the actual engine identity, permissions, and metadata.
 
 ## Compose override
 

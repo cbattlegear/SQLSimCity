@@ -5,11 +5,38 @@ using SqlSimCity.Contracts.V1;
 using SqlSimCity.SqlServer;
 using SqlSimCity.SqlServer.Auth;
 using System.Data;
+using Azure.Identity;
+using SqlSimCity.SqlServer.Secrets;
 
 namespace SqlSimCity.Collection.Tests.Probes;
 
 public sealed class SqlClientProbeExecutorTests
 {
+    [Theory]
+    [InlineData("secret")]
+    [InlineData("credential")]
+    [InlineData("authentication")]
+    public async Task ExpectedCredentialFailuresAreClassifiedWithoutLeakingDetails(string kind)
+    {
+        const string sensitive = "private credential detail";
+        Exception failure = kind switch
+        {
+            "secret" => new SecretResolutionException(sensitive),
+            "credential" => new CredentialUnavailableException(sensitive),
+            "authentication" => new AuthenticationFailedException(sensitive),
+            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+        };
+        var executor = new SqlClientProbeExecutor(
+            new CapturingConnectionFactory { Failure = failure }, BuildProfile("original"), ProbeCatalog.Load());
+
+        var classified = await Assert.ThrowsAsync<ProbeAuthenticationException>(
+            () => executor.GetServerIdentityAsync(CancellationToken.None));
+
+        Assert.Same(failure, classified.InnerException);
+        Assert.DoesNotContain(sensitive, classified.Reason, StringComparison.Ordinal);
+        Assert.Null(classified.SqlErrorNumber);
+    }
+
     [Fact]
     public async Task DatabaseScopedCallsOpenOnlyTheRequestedDatabaseProfiles()
     {
@@ -146,11 +173,12 @@ public sealed class SqlClientProbeExecutorTests
     private sealed class CapturingConnectionFactory : ISqlConnectionFactory
     {
         public List<ConnectionProfile> OpenedProfiles { get; } = [];
+        public Exception? Failure { get; init; }
 
         public Task<SqlConnectionOpenResult> OpenAsync(ConnectionProfile profile, CancellationToken cancellationToken)
         {
             OpenedProfiles.Add(profile);
-            throw new StopAfterCaptureException();
+            throw Failure ?? new StopAfterCaptureException();
         }
 
         public Task InvalidateSqlLoginProfileAsync(ConnectionProfile profile, CancellationToken cancellationToken = default) =>

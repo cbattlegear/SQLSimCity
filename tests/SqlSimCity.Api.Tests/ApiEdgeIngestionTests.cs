@@ -277,7 +277,7 @@ public sealed class ApiEdgeIngestionTests : IDisposable
         var query = await client.GetStringAsync("/api/v1/query-store/queries?metric=cpu&pageSize=10");
         var city = await client.GetStringAsync("/api/v1/database-city");
         var live = await client.GetStringAsync("/api/v1/live");
-        var findings = await client.GetStringAsync("/api/v1/findings?pageSize=10");
+        using var findings = await client.GetAsync(new Uri("/api/v1/findings?pageSize=10", UriKind.Relative));
 
         Assert.Contains("\"mode\":\"Edge\"", atlas, StringComparison.Ordinal);
         Assert.Contains("\"targetId\":\"target-1\"", atlas, StringComparison.Ordinal);
@@ -290,7 +290,8 @@ public sealed class ApiEdgeIngestionTests : IDisposable
         Assert.Contains("\"status\":\"Disconnected\"", city, StringComparison.Ordinal);
         Assert.Contains("EdgeConnector point-in-time sample", live, StringComparison.Ordinal);
         Assert.Contains("\"state\":\"Stopped\"", live, StringComparison.Ordinal);
-        Assert.Contains("\"targetId\":\"target-1\"", findings, StringComparison.Ordinal);
+        Assert.Equal(HttpStatusCode.Gone, findings.StatusCode);
+        Assert.Equal("application/json", findings.Content.Headers.ContentType?.MediaType);
     }
 
     [Fact]

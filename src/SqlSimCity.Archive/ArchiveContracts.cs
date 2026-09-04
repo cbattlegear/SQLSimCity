@@ -1,7 +1,5 @@
 namespace SqlSimCity.Archive;
 
-using SqlSimCity.Contracts.V1;
-
 public static class ArchiveFormat
 {
     public const string SchemaVersion = "1.0";
@@ -74,10 +72,7 @@ public sealed record ArchiveInfo(
     IReadOnlyList<string> Features,
     IReadOnlyList<string> Capabilities,
     long ArchiveBytes,
-    int EntryCount)
-{
-    public FindingsArchiveDescriptor? ArchivedFindings { get; init; }
-}
+    int EntryCount);
 
 public sealed record ArchivePageSeries(
     int ChunkSize,
@@ -91,12 +86,3 @@ public sealed record QueryStoreArchiveIndex(
 
 public sealed record DatabaseCityArchiveIndex(
     IReadOnlyDictionary<string, IReadOnlyDictionary<string, ArchivePageSeries>> Pages);
-
-public sealed record ArchiveFindingsSnapshot(
-    FindingsEngineStatusV1 Evaluation,
-    FindingsExportV1 Export);
-
-public sealed record FindingsArchiveDescriptor(
-    string Mode,
-    string EngineVersion,
-    IReadOnlyDictionary<string, string> RuleVersions);

@@ -7,7 +7,7 @@ using SqlSimCity.Domain;
 
 namespace SqlSimCity.Archive;
 
-public sealed class ArchiveSource :
+public sealed partial class ArchiveSource :
     IAtlasSnapshotSource,
     IAtlasCollectorStatusSource,
     ICapabilitiesSource,
@@ -24,8 +24,6 @@ public sealed class ArchiveSource :
     public const string QueryStoreIndexEntry = "query-store/index.json";
     public const string CitySummariesEntry = "database-city/summaries.json";
     public const string CityIndexEntry = "database-city/index.json";
-    public const string FindingsSnapshotEntry = "findings/snapshot.json";
-    public const string FindingsDescriptorEntry = "findings/descriptor.json";
 
     private readonly ArchivePackage _package;
     private readonly ArchiveRedactor _redactor;
@@ -37,7 +35,6 @@ public sealed class ArchiveSource :
     private readonly QueryStoreArchiveIndex _queryStoreIndex;
     private readonly DatabaseCitySummarySnapshotV1 _citySummaries;
     private readonly DatabaseCityArchiveIndex _cityIndex;
-    private readonly FindingsArchiveDescriptor? _findingsDescriptor;
 
     private ArchiveSource(ArchivePackage package)
     {
@@ -77,8 +74,8 @@ public sealed class ArchiveSource :
         _cityIndex = ReadOptional<DatabaseCityArchiveIndex>(CityIndexEntry) ??
             new DatabaseCityArchiveIndex(
                 new Dictionary<string, IReadOnlyDictionary<string, ArchivePageSeries>>(StringComparer.Ordinal));
-        _findingsDescriptor = ReadOptional<FindingsArchiveDescriptor>(FindingsDescriptorEntry);
         ValidateIndexes();
+        ValidateLegacyFindings();
     }
 
     public ArchiveInfo Info => new(
@@ -87,15 +84,13 @@ public sealed class ArchiveSource :
         _package.Manifest.ProducerVersion,
         _package.Manifest.CreatedAt,
         _package.Manifest.Target,
-        _package.Manifest.IncludedSections,
+        _package.Manifest.IncludedSections.Where(section => section != "findings").ToArray(),
         _package.Manifest.Redaction,
-        _package.Manifest.Features,
-        _package.Manifest.Capabilities,
+        _package.Manifest.Features.Where(feature => feature != LegacyFindingsFeature).ToArray(),
+        _package.Manifest.Capabilities
+            .Where(capability => capability != "offline-findings-reevaluation").ToArray(),
         _package.Length,
-        _package.Manifest.Entries.Count)
-    {
-        ArchivedFindings = _findingsDescriptor,
-    };
+        _package.Manifest.Entries.Count);
 
     public static ArchiveSource Open(ArchiveSourceOptions options)
     {
@@ -539,8 +534,6 @@ public sealed class ArchiveSource :
         RequireOptionalSection(QueryStoreIndexEntry, "query-store");
         RequireOptionalSection(CitySummariesEntry, "database-city");
         RequireOptionalSection(CityIndexEntry, "database-city");
-        RequireOptionalSection(FindingsSnapshotEntry, "findings");
-        RequireOptionalSection(FindingsDescriptorEntry, "findings");
 
         ValidateIndexMap(_queryStoreIndex.FamilyEntries, "Query Store family");
         ValidateIndexMap(_queryStoreIndex.PlanEntries, "Query Store plan");
@@ -601,52 +594,6 @@ public sealed class ArchiveSource :
                     });
             }
         }
-        ArchiveFindingsSnapshot? findings = null;
-        var hasFindingsSnapshot = _package.Manifest.Entries.Any(entry => entry.Name == FindingsSnapshotEntry);
-        var hasFindingsDescriptor = _package.Manifest.Entries.Any(entry => entry.Name == FindingsDescriptorEntry);
-        var declaresFindings = _package.Manifest.Features.Contains(
-            "findings-evidence-v1", StringComparer.Ordinal);
-        if (hasFindingsSnapshot)
-        {
-            findings = ReadRequired<ArchiveFindingsSnapshot>(FindingsSnapshotEntry);
-            if (findings.Evaluation.SchemaVersion != "1.0" ||
-                findings.Export.SchemaVersion != "1.0" ||
-                string.IsNullOrWhiteSpace(findings.Evaluation.EngineVersion) ||
-                findings.Evaluation.Rules.Select(rule => rule.RuleId)
-                    .Distinct(StringComparer.Ordinal).Count() != findings.Evaluation.Rules.Count ||
-                findings.Evaluation.Rules.Any(rule =>
-                    string.IsNullOrWhiteSpace(rule.RuleId) || string.IsNullOrWhiteSpace(rule.RuleVersion)) ||
-                findings.Export.EngineVersion != findings.Evaluation.EngineVersion ||
-                findings.Export.Findings.Any(finding =>
-                    finding.SchemaVersion != "1.0" ||
-                    string.IsNullOrWhiteSpace(finding.RuleId) ||
-                    string.IsNullOrWhiteSpace(finding.RuleVersion)))
-                throw new ArchiveValidationException("Archive findings engine or rule version metadata is invalid.");
-        }
-        if (_findingsDescriptor is not null)
-        {
-            if (_findingsDescriptor.Mode != "ReevaluateImportedEvidence" ||
-                string.IsNullOrWhiteSpace(_findingsDescriptor.EngineVersion) ||
-                _findingsDescriptor.EngineVersion.Length > 64 ||
-                _findingsDescriptor.RuleVersions.Count > ArchiveFormat.MaxManifestListItems ||
-                _findingsDescriptor.RuleVersions.Any(pair =>
-                    string.IsNullOrWhiteSpace(pair.Key) || pair.Key.Length > 128 ||
-                    string.IsNullOrWhiteSpace(pair.Value) || pair.Value.Length > 64) ||
-                findings is null ||
-                findings.Evaluation.EngineVersion != _findingsDescriptor.EngineVersion ||
-                findings.Evaluation.Rules.Count != _findingsDescriptor.RuleVersions.Count ||
-                findings.Evaluation.Rules.Any(rule =>
-                    !_findingsDescriptor.RuleVersions.TryGetValue(rule.RuleId, out var version) ||
-                    version != rule.RuleVersion) ||
-                findings.Export.Findings.Any(finding =>
-                    !_findingsDescriptor.RuleVersions.TryGetValue(finding.RuleId, out var version) ||
-                    version != finding.RuleVersion))
-                throw new ArchiveValidationException("Archive findings descriptor is inconsistent.");
-        }
-        if (hasFindingsSnapshot != hasFindingsDescriptor ||
-            declaresFindings != hasFindingsSnapshot)
-            throw new ArchiveValidationException(
-                "Archive findings feature, snapshot, and descriptor must be present together.");
     }
 
     private void ValidateIndexMap(IReadOnlyDictionary<string, string> values, string kind)
@@ -729,7 +676,7 @@ public sealed class ArchiveSource :
         var known = new HashSet<string>(StringComparer.Ordinal)
         {
             "atlas-v1", "capabilities-v1", "query-store-v1", "database-city-v1",
-            "live-point-in-time-v1", "findings-evidence-v1", "canonical-json-v1",
+            "live-point-in-time-v1", LegacyFindingsFeature, "canonical-json-v1",
             "uncompressed-container-v1",
         };
         var unsupported = manifest.Features.Where(feature => !known.Contains(feature)).ToArray();

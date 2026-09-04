@@ -282,12 +282,15 @@ When Edge mode is enabled, the central server exposes read-only, `no-store` stat
   for one delivered section.
 - `GET /api/v1/edge/source` — the selected target's compact source/status projection.
 
-Atlas, capabilities, Query Store, database-city, live, and findings use the same existing API routes
+Atlas, capabilities, Query Store, database-city, and live use the same retained API routes
 in Edge mode. They switch atomically only when all five standard sections share one connector, target,
 epoch, boot, and sequence; a partial next generation is never projected. The UI shows a compact
 source/status/target panel and Edge source labels. A connector that stops delivering goes
 stale/disconnected. Imported live evidence is always a static point-in-time sample; the central
 service starts no sampler, SQL collection, or SignalR trace.
+
+Findings is not evaluated centrally or on the connector. The retired `/api/v1/findings` route
+family returns JSON `410 Gone` in Edge mode too; the five evidence sections are unchanged.
 
 The replay nonce journal is durable across central restarts. Accepted observation generations and
 bounded idempotency indexes are in-memory; after a central restart the source waits for the connector's

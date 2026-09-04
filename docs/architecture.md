@@ -12,7 +12,6 @@ src/SqlSimCity.Domain     source-neutral API seams and fixture sources
 src/SqlSimCity.SqlServer  validated connection and authentication strategies
 src/SqlSimCity.Collection static SQL probes, capability negotiation, Atlas/City/Query Store/live collectors
 src/SqlSimCity.Storage    plaintext protected SQLite records and retention (legacy sealed records still open)
-src/SqlSimCity.Findings   deterministic rules and evidence references
 src/SqlSimCity.Archive    hostile-input archive format and offline adapters
 src/SqlSimCity.Edge       signed delivery, replay defense, encrypted spool, atomic edge generations
 src/SqlSimCity.Api        same-origin HTTP, SignalR, source registration, and static hosting
@@ -613,9 +612,8 @@ on the map: Query Store aggregates become roads, wait lanes, and address-book me
 become road congestion and incident pins.
 
 > [!NOTE]
-> Findings are still computed and still served from `/api/v1/findings`, but the UI no longer draws
-> them. SQLSimCity is a map, not an assessment tool. Removing the backend end-to-end is a clean
-> follow-up rather than part of this change.
+> Findings has been removed end-to-end. SQLSimCity is a map and evidence explorer, not an
+> assessment engine. The retired `/api/v1/findings` route family returns a JSON `410 Gone`.
 
 ### Query Store aggregates
 
@@ -655,17 +653,6 @@ demonstrable offline, and a connected collector that has not yet issued the prob
 upgrade a road to red congestion, and to place an incident pin — and only where a resolved lock names
 one of the loaded objects.
 
-### Findings
-
-Findings are deterministic observations with measured impact, confidence, evidence links, caveats,
-alternate explanations, next checks, and read-only recommendations. Insufficient evidence produces
-`NotEvaluated` or `InsufficientEvidence`, not a diagnosis.
-
-Rules avoid folklore such as universal page-life-expectancy thresholds, treating every scan or
-`CXPACKET` wait as bad, or assigning a query's total work to each operator/table.
-
-They are computed and served, and no UI draws them.
-
 ## Acquisition modes
 
 - **Fixture** is deterministic and opens no SQL or identity network connection.
@@ -701,7 +688,6 @@ Primary read-only groups:
 /api/v1/database-city
 /api/v1/query-store
 /api/v1/live
-/api/v1/findings
 ```
 
 `/api/v1/edge/ingest` is the sole bounded POST route and exists only when edge ingestion is explicitly
@@ -712,7 +698,10 @@ Capabilities use the acquisition source, never fixture profiles for a connected 
 collector negotiates on startup and after each Atlas refresh interval (60 seconds for live-only
 connections); HTTP reads only return its latest bounded snapshot. The profile's feature fields refer
 to the configured initial database. Query Store availability also covers configured or discovered
-databases, up to the Atlas 100-database bound, with truncation disclosed. Observation timestamps
+databases, up to the Atlas 100-database bound, with truncation disclosed. Target
+identity/discovery/server-permission results are shared only within one refresh, avoiding
+repeated target-wide probes for every database; database-local permission and metadata probes stay
+distinct. All target-wide probes run again on the next refresh. Observation timestamps
 remain those of negotiation, including explicit permission/unavailable results. Before the first
 cycle, the configured target is `NotProbed` with no evidence observation time; the required snapshot
 and profile timestamp fields use the Unix epoch, not a fabricated current observation.
