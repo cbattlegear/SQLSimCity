@@ -251,24 +251,50 @@ for ($s = 0; $s -lt $slowCount; $s++) {
     $jobs += Start-Worker -Name "slowjoin-$s" -Sql $sql
 }
 
+# Tables the blockers may lock, resolved from the instance rather than derived from the seed's
+# shape.
+#
+# The previous derivation computed the schema arithmetically -- entity_38 lives in app6 because
+# 02-objects.sql spreads tables round-robin over eight schemas. That is true of the standard seed
+# and false of any smaller one: SimCitySmall has 64 tables over *three* schemas, so the derived
+# [app6].[entity_38] does not exist there, and the failure surfaces as "0 blocked" -- which reads
+# as a broken incident feature rather than a rig that locked nothing. Asking the instance which
+# tables exist costs one round trip and works on any seed.
+#
+# entity_1 is still excluded: the join shape reads it constantly, so a lock there stalls every
+# worker rather than a nameable few. `amount` is required because that is the column the blocking
+# UPDATE writes.
+$lockTableSql = @'
+SET NOCOUNT ON;
+SELECT TOP (20) s.name + '.' + t.name
+FROM sys.tables AS t
+JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+WHERE t.name <> 'entity_1'
+  AND EXISTS (SELECT 1 FROM sys.columns AS c WHERE c.object_id = t.object_id AND c.name = 'amount')
+  AND EXISTS (SELECT 1 FROM sys.columns AS c WHERE c.object_id = t.object_id AND c.name = 'label')
+ORDER BY t.name;
+'@
+$lockTables = @(
+    & docker exec $Container $sqlcmd -S localhost -U sa -P $SaPassword -C -b -t 0 `
+        -d $Database -Q $lockTableSql -h -1 -W 2>&1 |
+        ForEach-Object { "$_".Trim() } |
+        Where-Object { $_ -match '^\w+\.\w+$' }
+)
+if ($lockTables.Count -eq 0) {
+    throw "No lockable table found in '$Database'. Expected tables with 'amount' and 'label' columns, as the seed builds."
+}
+
 for ($b = 1; $b -le $Blockers; $b++) {
     # A distinct table per chain, so two chains block independently and the city shows more
-    # than one incident. entity_1 is left alone: the join shape reads it constantly and a lock
-    # there stalls every worker rather than a nameable few.
-    #
-    # The schema is *derived*, not assumed. 02-objects.sql spreads the tables round-robin across
-    # the 8 schemas, so a hardcoded [app1] names a table that does not exist for most indexes --
-    # and the failure is silent in exactly the way that matters: sqlcmd reports "Invalid object
-    # name", the job ends, the script still says it started N sessions, and the measurement then
-    # reports zero blocked requests as though the feature were broken rather than the rig.
-    $index = ($b * 37) + 1
-    $schema = "app$((($index - 1) % 8) + 1)"
-    $table = "[$schema].[entity_$index]"
+    # than one incident. Spread across the resolved list rather than taken consecutively, so a
+    # small database with few tables still gives the chains different tables where it can.
+    $parts = $lockTables[(($b - 1) * 7) % $lockTables.Count] -split '\.'
+    $table = "[$($parts[0])].[$($parts[1])]"
 
     $blockerSql = @"
 SET NOCOUNT ON;
 BEGIN TRANSACTION;
-UPDATE TOP (1) $table SET amount = amount;
+UPDATE TOP (1) $table WITH (TABLOCKX) SET amount = amount;
 WAITFOR DELAY '$( [TimeSpan]::FromSeconds($DurationSeconds).ToString('hh\:mm\:ss') )';
 ROLLBACK TRANSACTION;
 "@
@@ -276,6 +302,16 @@ ROLLBACK TRANSACTION;
 
     # The blocked readers run shape 3 verbatim -- same text, same sp_executesql parameterisation
     # as the seed -- so the halted vehicle belongs to a family that has a road.
+    #
+    # TABLOCKX above is what makes that reliable rather than lucky. A bare row-level X lock is only
+    # a block if the reader's plan happens to touch the locked row, and shape 3 filters on `label`,
+    # which the seed indexes -- so the optimizer can answer COUNT_BIG(*) from the nonclustered index
+    # and never visit the clustered row the UPDATE holds. Measured against SimCitySmall: two
+    # blockers holding X locks on app1.entity_10 and app2.entity_17, three readers per chain
+    # scanning exactly those tables, and `blocking_session_id = 0` on every one of them. The lock
+    # was real, the readers were real, and nothing was blocked -- which reads from the browser as
+    # an incident layer that does not work. Locking the table removes the access path from the
+    # question; the block is no less genuine for being taken at a coarser granularity.
     $blockedSql = @"
 SET NOCOUNT ON;
 DECLARE @end datetime2(0) = $deadline;

@@ -736,6 +736,37 @@ dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font: 0.72rem/1.45 ui-mon
 }
 .hud-road-readout strong { color: #93a8ba; font: .62rem ui-monospace, Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
 .hud-road-readout span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/*
+ * The guided tour's caption, in the same bottom-centre slot as the road readout.
+ *
+ * Only ever one of the two is mounted -- the viewport swaps them rather than stacking them -- so
+ * they share the slot without a stacking order to get wrong. It is the wider of the pair because it
+ * carries three things and the readout carries two: what kind of stop this is, what the stop is,
+ * and the measurement that earned the visit. The detail line is the load-bearing one; without it
+ * this is a slideshow, and with it every shot says why the camera came here.
+ *
+ * Two rows rather than three columns so a long object name wraps under its own chip instead of
+ * squeezing the number that justifies it down to an ellipsis.
+ */
+.hud-tour {
+  left: 50%; bottom: 12px; transform: translateX(-50%); max-width: min(620px, 84%);
+  grid-template-columns: auto minmax(0, 1fr); gap: 1px 10px; align-items: baseline;
+  padding: 8px 13px; background: rgba(8, 13, 20, 0.94); border: 1px solid #3d5670;
+  color: #eaf2f8; backdrop-filter: blur(6px); font-size: .78rem;
+}
+.hud-tour-kind {
+  grid-row: span 2; align-self: center;
+  padding: 3px 7px; border: 1px solid currentColor; color: #93a8ba;
+  font: .58rem ui-monospace, Consolas, monospace; letter-spacing: .09em; text-transform: uppercase;
+  white-space: nowrap;
+}
+/* Blocked traffic is the one stop kind that is an exception rather than a tour of the ordinary, and
+   it borrows the incident palette so the caption matches the pin the camera is looking at. */
+.hud-tour-kind-incident { color: #f2a24b; }
+.hud-tour strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hud-tour-detail { color: #9db2c4; font-size: .7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hud-tour-toggle[aria-pressed='true'] { border-color: #72f4c4; color: #72f4c4; }
 .city-viewport:has(.hud-panel) .hud-top-right { right: calc(min(360px, 40%) + 24px); }
 .city-viewport:has(.hud-panel) .hud-bottom-right { right: calc(min(360px, 40%) + 24px); }
 
@@ -2032,6 +2063,8 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
     min-height: 0;
   }
   .hud-road-readout { bottom: 74px; max-width: calc(100vw - 20px); }
+  /* Same slot, same clearance over the narrow tray's camera controls. */
+  .hud-tour { bottom: 74px; max-width: calc(100vw - 20px); }
 }
 
 /* ------------------------------------------ the narrow bottom sheet scrolls as one region */
