@@ -2,6 +2,8 @@ import type { NormalizedShowplan } from './contracts'
 import type { DatabaseCityQueryFamily } from './databaseCityContracts'
 import { planChoice, type PlanChoice, type PlanFetchers } from './cityPlanSearch'
 import { queryAddressId } from './addressBook'
+import type { TrafficBasis } from './cityTrafficWindow'
+import type { PlanScopePolicy } from './cityQueryScope'
 
 export interface ActiveCityPlan { choice: PlanChoice; showplan: NormalizedShowplan }
 export interface CityNavigationState {
@@ -17,11 +19,13 @@ export class CityPlanNavigation {
   private request: AbortController | null = null
   private generation = 0
   private returnFocus: (() => void) | null = null
-  private databaseId: string
+  private databaseId: string | null
   private api: Pick<PlanFetchers, 'fetchFamily' | 'fetchPlan'>
-  constructor(databaseId: string, api: Pick<PlanFetchers, 'fetchFamily' | 'fetchPlan'>) {
+  private policy: PlanScopePolicy
+  constructor(databaseId: string | null, api: Pick<PlanFetchers, 'fetchFamily' | 'fetchPlan'>, policy: PlanScopePolicy = { directPlanIds: true, reason: null }) {
     this.databaseId = databaseId
     this.api = api
+    this.policy = policy
   }
   getSnapshot = () => this.state
   subscribe = (fn: () => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn) } }
@@ -37,18 +41,20 @@ export class CityPlanNavigation {
     if (restoreFocus) this.returnFocus?.()
     this.returnFocus = null
   }
-  openFamily = async (family: DatabaseCityQueryFamily, returnFocus?: () => void) => {
+  openFamily = async (family: DatabaseCityQueryFamily, returnFocus?: () => void, trafficBasis?: TrafficBasis) => {
     await this.open(async signal => {
+      if (this.databaseId === null) throw new Error(this.policy.reason ?? 'The query database scope is unavailable.')
       const detail = await this.api.fetchFamily(family.familyId, signal)
       if (detail.family.databaseId !== this.databaseId) throw new Error('This query family belongs to another database.')
       const plan = detail.plans.find(candidate => candidate.runtimeCounted) ?? detail.plans[0]
       if (!plan) throw new Error(`Query Store retains no compiled plan for ${family.familyId}. The family may have retired; its measured evidence is still shown on the road.`)
-      return planChoice(detail, plan.planId, family)
+      return { ...planChoice(detail, plan.planId, family), trafficBasis }
     }, family.familyId, returnFocus)
   }
   openPlan = async (choice: PlanChoice, returnFocus?: () => void) => {
     await this.open(async () => {
-      const scopedId = choice.planId.startsWith(`${this.databaseId}:`) && /^\d+$/.test(choice.planId.slice(this.databaseId.length + 1))
+      if (this.databaseId === null) throw new Error(this.policy.reason ?? 'The query database scope is unavailable.')
+      const scopedId = this.policy.directPlanIds && choice.planId.startsWith(`${this.databaseId}:`) && /^\d+$/.test(choice.planId.slice(this.databaseId.length + 1))
       if (choice.family ? choice.family.databaseId !== this.databaseId : !scopedId) throw new Error('This plan has not been located in the selected database. Continue the bounded search.')
       return choice
     }, choice.familyId, returnFocus)

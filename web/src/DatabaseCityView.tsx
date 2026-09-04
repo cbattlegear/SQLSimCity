@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
-  fetchDatabaseCity,
   fetchPlan,
-  fetchQueryFamilies,
   fetchQueryFamily,
 } from './api'
 import { subscribeToLiveIncidents } from './liveFeed'
@@ -10,10 +8,17 @@ import { accessibleObjectLabel, attributedAbsenceLabel, databaseCityMetricValue,
 import type { DatabaseCityObject, DatabaseCityPage, DatabaseCityQueryFamily } from './databaseCityContracts'
 import type { LiveIncidentResponse } from './liveContracts'
 import type { LiveFeedConnectionState } from './liveIncidents'
-import type { NormalizedShowplan, QueryFamilySummary } from './contracts'
 import { DatabaseCityViewport } from './DatabaseCityViewport'
 import { liveBlockingEdges, type LiveBlockingSummary } from './cityBlocking'
-import { mergeCityPage } from './cityPaging'
+import { useCityEvidence } from './useCityEvidence'
+import { type CitySourceMode } from './cityEvidence'
+import { useCityPlans } from './useCityPlans'
+import type { PlanChoice, PlanSearchMode } from './cityPlanSearch'
+import type { ActiveCityPlan } from './cityPlanNavigation'
+import { CityRouteEvidence } from './CityRouteEvidence'
+import { CONTRIBUTOR_PAGE_SIZE, exactCount, observationTime, roadContributors } from './cityQueryEvidence'
+import { familyTrafficMeasurement, trafficBasis } from './cityTrafficWindow'
+import { cityQueryScope } from './cityQueryScope'
 import {
   CITY_REFRESH_INTERVAL_MS,
   cityLayoutSignature,
@@ -65,20 +70,6 @@ import {
 const metrics = ['cpu', 'duration', 'reads', 'executions'] as const
 type Metric = (typeof metrics)[number]
 
-/**
- * Resolves once the browser has actually put the current render on screen.
- *
- * Two frames, not one. A state change only queues a render; the frame callback after that render is
- * the first moment its pixels exist. Anything scheduled before that point is invisible if the main
- * thread then blocks, which is exactly the situation this is used to avoid.
- */
-function nextPaint(): Promise<void> {
-  if (typeof requestAnimationFrame !== 'function') return Promise.resolve()
-  return new Promise(resolve => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-  })
-}
-
 type Props = {
   databaseId: string
   databaseName: string
@@ -88,31 +79,23 @@ type Props = {
   onViewModeChange: (mode: MapViewMode) => void
   /** Deployment and provenance cards, floated over the map by the shell. */
   banners: ReactNode
+  sourceMode?: CitySourceMode
 }
 
-type PlanChoice = {
-  planId: string
-  familyId: string
-  queryHash: string
-  text: string | null
-  textReason: string
-  executionCount: string
-}
+const EMPTY_OBJECTS: DatabaseCityObject[] = []
 
-/**
- * How many object pages the view will walk on its own before handing back to the button.
- *
- * A stop exists so that opening a very large database cannot turn into an unbounded burst of
- * requests at a live instance. At the API's 50-object ceiling this covers a 4,000-object database,
- * which is past the point where every table is legible on one map anyway; beyond it the manual
- * "load more" control comes back and the user decides whether to keep going.
- */
-const AUTO_PAGE_LIMIT = 80
-
-export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, onViewModeChange, banners }: Props) {
+export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, onViewModeChange, banners, sourceMode = 'live' }: Props) {
   const [metric, setMetric] = useState<Metric>('cpu')
-  const [page, setPage] = useState<DatabaseCityPage | null>(null)
-  const [objects, setObjects] = useState<DatabaseCityObject[]>([])
+  const city = useCityEvidence(databaseId, metric, sourceMode)
+  const { page, error, loadedCount, loadMore, disclosure } = city
+  const objects = page?.objects ?? EMPTY_OBJECTS
+  const loading = city.phase === 'initial' || city.phase === 'continuation'
+  const backfilling = city.phase === 'backfill'
+  const relayouting = city.phase === 'layout'
+  const queryScope = cityQueryScope(page, sourceMode)
+  const { finder, navigation, search, selection } = useCityPlans(databaseId, metric, queryScope)
+  const { activePlan, mappingFamilyId, selectedAddressId, error: routeError } = selection
+  const setSelectedAddressId = navigation.selectAddress
   const [selectedId, setSelectedId] = useState<string | null>(() =>
     new URLSearchParams(window.location.search).get('object'))
   const [selectedRoadId, setSelectedRoadId] = useState<string | null>(null)
@@ -133,22 +116,6 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
    * others as well.
    */
   const [chosenRegion, setChosenRegion] = useState<SidebarRegion | null>(null)
-  const [loading, setLoading] = useState(true)
-  /** True while pages after the first are still being walked in the background. */
-  const [backfilling, setBackfilling] = useState(false)
-  /**
-   * True while the whole database is being laid out at once.
-   *
-   * Its own flag rather than a variant of `loading` because the map is already on screen by then,
-   * and the layout it is about to run blocks the main thread for as long as it takes. Nothing can be
-   * painted once that starts, so the screen that covers it has to be up a frame early.
-   */
-  const [relayouting, setRelayouting] = useState(false)
-  /** Objects fetched so far, tracked separately so progress can move while the layout is held. */
-  const [loadedCount, setLoadedCount] = useState(0)
-  const [error, setError] = useState<string | null>(null)
-  /** When the city last re-read itself, so the legend can date the traffic it is showing. */
-  const [refreshedAt, setRefreshedAt] = useState<string | null>(null)
   const [snapshot, setSnapshot] = useState<LiveIncidentResponse | null>(null)
   /**
    * The scrolling log of individual executions, folded out of successive samples.
@@ -160,175 +127,25 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
   const [queryFeed, setQueryFeed] = useState<LiveQueryFeed>(EMPTY_QUERY_FEED)
   const [feedState, setFeedState] = useState<LiveFeedConnectionState>('disconnected')
   const [planQuery, setPlanQuery] = useState('')
-  const [planChoices, setPlanChoices] = useState<PlanChoice[]>([])
-  const [planSearchState, setPlanSearchState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
-  const [planSearchError, setPlanSearchError] = useState<string | null>(null)
-  const [activePlan, setActivePlan] = useState<{ choice: PlanChoice; showplan: NormalizedShowplan } | null>(null)
-  const [mappingFamilyId, setMappingFamilyId] = useState<string | null>(null)
-  const [routeError, setRouteError] = useState<string | null>(null)
-  const requests = useRef(new Set<AbortController>())
-  const headingRef = useRef<HTMLHeadingElement>(null)
+  const [planSearchMode, setPlanSearchMode] = useState<PlanSearchMode>('family')
+  const [visiblePlanCount, setVisiblePlanCount] = useState(12)
   const roadInvokerRef = useRef<HTMLElement | null>(null)
-
-  /** Hands a merged page to the map. Every consumer reads one accumulated page, never a raw one. */
-  const publish = useCallback((value: DatabaseCityPage) => {
-    setPage(value)
-    setObjects(value.objects)
-  }, [])
-  const hasPage = page !== null
-
+  const focusSidebar = useCallback(() => document.querySelector<HTMLButtonElement>('.sidebar-back')?.focus(), [])
   useEffect(() => {
-    for (const request of requests.current) request.abort()
-    requests.current.clear()
-    const controller = new AbortController()
-    requests.current.add(controller)
-    setLoading(true)
-    setBackfilling(false)
-    setRelayouting(false)
-    setLoadedCount(0)
-    setError(null)
-    setPage(null)
-    setObjects([])
-    setRefreshedAt(null)
-    /*
-     * Walk the cursor to the end rather than stopping at the first page.
-     *
-     * Object inventory arrives in bounded pages, and the view used to draw the first one and wait
-     * for a click. That is the wrong default: a city is a database, and a database that had loaded
-     * 24 of its 75 tables was missing two thirds of its buildings. Everything keyed on a building
-     * silently lost those objects with it — most visibly the query paths, where a stop on a table
-     * that had simply not been fetched yet reported itself as unplaceable and the route line
-     * skipped straight over it.
-     *
-     * Pages are still requested one at a time, so the bound the API is defending is untouched; the
-     * only change is who asks for the next one. Each page is merged as it lands, so the city draws
-     * from the first response and fills in behind it instead of blocking on the whole walk.
-     */
-    void (async () => {
-      let token: string | null = null
-      let pages = 0
-      let merged: DatabaseCityPage | null = null
-      try {
-        do {
-          const value = await fetchDatabaseCity(databaseId, metric, token, controller.signal)
-          if (controller.signal.aborted) return
-          pages += 1
-          merged = merged ? mergeCityPage(merged, value) : value
-          token = value.nextPageToken ?? null
-          if (pages === 1) {
-            // The first page is enough to draw and interact with. The rest backfills behind it.
-            publish(merged)
-            setSelectedId(current =>
-              current && merged!.objects.some(object => object.objectId === current)
-                ? current
-                : merged!.objects[0]?.objectId ?? null)
-            setLoading(false)
-            setBackfilling(Boolean(token))
-          }
-          setLoadedCount(merged.objects.length)
-        } while (token && pages < AUTO_PAGE_LIMIT)
-        /*
-         * One re-layout at the end rather than one per page.
-         *
-         * Every published page re-plans the city, and a schema gaining a member re-ranks that
-         * schema's buildings by footprint, so a mid-walk publish visibly reshuffles blocks. Holding
-         * the pages and publishing once means the city is drawn twice however large the database is:
-         * the first page, then the whole thing.
-         *
-         * That second draw is the expensive one — a large database traces its whole street network
-         * here — and it runs synchronously, so the browser cannot paint again until it finishes.
-         * Raising the loading screen and waiting for it to actually reach the glass before starting
-         * is the only way it is ever seen; set it in the same tick and the user gets a frozen map
-         * instead.
-         */
-        if (merged && pages > 1) {
-          setRelayouting(true)
-          await nextPaint()
-          if (controller.signal.aborted) return
-          publish(merged)
-        }
-      } catch (reason) {
-        if (!(reason instanceof DOMException && reason.name === 'AbortError')) setError(String(reason))
-      } finally {
-        requests.current.delete(controller)
-        if (!controller.signal.aborted) {
-          setLoading(false)
-          setBackfilling(false)
-          setRelayouting(false)
-        }
-      }
-    })()
-    return () => {
-      controller.abort()
-      requests.current.delete(controller)
-    }
-  }, [databaseId, metric])
-
-  useEffect(() => () => {
-    for (const request of requests.current) request.abort()
-    requests.current.clear()
-  }, [])
-
-  /*
-   * The city re-reads itself while it is open.
-   *
-   * Traffic is graded from the last quarter of an hour and the directory is meant to be a live
-   * document -- objects appear, disappear and change size as the database does. Neither is true of a
-   * page fetched once when the view mounted; on a long-lived tab that page is a photograph of the
-   * moment someone clicked, presented as a traffic map.
-   *
-   * Three things make this safe to run on a timer:
-   *
-   *  - Each refresh is a **fresh walk**, merged only onto its own pages and then published whole. It
-   *    is deliberately not merged onto the page already on screen: `mergeCityPage` accumulates by id
-   *    and never drops, so refreshing through it would make removal impossible and the directory
-   *    would only ever grow.
-   *  - The layout inputs are held content-stable (see `planObjects` below), so a refresh that only
-   *    moved the traffic repaints without re-planning the city.
-   *  - A failed refresh is swallowed. The city already on screen is real evidence, dated and
-   *    disclosed; replacing it with an error because one poll timed out would throw away something
-   *    true in favour of nothing.
-   */
+    if (activePlan || selectedRoadId) focusSidebar()
+  }, [activePlan, selectedRoadId, focusSidebar])
   useEffect(() => {
-    if (loading || backfilling || !hasPage) return
-    let cancelled = false
-    let walking: AbortController | null = null
-    const refresh = async () => {
-      // A hidden tab re-probing SQL Server every thirty seconds forever is invisible in a screenshot
-      // and shows up only as an instance that never goes idle.
-      if (document.hidden || walking) return
-      const controller = new AbortController()
-      walking = controller
-      requests.current.add(controller)
-      try {
-        let token: string | null = null
-        let pages = 0
-        let merged: DatabaseCityPage | null = null
-        do {
-          const value = await fetchDatabaseCity(databaseId, metric, token, controller.signal)
-          if (cancelled || controller.signal.aborted) return
-          pages += 1
-          merged = merged ? mergeCityPage(merged, value) : value
-          token = value.nextPageToken ?? null
-        } while (token && pages < AUTO_PAGE_LIMIT)
-        if (merged && !cancelled && !controller.signal.aborted) {
-          publish(merged)
-          setRefreshedAt(new Date().toISOString())
-        }
-      } catch {
-        // Deliberately silent: see above.
-      } finally {
-        requests.current.delete(controller)
-        if (walking === controller) walking = null
-      }
-    }
-    const handle = window.setInterval(() => void refresh(), CITY_REFRESH_INTERVAL_MS)
-    return () => {
-      cancelled = true
-      window.clearInterval(handle)
-      walking?.abort()
-    }
-  }, [databaseId, metric, loading, backfilling, hasPage, publish])
+    setSelectedId(new URLSearchParams(window.location.search).get('object'))
+    setSelectedRoadId(null)
+    setAddressTerm('')
+    setPlanQuery('')
+    setChosenRegion(null)
+    focusSidebar()
+  }, [databaseId, focusSidebar])
+  useEffect(() => {
+    if (page && city.phase === 'idle') setSelectedId(current =>
+      current && page.objects.some(object => object.objectId === current) ? current : page.objects[0]?.objectId ?? null)
+  }, [page, city.phase])
 
   useEffect(() => subscribeToLiveIncidents(setSnapshot, setFeedState), [])
 
@@ -370,20 +187,18 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
    */
   useEffect(() => setQueryFeed(EMPTY_QUERY_FEED), [databaseId])
 
-  useEffect(() => {
-    headingRef.current?.focus()
-  }, [databaseId])
-
   const selectObject = useCallback((objectId: string) => {
+    navigation.clear(false)
     setSelectedId(objectId)
     // A building click answers a different question than a road click, so it takes over the panel.
     setSelectedRoadId(null)
     const url = new URL(window.location.href)
     url.searchParams.set('object', objectId)
     window.history.replaceState(null, '', url)
-  }, [])
+  }, [navigation])
 
   const selectRoad = useCallback((routeId: string | null) => {
+    navigation.clear(false)
     // Remember what opened the panel. Its own controls unmount it, so closing has to hand focus
     // back deliberately instead of dropping the reader on document.body, where Tab restarts at
     // the top of the page.
@@ -392,14 +207,18 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
       roadInvokerRef.current = active instanceof HTMLElement && active !== document.body ? active : null
     }
     setSelectedRoadId(routeId)
-  }, [])
+  }, [navigation])
 
   const restoreRoadFocus = useCallback(() => {
     const invoker = roadInvokerRef.current
     roadInvokerRef.current = null
-    if (invoker?.isConnected) invoker.focus()
-    else headingRef.current?.focus()
-  }, [])
+    const roadId = selectedRoadId
+    requestAnimationFrame(() => {
+      const target = invoker?.isConnected ? invoker : roadId ? document.querySelector<HTMLElement>(`[data-road-id="${CSS.escape(roadId)}"]`) : null
+      if (target) target.focus()
+      else focusSidebar()
+    })
+  }, [focusSidebar, selectedRoadId])
 
   const closeRoad = useCallback(() => {
     setSelectedRoadId(null)
@@ -416,11 +235,14 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
   useEffect(() => {
     if (!selectedRoadId) return
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') closeRoad()
+      if (event.key === 'Escape') {
+        if (activePlan || selection.loading) navigation.clear()
+        else closeRoad()
+      }
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [selectedRoadId, closeRoad])
+  }, [selectedRoadId, closeRoad, activePlan, selection.loading, navigation])
 
   const selected = objects.find(object => object.objectId === selectedId) ?? null
   /**
@@ -562,11 +384,10 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
     return labels
   }, [roads, endpointName, facilityTraffic])
 
-  const selectedRoad = roads.find(road => road.routeId === selectedRoadId) ?? null
-  useEffect(() => {
-    // A road that filtering or a refresh removed must not leave a stale panel behind.
-    if (selectedRoadId !== null && !roads.some(road => road.routeId === selectedRoadId)) setSelectedRoadId(null)
-  }, [roads, selectedRoadId])
+  const retainedRoad = useRef<RoadTraffic | null>(null)
+  const currentRoad = roads.find(road => road.routeId === selectedRoadId) ?? null
+  if (currentRoad) retainedRoad.current = currentRoad
+  const selectedRoad = currentRoad ?? (retainedRoad.current?.routeId === selectedRoadId ? retainedRoad.current : null)
 
   /**
    * Everything `planCity` needs to lay the city out the same way every time: the database id as the
@@ -668,154 +489,39 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
     [families, visibleObjects],
   )
 
-  const loadMore = () => {
-    if (!page?.nextPageToken) return
-    const current = page
-    const controller = new AbortController()
-    requests.current.add(controller)
-    setLoading(true)
-    void fetchDatabaseCity(databaseId, metric, current.nextPageToken, controller.signal)
-      .then(next => {
-        const merged = mergeCityPage(current, next)
-        publish(merged)
-        setLoadedCount(merged.objects.length)
-      })
-      .catch(reason => {
-        if (!(reason instanceof DOMException && reason.name === 'AbortError')) setError(String(reason))
-      })
-      .finally(() => {
-        requests.current.delete(controller)
-        if (!controller.signal.aborted) setLoading(false)
-      })
-  }
+  const searchPlans = useCallback(() => {
+    setVisiblePlanCount(12)
+    return finder.search(planQuery, planSearchMode)
+  }, [finder, planQuery, planSearchMode])
 
-  const searchPlans = useCallback(async () => {
-    const term = planQuery.trim().toLocaleLowerCase()
-    setPlanSearchState('loading')
-    setPlanSearchError(null)
-    const controller = new AbortController()
-    requests.current.add(controller)
-    try {
-      const familyPage = await fetchQueryFamilies(metric, null, controller.signal)
-      const matches = familyPage.items
-        .filter(family => !term || familyMatches(family, term))
-        .slice(0, 8)
-      const details = await Promise.all(
-        matches.map(family =>
-          fetchQueryFamily(family.familyId, controller.signal)
-            .then(detail => ({ family, detail }))
-            .catch(() => null)))
-      const choices: PlanChoice[] = []
-      for (const entry of details) {
-        if (!entry) continue
-        for (const plan of entry.detail.plans) {
-          choices.push({
-            planId: plan.planId,
-            familyId: entry.family.familyId,
-            queryHash: entry.family.queryHash,
-            text: entry.family.text.normalizedText,
-            textReason: entry.family.text.reason,
-            executionCount: entry.family.executionCount,
-          })
-        }
-      }
-      const planTermMatches = term
-        ? choices.filter(choice =>
-          choice.planId.toLocaleLowerCase().includes(term) ||
-          choice.familyId.toLocaleLowerCase().includes(term) ||
-          choice.queryHash.toLocaleLowerCase().includes(term) ||
-          (choice.text ?? '').toLocaleLowerCase().includes(term))
-        : []
-      setPlanChoices(planTermMatches.length > 0 ? planTermMatches : choices)
-      setPlanSearchState('ready')
-    } catch (reason) {
-      if (reason instanceof DOMException && reason.name === 'AbortError') return
-      setPlanSearchError(String(reason))
-      setPlanSearchState('error')
-    } finally {
-      requests.current.delete(controller)
+  const restoreNavigationFocus = useCallback((selector: string, addressId: string | null = null) => {
+    const invoker = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const roadId = selectedRoadId
+    return () => {
+      setSelectedRoadId(roadId)
+      navigation.selectAddress(addressId)
+      requestAnimationFrame(() => {
+        const target = invoker?.isConnected ? invoker : document.querySelector<HTMLElement>(selector)
+        if (target) target.focus()
+        else focusSidebar()
+      })
     }
-  }, [metric, planQuery])
-
-  const choosePlan = useCallback(async (choice: PlanChoice) => {
-    setRouteError(null)
-    const controller = new AbortController()
-    requests.current.add(controller)
-    try {
-      const showplan = await fetchPlan(choice.planId, controller.signal)
-      setActivePlan({ choice, showplan })
-    } catch (reason) {
-      if (reason instanceof DOMException && reason.name === 'AbortError') return
-      setRouteError(String(reason))
-    } finally {
-      requests.current.delete(controller)
-    }
-  }, [])
-
-  const [selectedAddressId, setSelectedAddressId] = useState<string | null>(null)
-
-  /**
-   * Draws a ranked family's own plan on the map. The family row already carries the workload
-   * evidence; this reads the one plan behind it so the same evidence becomes a route through the
-   * buildings it named, instead of requiring the operator to rediscover it in the plan finder.
-   *
-   * Selecting the family's address is part of *drawing* it, not part of clicking a list row, and
-   * that is why `setSelectedAddressId` is here rather than in `openAddress`. There are three
-   * callers -- the address book, the live query feed, and the ranked families table -- and only
-   * the first used to set it, so the other two left the rail in a different state from the one the
-   * list produced for the very same family.
-   *
-   * The divergence is invisible in the success case and only in the success case: `buildCityRoute`
-   * never returns null, so a plan that arrives always swaps the rail over to `RoutePanel`, which
-   * covers the address book whether or not a row underneath it is highlighted. What it is *not*
-   * invisible in is everything either side of that moment, and those are the states a live feed
-   * spends most of its time in:
-   *
-   * - **While the two fetches are in flight.** `fetchQueryFamily` then `fetchPlan`, against Query
-   *   Store, is not instant. The address book is still up for all of it, and the list highlighted
-   *   the row immediately when the click came from the list and never when it came from the feed.
-   * - **When the family cannot be drawn at all.** Query Store retaining no compiled plan is an
-   *   ordinary outcome, not an error case; `activePlan` stays null, the rail stays on the address
-   *   book, and the two paths then differ permanently rather than for a few hundred milliseconds.
-   * - **Over a stale place card.** `selectedFacility` is derived from `selectedAddressId`, so with
-   *   a facility card open a feed click left that card sitting over the rail describing something
-   *   the user had just navigated away from. This is the one a reader actually notices.
-   */
-  const showFamilyOnMap = useCallback(async (family: DatabaseCityQueryFamily) => {
-    setSelectedAddressId(queryAddressId(family.familyId))
-    setRouteError(null)
-    setMappingFamilyId(family.familyId)
-    const controller = new AbortController()
-    requests.current.add(controller)
-    try {
-      const detail = await fetchQueryFamily(family.familyId, controller.signal)
-      // Prefer a plan whose runtime is counted; a dispatcher plan carries no operator tree to walk.
-      const plan = detail.plans.find(candidate => candidate.runtimeCounted) ?? detail.plans[0]
-      if (!plan) {
-        setRouteError(
-          `Query Store retains no compiled plan for ${family.familyId}, so this family cannot be drawn as a route.`)
-        return
-      }
-      const showplan = await fetchPlan(plan.planId, controller.signal)
-      setActivePlan({
-        choice: {
-          planId: plan.planId,
-          familyId: family.familyId,
-          queryHash: family.queryHash,
-          text: detail.family.text.normalizedText,
-          textReason: detail.family.text.reason,
-          executionCount: family.executionCount,
-        },
-        showplan,
-      })
-    } catch (reason) {
-      if (reason instanceof DOMException && reason.name === 'AbortError') return
-      setRouteError(String(reason))
-    } finally {
-      requests.current.delete(controller)
-      setMappingFamilyId(current => (current === family.familyId ? null : current))
-    }
-  }, [])
+  }, [selectedRoadId, navigation, focusSidebar])
+  const choosePlan = useCallback((choice: PlanChoice) => {
+    const cityFamily = families.find(family => family.familyId === choice.familyId)
+    return navigation.openPlan(
+      { ...choice, cityFamily, trafficBasis: cityFamily ? trafficBasis(families) : undefined },
+      restoreNavigationFocus(`[data-plan-id="${CSS.escape(choice.planId)}"]`),
+    )
+  }, [navigation, families, restoreNavigationFocus])
+  const showFamilyOnMap = useCallback((family: DatabaseCityQueryFamily) => navigation.openFamily(
+    family,
+    restoreNavigationFocus(
+      selectedRoadId ? `[data-contributor-id="${CSS.escape(family.familyId)}"]` : `[data-family-id="${CSS.escape(family.familyId)}"], [data-address-id="${CSS.escape(queryAddressId(family.familyId))}"]`,
+      queryAddressId(family.familyId),
+    ),
+    trafficBasis(families),
+  ), [navigation, restoreNavigationFocus, selectedRoadId, families])
 
   const addressEntries = useMemo(
     () => buildAddressBook(visibleObjects, page?.topQueryFamilies ?? [], facilities, cityPlan),
@@ -852,16 +558,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
     ? facilities.find(facility => `facility:${facility.kind}` === selectedAddressId) ?? null
     : null
 
-  /**
-   * Close an open query route and return to the database. The route was opened from a query address,
-   * so its list row is still selected; clearing that too keeps the address list from coming back with
-   * a stale `is-selected` row highlighted.
-   */
-  const clearRoute = useCallback(() => {
-    setActivePlan(null)
-    setSelectedAddressId(null)
-    setRouteError(null)
-  }, [])
+  const clearRoute = useCallback(() => navigation.clear(), [navigation])
 
   const liveQueryFeed = (
     /*
@@ -960,6 +657,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
     >
       <summary>Route a captured query plan</summary>
       <div className="sidebar-drawer-body">
+        {queryScope.reason && <p className="hud-note" role="status">{queryScope.reason}</p>}
         <form
           className="hud-field"
           onSubmit={event => {
@@ -968,39 +666,60 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
           }}
         >
           <label>
+            <span>Search by</span>
+            <select value={planSearchMode} onChange={event => setPlanSearchMode(event.target.value as PlanSearchMode)}>
+              <option value="family">Family, query hash or SQL text</option>
+              <option value="plan">Exact plan ID</option>
+            </select>
+          </label>
+          <label>
             <span>Find a query plan</span>
             <input
               type="search"
               value={planQuery}
               onChange={event => setPlanQuery(event.target.value)}
-              placeholder="plan id, family id, query hash, or text"
+              placeholder={planSearchMode === 'plan' ? 'Plan ID in this database' : 'Family id, query hash, or SQL text'}
             />
           </label>
-          <button type="submit">Route it</button>
+          <button type="submit" disabled={!queryScope.databaseId || search.status === 'loading'}>Find plans</button>
         </form>
-        {planSearchState === 'loading' && <p className="hud-note" role="status">Searching captured plans…</p>}
-        {planSearchState === 'error' && <p className="hud-note is-error" role="alert">{planSearchError}</p>}
-        {planSearchState === 'ready' && planChoices.length === 0 && (
-          <p className="hud-note">No captured plan matches. Query Store only returns plans it captured.</p>
+        {search.status === 'loading' && <p className="hud-note" role="status">Searching captured plans…</p>}
+        {search.error && <p className="hud-note is-error" role="alert">{search.error}</p>}
+        {search.status !== 'idle' && search.status !== 'loading' && (
+          <p className="hud-note" role="status">
+            {search.searched} families searched in this database.{' '}
+            {search.status === 'exhausted' ? 'Search exhausted.' : search.status === 'limited' ? '200-result limit reached; narrow the search.' : 'Partial search; absence is not proved.'}{' '}
+            {search.choices.length === 0 ? 'No match in the searched subset.' : `${search.choices.length} plan(s) located.`}
+          </p>
         )}
-        {planChoices.length > 0 && (
+        {search.failures.length > 0 && <details className="plan-search-failures">
+          <summary>{search.failures.length} unavailable family or plan read(s)</summary>
+          <ul>{search.failures.map((failure, index) => <li key={index}>{failure}</li>)}</ul>
+        </details>}
+        {search.choices.length > 0 && (
           <ul className="hud-results">
-            {planChoices.slice(0, 12).map(choice => (
+            {search.choices.slice(0, visiblePlanCount).map(choice => (
               <li key={`${choice.familyId}:${choice.planId}`}>
                 <button
                   type="button"
+                  data-plan-id={choice.planId}
                   aria-pressed={activePlan?.choice.planId === choice.planId}
                   onClick={() => void choosePlan(choice)}
                 >
                   <strong>{choice.planId}</strong>
-                  <small>{choice.text ?? choice.textReason}</small>
-                  <small>{choice.familyId} · {choice.executionCount} executions</small>
+                  <small>{choice.text ? `${choice.text.slice(0, 240)}${choice.text.length > 240 ? '…' : ''}` : choice.textReason}</small>
+                  <small>{choice.familyId ?? 'Family not yet located'} · {exactCount(choice.executionCount)} retained executions</small>
                 </button>
               </li>
             ))}
           </ul>
         )}
-        {routeError && <p className="hud-note is-error" role="alert">{routeError}</p>}
+        {search.choices.length > visiblePlanCount && <button type="button" className="load-more" onClick={() => setVisiblePlanCount(count => count + 12)}>
+          Show next 12 located plans
+        </button>}
+        {search.canContinue && search.status !== 'limited' && <button type="button" className="load-more" disabled={search.status === 'loading'} onClick={() => void finder.more()}>
+          {search.status === 'error' ? 'Retry bounded search' : 'Search next bounded group'}
+        </button>}
       </div>
     </details>
   )
@@ -1017,7 +736,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
 
   /** The place card: whatever the map is currently pointing at, rendered over the address list. */
   const placeCard = route
-    ? <RoutePanel route={route} plan={activePlan!} />
+    ? <RoutePanel route={route} plan={activePlan!} now={city.now} sourceMode={sourceMode} />
     : selectedRoad
       ? <RoadPanel
         road={selectedRoad}
@@ -1026,6 +745,11 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
         onSelectEndpoint={selectRoadEndpoint}
         hasEndpoint={objectId => objects.some(object => object.objectId === objectId)}
         onClose={closeRoad}
+        families={families}
+        onShowFamily={showFamilyOnMap}
+        mappingFamilyId={mappingFamilyId}
+        retired={!currentRoad}
+        selectedFamilyId={selectedAddressId?.startsWith('query:') ? selectedAddressId.slice('query:'.length) : null}
       />
       : selectedFacility
         ? <FacilityPanel facility={selectedFacility} onClose={() => setSelectedAddressId(null)} />
@@ -1067,19 +791,30 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
             </a>
           </div>
         }
-        title={sidebarMode.title}
-        subtitle={sidebarMode.subtitle}
-        onBack={sidebarMode.clearsRoute ? clearRoute : onBack}
-        backLabel={sidebarMode.backLabel}
+        title={!route && selectedRoad ? 'Road evidence' : sidebarMode.title}
+        subtitle={!route && selectedRoad ? `${endpointName(selectedRoad.fromObjectId)} · ${endpointName(selectedRoad.toId)}` : sidebarMode.subtitle}
+        onBack={sidebarMode.clearsRoute ? clearRoute : selectedRoad ? closeRoad : onBack}
+        backLabel={route && selectedRoad ? 'Back to road' : selectedRoad ? 'Back to city' : sidebarMode.backLabel}
       />
 
+      {page && <section className={`city-evidence-status${disclosure.degraded ? ' is-degraded' : ''}`} aria-label="City evidence status">
+        <p role="status"><strong>{disclosure.status}</strong> · Workload observed {observationTime(disclosure.observedAt)}</p>
+        {sourceMode !== 'live' && <p>{sourceMode === 'archive' ? 'Archive snapshot' : 'Edge sample'} · static captured evidence</p>}
+        {error && <p role="alert">{error} Last useful city retained.</p>}
+        {(error || disclosure.degraded) && <button type="button" onClick={() => void city.refresh()} disabled={city.phase !== 'idle'}>
+          {city.phase === 'refresh' ? 'Refreshing…' : 'Retry city read'}
+        </button>}
+        {selection.loading && <p role="status">Reading the selected compiled plan…</p>}
+        {routeError && <p className="is-error" role="alert">{routeError}</p>}
+      </section>}
+
       {placeCard && (
-        <div className={`sidebar-place-card${route ? ' is-full' : ''}`}>{placeCard}</div>
+        <div className={`sidebar-place-card${route || selectedRoad ? ' is-full' : ''}`}>{placeCard}</div>
       )}
 
-      {sidebarMode.showsAddressBook && liveQueryFeed}
+      {sidebarMode.showsAddressBook && !selectedRoad && liveQueryFeed}
 
-      {sidebarMode.showsAddressBook && (
+      {sidebarMode.showsAddressBook && !selectedRoad && (
         <AddressBook
           entries={addressEntries}
           term={addressTerm}
@@ -1108,7 +843,7 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
                   </p>
                 )}
                 {!backfilling && page?.nextPageToken && (
-                  <button type="button" className="load-more" onClick={loadMore}>
+                  <button type="button" className="load-more" onClick={() => void loadMore()} disabled={city.phase !== 'idle'}>
                     Load next bounded object page
                   </button>
                 )}
@@ -1154,7 +889,8 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
                   onShowFamily={showFamilyOnMap}
                   selectedObject={selected}
                   vehicles={vehicleRoster}
-                  refreshedAt={refreshedAt}
+                  observedAt={disclosure.observedAt}
+                  sourceMode={sourceMode}
                   open={openRegion === 'legend'}
                   onOpenChange={regionToggle('legend')}
                 />}
@@ -1189,7 +925,9 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
           total={page?.totalObjects != null ? Number(page.totalObjects) : null}
         />
       )}
-      {error && <section className="stage-message error" role="alert">{error}</section>}
+      {error && !page && <section className="stage-message error" role="alert">
+        {error} <button type="button" onClick={() => void city.refresh()}>Retry city read</button>
+      </section>}
 
       {page && (
         <DatabaseCityViewport
@@ -1223,8 +961,8 @@ export function DatabaseCityView({ databaseId, databaseName, onBack, viewMode, o
       )}
 
       {page && (
-        <StatusChip degraded={page.evidence.status !== 'Available'} title={page.evidence.reason}>
-          {page.evidence.source} · {page.evidence.status}
+        <StatusChip degraded={disclosure.degraded} title={disclosure.detail}>
+          {page.evidence.source} · {disclosure.status}
         </StatusChip>
       )}
 
@@ -1343,6 +1081,7 @@ function LiveQueryTicker({
                   ? (
                     <button
                       type="button"
+                      data-family-id={family.familyId}
                       aria-pressed={family.familyId === activeFamilyId}
                       title={`Route this query's captured plan across the city (family ${family.familyId})`}
                       onClick={() => void onShowFamily(family)}
@@ -1396,7 +1135,8 @@ function LegendDrawer({
   onShowFamily,
   selectedObject,
   vehicles,
-  refreshedAt,
+  observedAt,
+  sourceMode,
   open,
   onOpenChange,
 }: {
@@ -1419,7 +1159,8 @@ function LegendDrawer({
   onShowFamily: (family: DatabaseCityQueryFamily) => void | Promise<void>
   selectedObject: DatabaseCityObject | null
   vehicles: VehicleRoster
-  refreshedAt: string | null
+  observedAt: string | null
+  sourceMode: CitySourceMode
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
@@ -1432,8 +1173,8 @@ function LegendDrawer({
    */
   const [showUnmappedFamilies, setShowUnmappedFamilies] = useState(false)
   const trafficWindow = useMemo(
-    () => describeTrafficWindow(page.topQueryFamilies, refreshedAt, CITY_REFRESH_INTERVAL_MS),
-    [page.topQueryFamilies, refreshedAt],
+    () => describeTrafficWindow(page.topQueryFamilies, observedAt, CITY_REFRESH_INTERVAL_MS, sourceMode),
+    [page.topQueryFamilies, observedAt, sourceMode],
   )
   const placedIds = useMemo(() => placedObjectIds(objects), [objects])
   const familySplit = useMemo(
@@ -1497,8 +1238,8 @@ function LegendDrawer({
           logarithmically and height maps exact used pages, so a one-page table is a house and a
           multi-gigabyte table is a skyscraper for a measured reason. Amber roof-cap height maps
           attributed Query Store CPU; index annex width maps direct DMV operations, and indexes stay
-          attached to their parent. Road width maps the executions of query families naming both
-          endpoints; road colour maps captured wait share, upgraded to red only where a resolved live
+          attached to their parent. Roads have a constant width; road colour maps captured wait
+          milliseconds per execution in the disclosed window, upgraded to red where a resolved live
           lock names that object; route line pattern maps co-reference confidence, never row flow.
           Wait-lane width maps the captured Query Store wait milliseconds a building&apos;s workload
           spent queued at one infrastructure facility, and lane colour names that destination; a
@@ -1580,9 +1321,9 @@ function LegendDrawer({
 
         <p className="mapping-note">
           <strong>The traffic is measured; the streets carrying it are not.</strong> A street&apos;s
-          width is the captured executions of every query family whose journey runs along it, and its
-          colour is the waiting those executions carried, in milliseconds per execution. Both numbers
-          come from Query Store. What is invented is the geography: SQL Server has no streets, so the
+          width is constant, and its colour is the waiting those executions carried in the disclosed
+          window, in milliseconds per execution. Wait placement uses the optimizer&apos;s estimated
+          cost split; missing allocation stays unknown. What is invented is the geography: SQL Server has no streets, so the
           route each family takes between the tables it reads is modelled on those seeded speed
           limits, and the busiest families fan out onto parallel streets rather than stacking on one
           road. Read a red street as &ldquo;queries that touch these tables wait a lot&rdquo;, never as
@@ -1697,6 +1438,7 @@ function LegendDrawer({
               <td className="map-cell">{familyOnMap(family, placedIds) ? <>
                 <button
                   type="button"
+                  data-family-id={family.familyId}
                   disabled={mappingFamilyId === family.familyId}
                   aria-label={`Draw the plan for ${family.familyId} on the map`}
                   onClick={() => void onShowFamily(family)}
@@ -1736,6 +1478,7 @@ function LegendDrawer({
                   ? <button
                     type="button"
                     className="route-endpoints"
+                    data-road-id={route.routeId}
                     aria-pressed={route.routeId === selectedRoadId}
                     onClick={() => onSelectRoad(route.routeId)}
                   >
@@ -1777,14 +1520,6 @@ function FacilityPanel({ facility, onClose }: { facility: Facility; onClose: () 
         <p>{facility.reason}</p>
       </div>
     </aside>
-  )
-}
-
-function familyMatches(family: QueryFamilySummary, term: string): boolean {
-  return (
-    family.familyId.toLocaleLowerCase().includes(term) ||
-    family.queryHash.toLocaleLowerCase().includes(term) ||
-    (family.text.normalizedText ?? '').toLocaleLowerCase().includes(term)
   )
 }
 
@@ -1966,12 +1701,18 @@ const RESOURCE_TAGS: Readonly<Record<FacilityKind, string>> = {
 function RoutePanel({
   route,
   plan,
+  now,
+  sourceMode,
 }: {
   route: CityRoute
-  plan: { choice: PlanChoice; showplan: NormalizedShowplan }
+  plan: ActiveCityPlan
+  now: number
+  sourceMode: CitySourceMode
 }) {
   return (
     <aside className="hud-slideover" aria-label={`This query's route · plan ${plan.choice.planId}`}>
+      <CityRouteEvidence choice={plan.choice} now={now} sourceMode={sourceMode} />
+      <h2>Compiled plan route</h2>
       <ol className="route-directions">
         {route.stops.map(stop => (
           <li key={stop.ordinal} className={`stop-${stop.kind}`}>
@@ -2047,6 +1788,11 @@ function RoadPanel({
   onSelectEndpoint,
   hasEndpoint,
   onClose,
+  families,
+  onShowFamily,
+  mappingFamilyId,
+  retired,
+  selectedFamilyId,
 }: {
   road: RoadTraffic
   fromName: string
@@ -2054,7 +1800,18 @@ function RoadPanel({
   onSelectEndpoint: (objectId: string) => void
   hasEndpoint: (objectId: string) => boolean
   onClose: () => void
+  families: readonly DatabaseCityQueryFamily[]
+  onShowFamily: (family: DatabaseCityQueryFamily) => void | Promise<void>
+  mappingFamilyId: string | null
+  retired: boolean
+  selectedFamilyId: string | null
 }) {
+  const [contributorCount, setContributorCount] = useState(CONTRIBUTOR_PAGE_SIZE)
+  useEffect(() => setContributorCount(CONTRIBUTOR_PAGE_SIZE), [road.routeId])
+  const selectedIndex = selectedFamilyId === null ? -1 : road.familyIds.indexOf(selectedFamilyId)
+  const shownCount = Math.max(contributorCount, selectedIndex + 1)
+  const contributors = roadContributors(road.familyIds, families, shownCount)
+  const basis = trafficBasis(families)
   const endpoint = (objectId: string, name: string) =>
     hasEndpoint(objectId)
       ? <button type="button" className="link-button" onClick={() => onSelectEndpoint(objectId)}>{name}</button>
@@ -2074,19 +1831,44 @@ function RoadPanel({
       </p>
       <dl>
         <div><dt>Reference</dt><dd>{road.kind} · {road.confidence}</dd></div>
-        <div><dt>Executions</dt><dd>{road.executions?.toLocaleString() ?? 'Unavailable'}</dd></div>
-        <div><dt>Query families</dt><dd>{road.familyIds.length}</dd></div>
+        <div><dt>Window executions</dt><dd>{(road.recentWindowMinutes === null ? road.executions : road.recentExecutions)?.toLocaleString() ?? 'Unavailable'}</dd></div>
+        <div><dt>Retained executions</dt><dd>{road.executions?.toLocaleString() ?? 'Unavailable'}</dd></div>
         <div><dt>Wait share</dt><dd>
           {road.waitShare === null ? 'Unavailable' : `${(road.waitShare * 100).toFixed(1)}%`}
         </dd></div>
         <div><dt>Congestion</dt><dd>{CONGESTION_LABELS[road.grade]}</dd></div>
       </dl>
+      {retired && <p className="hud-note is-warning">This road is absent from the latest city read. Its last useful reference is retained; missing contributors cannot be routed.</p>}
+      <section className="road-contributors" aria-labelledby="road-contributors-title">
+        <h3 id="road-contributors-title">Contributing query families</h3>
+        <p className="hud-note">{road.familyIds.length} family/families in the loaded, backend-ranked subset. This is not a complete workload inventory.</p>
+        {contributors.items.length === 0 && <p>No captured family can be linked to this road.</p>}
+        <ul className="hud-results">
+          {contributors.items.map(({ id, family }) => <li key={id}>
+            {family ? <button
+              type="button"
+              data-contributor-id={id}
+              aria-pressed={id === selectedFamilyId}
+              aria-busy={mappingFamilyId === id}
+              onClick={() => void onShowFamily(family)}
+            >
+              <strong>{family.queryHash || id}</strong>
+              <small>{id}</small>
+              <small>{exactCount(familyTrafficMeasurement(family, basis).executions?.toString())} {basis.kind === 'recent' ? 'window' : 'retained'} executions · {family.confidence}</small>
+              <span>{mappingFamilyId === id ? 'Reading plan…' : 'Show query evidence and route'}</span>
+            </button> : <p>{id} · No longer in the loaded family set. Refresh or use the plan finder to look for retained evidence.</p>}
+          </li>)}
+        </ul>
+        {contributors.remaining > 0 && <button type="button" className="load-more" onClick={() => setContributorCount(shownCount + CONTRIBUTOR_PAGE_SIZE)}>
+          Show next {Math.min(CONTRIBUTOR_PAGE_SIZE, contributors.remaining)} contributors ({contributors.remaining} remaining)
+        </button>}
+      </section>
       <div className="source-note">
         <strong>Why this road looks like this</strong>
         <p>{road.rationale}</p>
       </div>
       <p className="hud-note">
-        Width maps captured executions naming both endpoints; colour maps captured wait share. The
+        Width is constant; colour maps captured wait milliseconds per execution in the disclosed window. The
         road follows the street grid and claims a reference between these two objects, never row flow.
       </p>
     </aside>

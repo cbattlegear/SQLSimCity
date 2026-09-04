@@ -107,4 +107,50 @@ describe('city evidence lifecycle', () => {
     await owner.refresh()
     expect(cityEvidenceDisclosure(owner.getSnapshot(), 'live').observedAt).toBe('2026-09-04T10:00:00Z')
   })
+
+  it('bounds automatic paging and ignores a second load-more click while one is pending', async () => {
+    const pending = deferred<DatabaseCityPage>()
+    const fetch = vi.fn(async (_database: string, _metric: string, token: string | null) =>
+      page({ nextPageToken: String(Number(token ?? 0) + 1) }))
+    const owner = new CityEvidenceController('db', 'cpu', 'live', fetch)
+    await owner.refresh()
+    expect(fetch).toHaveBeenCalledTimes(80)
+    fetch.mockImplementationOnce(() => pending.promise)
+    const more = owner.loadMore()
+    await owner.loadMore()
+    expect(fetch).toHaveBeenCalledTimes(81)
+    pending.resolve(page())
+    await more
+    expect(owner.getSnapshot().page?.nextPageToken).toBeNull()
+  })
+
+  it('does not publish a one-second heartbeat or poll a hidden city', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-04T10:00:01Z'))
+    const fetch = vi.fn().mockResolvedValue(page())
+    const owner = new CityEvidenceController('db', 'cpu', 'live', fetch, undefined, () => true)
+    const publish = vi.fn()
+    owner.subscribe(publish)
+    owner.start()
+    await vi.advanceTimersByTimeAsync(0)
+    publish.mockClear()
+    await vi.advanceTimersByTimeAsync(58_000)
+    expect(publish).not.toHaveBeenCalled()
+    expect(fetch).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(publish).toHaveBeenCalledOnce()
+    expect(cityEvidenceDisclosure(owner.getSnapshot(), 'live').status).toBe('Stale')
+    owner.dispose()
+  })
+
+  it('stops all timing for a fixture discovered through the live adapter', async () => {
+    vi.useFakeTimers()
+    const value = page()
+    value.evidence = { ...value.evidence, source: 'Fixture' }
+    const owner = new CityEvidenceController('db', 'cpu', 'live', vi.fn().mockResolvedValue(value))
+    owner.start()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.getTimerCount()).toBe(0)
+    owner.dispose()
+  })
 })

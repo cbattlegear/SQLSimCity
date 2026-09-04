@@ -52,6 +52,21 @@ describe('bounded city plan search', () => {
     await finder.search('other-plan', 'plan')
     expect(finder.getSnapshot().choices).toEqual([])
   })
+  it('does not qualify or expose captured numeric IDs without membership', async () => {
+    const fetchers = api({ fetchFamilies: async () => page([]) })
+    const finder = new CityPlanSearch('db', 'cpu', fetchers, { directPlanIds: false, reason: null })
+    await finder.search('123', 'plan')
+    expect(fetchers.fetchPlan).toHaveBeenCalledWith('123', expect.any(AbortSignal))
+    expect(finder.getSnapshot().choices).toEqual([])
+  })
+  it('never requests an unproven database namespace', async () => {
+    const fetchers = api()
+    const finder = new CityPlanSearch(null, 'cpu', fetchers, { directPlanIds: false, reason: 'Ambiguous source' })
+    await finder.search('123', 'plan')
+    expect(fetchers.fetchPlan).not.toHaveBeenCalled()
+    expect(fetchers.fetchFamilies).not.toHaveBeenCalled()
+    expect(finder.getSnapshot()).toMatchObject({ status: 'error', error: 'Ambiguous source' })
+  })
   it('continues beyond page one and eight matching families without claiming exhaustion', async () => {
     const all = Array.from({ length: 10 }, (_, index) => detail(`f${index}`, 'db', `db:${index}`))
     const fetchers = api({ fetchFamilies: vi.fn().mockResolvedValueOnce(page(all, 'page2')).mockResolvedValueOnce(page([detail('last', 'db', 'db:999')])), fetchFamily: async id => all.find(item => item.family.familyId === id) ?? detail('last', 'db', 'db:999') })
@@ -114,6 +129,19 @@ describe('city plan navigation ownership', () => {
     await owner.openFamily(family)
     expect(owner.getSnapshot().activePlan).toBeNull()
     expect(owner.getSnapshot().error).toContain('another database')
+  })
+  it('rejects an unproven namespace before reading family evidence', async () => {
+    const fetchers = api()
+    const owner = new CityPlanNavigation(null, fetchers, { directPlanIds: false, reason: 'Ambiguous source' })
+    await owner.openFamily(family)
+    expect(fetchers.fetchFamily).not.toHaveBeenCalled()
+    expect(owner.getSnapshot().error).toBe('Ambiguous source')
+  })
+  it('does not trust a captured numeric-looking prefix as database membership', async () => {
+    const owner = new CityPlanNavigation('db', api(), { directPlanIds: false, reason: null })
+    await owner.openPlan({ planId: 'db:123', familyId: null, queryHash: null, text: null, textReason: 'unknown', executionCount: null, family: null })
+    expect(owner.getSnapshot().activePlan).toBeNull()
+    expect(owner.getSnapshot().error).toContain('not been located')
   })
   it('does not reopen a cleared route when a pending read completes', async () => {
     let resolve!: (value: NormalizedShowplan) => void

@@ -15,7 +15,6 @@ export interface CityEvidenceState {
 }
 
 export const AUTO_PAGE_LIMIT = 80
-export const EVIDENCE_CLOCK_MS = 1_000
 type FetchCity = (databaseId: string, metric: string, token: string | null, signal: AbortSignal) => Promise<DatabaseCityPage>
 
 export function evidenceStatus(evidence: Pick<Evidence, 'status' | 'freshUntil'>, now: number, staticSource = false) {
@@ -56,7 +55,7 @@ export class CityEvidenceController {
   private listeners = new Set<() => void>()
   private request: AbortController | null = null
   private generation = 0
-  private clock: ReturnType<typeof setInterval> | null = null
+  private clock: ReturnType<typeof setTimeout> | null = null
   private poll: ReturnType<typeof setInterval> | null = null
   readonly databaseId: string
   readonly metric: string
@@ -89,12 +88,34 @@ export class CityEvidenceController {
   private update(update: Partial<CityEvidenceState>) {
     this.state = { ...this.state, ...update }
     this.listeners.forEach(listener => listener())
+    if ('page' in update) this.scheduleExpiry()
+  }
+  private scheduleExpiry() {
+    if (this.clock !== null) clearTimeout(this.clock)
+    this.clock = null
+    const page = this.state.page
+    if (!page) return
+    if (this.mode !== 'live' || page.evidence.source === 'Fixture' || page.evidence.source === 'ImportedArchive') {
+      if (this.poll !== null) clearInterval(this.poll)
+      this.poll = null
+      return
+    }
+    const now = Date.now()
+    const deadlines = [page.evidence, page.otherWorkload.evidence, ...page.topQueryFamilies.map(family => family.evidence)]
+      .filter(evidence => evidence.status === 'Available')
+      .map(evidence => evidence.freshUntil === null ? NaN : Date.parse(evidence.freshUntil))
+      .filter(deadline => Number.isFinite(deadline) && deadline > now)
+    if (deadlines.length === 0) return
+    this.clock = setTimeout(() => {
+      this.clock = null
+      this.update({ now: Date.now() })
+      this.scheduleExpiry()
+    }, Math.min(2_147_483_647, Math.max(1, Math.min(...deadlines) - now)))
   }
 
   start() {
     void this.load('initial')
     if (this.mode === 'live') {
-      this.clock = setInterval(() => this.update({ now: Date.now() }), EVIDENCE_CLOCK_MS)
       this.poll = setInterval(() => {
         if (!this.hidden() && !this.request && this.state.page?.evidence.source !== 'ImportedArchive' && this.state.page?.evidence.source !== 'Fixture') void this.refresh()
       }, CITY_REFRESH_INTERVAL_MS)
@@ -103,7 +124,7 @@ export class CityEvidenceController {
 
   dispose() {
     this.cancel()
-    if (this.clock !== null) clearInterval(this.clock)
+    if (this.clock !== null) clearTimeout(this.clock)
     if (this.poll !== null) clearInterval(this.poll)
     this.clock = this.poll = null
   }

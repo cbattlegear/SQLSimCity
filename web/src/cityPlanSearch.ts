@@ -1,6 +1,8 @@
 import type { NormalizedShowplan, QueryFamilyDetail, QueryFamilyPage, QueryFamilySummary } from './contracts'
 import type { DatabaseCityQueryFamily } from './databaseCityContracts'
 import { QueryStoreRequestError } from './api'
+import type { TrafficBasis } from './cityTrafficWindow'
+import type { PlanScopePolicy } from './cityQueryScope'
 
 export interface PlanChoice {
   planId: string
@@ -12,6 +14,7 @@ export interface PlanChoice {
   family: QueryFamilySummary | null
   cityFamily?: DatabaseCityQueryFamily
   showplan?: NormalizedShowplan
+  trafficBasis?: TrafficBasis
 }
 export interface PlanFetchers {
   fetchFamilies: (metric: string, token: string | null, signal: AbortSignal, databaseId: string) => Promise<QueryFamilyPage>
@@ -59,13 +62,15 @@ export class CityPlanSearch {
   private pending: QueryFamilySummary[] = []
   private direct: NormalizedShowplan | null = null
 
-  private databaseId: string
+  private databaseId: string | null
   private metric: string
   private api: PlanFetchers
-  constructor(databaseId: string, metric: string, api: PlanFetchers) {
+  private policy: PlanScopePolicy
+  constructor(databaseId: string | null, metric: string, api: PlanFetchers, policy: PlanScopePolicy = { directPlanIds: true, reason: null }) {
     this.databaseId = databaseId
     this.metric = metric
     this.api = api
+    this.policy = policy
   }
   getSnapshot = () => this.state
   subscribe = (fn: () => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn) } }
@@ -93,7 +98,9 @@ export class CityPlanSearch {
     const current = () => generation === this.generation && !controller.signal.aborted
     this.update({ status: 'loading', error: null })
     try {
-      const id = scopedPlanId(this.databaseId, this.term)
+      const databaseId = this.databaseId
+      if (databaseId === null) throw new Error(this.policy.reason ?? 'The query database scope is unavailable.')
+      const id = this.policy.directPlanIds ? scopedPlanId(databaseId, this.term) : this.term
       if (!this.started && this.mode === 'plan') {
         if (!this.term) throw new Error('Enter a captured plan ID.')
         try {
@@ -107,7 +114,7 @@ export class CityPlanSearch {
           this.update({ failures: [`Plan ${id} is absent or unavailable from this source.`] })
         }
         if (!current()) return
-        if (this.direct && id.startsWith(`${this.databaseId}:`) && /^\d+$/.test(id.slice(this.databaseId.length + 1))) {
+        if (this.direct && this.policy.directPlanIds && id.startsWith(`${databaseId}:`) && /^\d+$/.test(id.slice(databaseId.length + 1))) {
           this.update({ choices: [{
             planId: id, familyId: null, queryHash: null, text: null,
             textReason: 'Family context not yet located. Continue the bounded search to attach its SQL and measurements.',
@@ -116,9 +123,9 @@ export class CityPlanSearch {
         }
       }
       if (this.pending.length === 0 && (!this.started || this.token)) {
-        const page = await this.api.fetchFamilies(this.metric, this.token, controller.signal, this.databaseId)
+        const page = await this.api.fetchFamilies(this.metric, this.token, controller.signal, databaseId)
         if (!current()) return
-        if (page.items.some(family => family.databaseId !== this.databaseId)) throw new Error('The search response belongs to another database.')
+        if (page.items.some(family => family.databaseId !== databaseId)) throw new Error('The search response belongs to another database.')
         this.pending = page.items
         this.token = page.nextPageToken
         this.started = true
@@ -135,7 +142,7 @@ export class CityPlanSearch {
         try {
           const detail = await this.api.fetchFamily(family.familyId, controller.signal)
           if (!current()) return
-          if (detail.family.databaseId !== this.databaseId) throw new Error('Family evidence belongs to another database.')
+          if (detail.family.databaseId !== databaseId) throw new Error('Family evidence belongs to another database.')
           const plans = this.mode === 'plan' ? detail.plans.filter(plan => plan.planId === id) : detail.plans
           const choices = new Map(this.state.choices.map(choice => [choice.planId, choice]))
           for (const plan of plans) {

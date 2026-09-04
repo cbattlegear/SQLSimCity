@@ -290,6 +290,7 @@ export interface DatabaseCitySummarySnapshot {
 export interface DatabaseCityPage {
   schemaVersion: string
   databaseId: string
+  queryStoreDatabaseId?: string | null
   databaseName: string
   metric: DatabaseCityMetric
   pageSize: number

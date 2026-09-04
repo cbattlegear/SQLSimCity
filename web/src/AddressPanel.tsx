@@ -104,6 +104,7 @@ export function AddressBook({
                     <li key={entry.id}>
                       <button
                         type="button"
+                        data-address-id={entry.id}
                         className={`address-entry ${entry.id === selectedId ? 'is-selected' : ''}`}
                         aria-pressed={entry.id === selectedId}
                         onClick={() => onSelect(entry)}

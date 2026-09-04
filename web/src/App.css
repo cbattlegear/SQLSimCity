@@ -456,6 +456,47 @@
   max-height: none;
 }
 
+.city-evidence-status {
+  flex: none;
+  max-height: 14vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 7px 16px;
+  color: #a8bac9;
+  font-size: .72rem;
+  line-height: 1.45;
+  border-bottom: 1px solid #263544;
+  overflow-wrap: anywhere;
+}
+.city-evidence-status p { margin: 0; }
+.city-evidence-status.is-degraded { color: #f0d9a8; }
+.city-evidence-status button {
+  margin-top: 5px;
+  padding: 5px 9px;
+  color: #e2eaf0;
+  background: #14202c;
+  border: 1px solid #3b4b5b;
+  font: inherit;
+  cursor: pointer;
+}
+.city-evidence-status button:disabled { opacity: .65; cursor: wait; }
+.route-evidence { min-width: 0; display: grid; gap: 10px; }
+.route-evidence p { margin: 0; line-height: 1.5; font-size: .78rem; }
+.route-evidence dd { overflow-wrap: anywhere; min-width: 0; }
+.route-evidence dt { flex: 0 0 75px; }
+.route-sql { min-width: 0; }
+.route-sql summary { cursor: pointer; color: #8be7ce; }
+.route-sql pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .78rem; line-height: 1.5; }
+.road-contributors h3 { margin: 0; font-size: .9rem; }
+.road-contributors .hud-results,
+.sidebar-drawer-body > .hud-results { max-height: none; overflow: visible; }
+.road-contributors .hud-results small,
+.sidebar-drawer-body > .hud-results small { white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+.road-contributors .hud-results strong,
+.sidebar-drawer-body > .hud-results strong { overflow-wrap: anywhere; }
+.road-contributors .hud-results span { font-size: .75rem; }
+.plan-search-failures { font-size: .75rem; overflow-wrap: anywhere; }
+
 .sidebar-metric {
   display: grid;
   gap: 8px;
@@ -824,6 +865,7 @@ dd { margin: 0; min-width: 0; overflow-wrap: anywhere; font: 0.72rem/1.45 ui-mon
 .hud-field span { color: #93a8ba; font: .66rem ui-monospace, Consolas, monospace; letter-spacing: .06em; text-transform: uppercase; }
 .hud-field input { width: 100%; padding: 6px 8px; color: #e7edf3; background: #0d1620; border: 1px solid #3b4b5b; font: inherit; }
 .hud-field input:focus-visible { outline: 2px solid #72f4c4; outline-offset: 1px; }
+.hud-field select { width: 100%; min-height: 32px; color: #e7edf3; background: #0d1620; border: 1px solid #3b4b5b; font: inherit; }
 form.hud-field { gap: 6px; }
 form.hud-field label { display: grid; gap: 5px; }
 form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; background: #72f4c4; border: 0; font-weight: 600; font-size: .72rem; line-height: 1; cursor: pointer; }
@@ -2213,4 +2255,9 @@ form.hud-field button { justify-self: start; padding: 5px 12px; color: #08131a; 
   .sidebar-place-card .detail,
   .sidebar-place-card .place-card,
   .sidebar-place-card > .hud-slideover { overflow: visible; }
+  .city-evidence-status { max-height: none; overflow: visible; font-size: .78rem; }
+  .hud-field input,
+  .hud-field select { min-height: 44px; font-size: 1rem; }
+  form.hud-field button,
+  .city-evidence-status button { min-height: 44px; }
 }

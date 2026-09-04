@@ -140,7 +140,9 @@ describe('feed and address-book clicks select the same family', () => {
     const start = code.indexOf('const showFamilyOnMap = useCallback')
     expect(start).toBeGreaterThan(-1)
     const body = code.slice(start, code.indexOf('const addressEntries = useMemo', start))
-    expect(body).toContain('setSelectedAddressId(queryAddressId(family.familyId))')
+    expect(body).toContain('navigation.openFamily(')
+    const owner = readFileSync(new URL('./cityPlanNavigation.ts', import.meta.url), 'utf8')
+    expect(owner).toContain('selectedAddressId: familyId ? queryAddressId(familyId) : null')
   })
 
   it('has openAddress delegate the query case rather than selecting it separately', () => {
@@ -164,8 +166,8 @@ describe('feed and address-book clicks select the same family', () => {
   })
 
   it('routes every showFamilyOnMap caller through the one function', () => {
-    // Three call sites, one definition: the address book, the feed ticker and the families table.
-    expect(code.match(/onShowFamily=\{showFamilyOnMap\}/g) ?? []).toHaveLength(2)
+    // Directory, live feed, ranked families and road contributors all use the same owner.
+    expect(code.match(/onShowFamily=\{showFamilyOnMap\}/g) ?? []).toHaveLength(3)
     expect(code).toContain('showFamilyOnMap(family)')
   })
 })

@@ -162,6 +162,7 @@ export default function App() {
           viewMode={viewMode}
           onViewModeChange={changeViewMode}
           banners={banners}
+          sourceMode={archiveInfo ? 'archive' : edgeInfo ? 'edge' : 'live'}
         />
       </LazySurface>
     )

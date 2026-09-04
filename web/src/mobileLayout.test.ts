@@ -165,7 +165,7 @@ describe('map overlays on a narrow viewport', () => {
   it('states the incident finding on the closed control and opens a real incident unasked', () => {
     const view = readFileSync(new URL('./DatabaseCityView.tsx', import.meta.url), 'utf8')
     expect(view).toContain('{incidentSummaryLabel(incidents)}')
-    expect(view).toContain('open={incidentDemandsAttention(incidents)}')
+    expect(view.replace(/\/\*[\s\S]*?\*\//g, '')).toContain("open={openRegion === 'activity'}")
     // Still reachable at narrow width: the wrapper dissolves, the drawers do not.
     expect(narrowRule('.sidebar-drawers')).toMatch(/display:\s*contents/)
     expect(narrowRule('.sidebar-drawer'), 'the sheet drawers are switched off')
@@ -260,7 +260,7 @@ describe('the tray cannot fold a warning away', () => {
    */
   it('delegates the incident wording to the module that holds the evidence', () => {
     expect(view).toContain('{incidentSummaryLabel(incidents)}')
-    expect(view).toContain('open={incidentDemandsAttention(incidents)}')
+    expect(view.replace(/\/\*[\s\S]*?\*\//g, '')).toContain("const alerting = incidentDemandsAttention(incidents)")
     // No local copy left behind to drift out of step with the projection.
     expect(view).not.toContain('function incidentChipLabel')
     // And the tray no longer carries a second, competing copy of it.
@@ -1087,7 +1087,7 @@ describe('three drawers in one rail share one height budget', () => {
       'the feed is no longer a region of the rail')
       .toMatch(/<section className="sidebar-feed"/)
 
-    const rendered = cityMarkup.indexOf('{sidebarMode.showsAddressBook && liveQueryFeed}')
+    const rendered = cityMarkup.indexOf('{sidebarMode.showsAddressBook && !selectedRoad && liveQueryFeed}')
     expect(rendered, 'the feed does not render with the address book').toBeGreaterThan(-1)
     expect(rendered, 'the feed is not above the address book')
       .toBeLessThan(cityMarkup.indexOf('<AddressBook'))
