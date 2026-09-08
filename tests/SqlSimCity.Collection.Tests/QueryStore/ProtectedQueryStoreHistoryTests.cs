@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using SqlSimCity.Collection.QueryStore;
 using SqlSimCity.Contracts.V1;
 using SqlSimCity.Domain;
@@ -74,6 +75,153 @@ public sealed class ProtectedQueryStoreHistoryTests
         Assert.Equal("db:dispatcher", after.Plans.Single(plan => plan.PlanType == QueryPlanType.Variant).DispatcherPlanId);
         Assert.Equal(QueryOptimizationKind.ParameterSensitivePlan,
             after.Plans.Single(plan => plan.PlanType == QueryPlanType.Variant).Optimization);
+    }
+
+    [Fact]
+    public async Task MissingDispatcherDoesNotBlockRestoreOrDiscardVariantEvidence()
+    {
+        var repository = new ProtectedQueryStoreRepository(new MemoryProtectedStore());
+        using (var initial = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker()))
+            await PublishCycleAsync(initial, 40);
+        var snapshot = (await repository.ReadPublishedSnapshotAsync())!;
+        var variant = VariantOnly(Assert.Single(snapshot.Families));
+        await repository.PublishSnapshotAsync(snapshot with { Families = [variant] });
+
+        var logger = new HistoryLogger();
+        using var restarted = new ProtectedQueryStoreHistorySink(
+            repository, new QueryStoreCollectionStatusTracker(), logger);
+        await restarted.PublishAsync(new(false, Now, Now.AddMinutes(5), [DatabaseResult("db", "offline")]), default);
+
+        var retained = Assert.Single((await repository.ReadPublishedSnapshotAsync())!.Families);
+        Assert.Equal(variant.Family.FamilyId, retained.Family.FamilyId);
+        Assert.Equal("40", retained.Family.ExecutionCount);
+        Assert.Equal("10", retained.Family.TotalWaitMilliseconds);
+        Assert.Equal(variant.Family.Evidence.ObservedAt, retained.Family.Evidence.ObservedAt);
+        Assert.Equal(variant.Family.Evidence.FreshUntil, retained.Family.Evidence.FreshUntil);
+        var runtime = Assert.Single(retained.Runtime);
+        Assert.Equal(variant.Runtime[0].Evidence.ObservedAt, runtime.Evidence.ObservedAt);
+        Assert.Equal(variant.Runtime[0].Evidence.FreshUntil, runtime.Evidence.FreshUntil);
+        Assert.Equivalent(variant.Runtime[0], runtime with { Evidence = variant.Runtime[0].Evidence });
+        var plan = Assert.Single(retained.Plans);
+        Assert.Equal("db:dispatcher", plan.DispatcherPlanId);
+        Assert.Equal(QueryOptimizationKind.ParameterSensitivePlan, plan.Optimization);
+        Assert.Contains("dispatcher", plan.Evidence.Caveat, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("unresolved", plan.Evidence.Caveat, StringComparison.OrdinalIgnoreCase);
+        var warning = Assert.Single(logger.Entries, entry => entry.EventId.Name == "QueryStoreIncompleteVariantRestore");
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Null(warning.Exception);
+        Assert.Equal(
+            "Query Store history restored 1 variant references without complete dispatcher metadata. " +
+            "Retained runtime is preserved; parent grouping remains unresolved until source metadata is collected.",
+            warning.Message);
+
+        var observed = Now.AddMinutes(10);
+        var state = new QueryStoreDatabaseState(
+            "db", QueryStoreCollectionState.ReadWrite, "epoch", Now.AddDays(-1), observed,
+            "available", 16, 160, true, true, false, false);
+        await restarted.BeginDatabaseCycleAsync(state, "epoch", false, default);
+        await restarted.StageFactsAsync("db", new(QueryStoreFactKind.Identity,
+        [
+            new QueryIdentityFact("parent", "parent-text", "context-a", "hash-a", observed,
+                false, true, null, null, null, null),
+            new QueryPlanFact("dispatcher", "parent", "dispatcher-hash", QueryPlanType.Dispatcher,
+                null, false, null, BigInteger.Zero, null, "16", "160", observed),
+        ], null, false), default);
+        await restarted.StageRuntimeBucketsAsync("db", [Bucket("variant-plan", 47)], false, default);
+        await restarted.CommitDatabaseCycleAsync(state,
+            new("db", "epoch", "epoch", observed, new Dictionary<QueryStoreFactKind, string?>()), default);
+        await restarted.PublishAsync(new(false, observed, observed, [DatabaseResult("db")]), default);
+        var recovered = Assert.Single((await repository.ReadPublishedSnapshotAsync())!.Families);
+        Assert.Equal("47", recovered.Family.ExecutionCount);
+        Assert.Equal(2, recovered.Family.PhysicalQueries.Count);
+        Assert.Equal(2, recovered.Plans.Count);
+        Assert.DoesNotContain("unresolved",
+            recovered.Plans.Single(item => item.PlanType == QueryPlanType.Variant).Evidence.Caveat,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task VariantRestoreResolvesDispatcherFromALaterFamily()
+    {
+        var repository = new ProtectedQueryStoreRepository(new MemoryProtectedStore());
+        using (var initial = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker()))
+            await PublishCycleAsync(initial, 40);
+        var snapshot = (await repository.ReadPublishedSnapshotAsync())!;
+        var original = Assert.Single(snapshot.Families);
+        var variant = VariantOnly(original);
+        var parent = original with
+        {
+            Family = original.Family with
+            {
+                PhysicalQueries = [original.Family.PhysicalQueries.Single(query => query.QueryId == "parent")],
+                ExecutionCount = "0",
+                TotalCpuMicroseconds = "0",
+                TotalDurationMicroseconds = "0",
+                TotalLogicalReads8KiBPages = "0",
+                TotalWaitMilliseconds = "0",
+            },
+            Plans = [original.Plans.Single(plan => plan.PlanType == QueryPlanType.Dispatcher)],
+            Runtime = [],
+        };
+        await repository.PublishSnapshotAsync(snapshot with { Families = [variant, parent] });
+        Assert.Equal(variant.Family.FamilyId,
+            (await repository.ReadPublishedSnapshotAsync())!.Families[0].Family.FamilyId);
+
+        using var restarted = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker());
+        await restarted.PublishAsync(new(false, Now, Now.AddMinutes(1), []), default);
+
+        var restored = Assert.Single((await repository.ReadPublishedSnapshotAsync())!.Families);
+        Assert.Equal(parent.Family.FamilyId, restored.Family.FamilyId);
+        Assert.Equal("40", restored.Family.ExecutionCount);
+        Assert.Equal("10", restored.Family.TotalWaitMilliseconds);
+        Assert.Equal(2, restored.Family.PhysicalQueries.Count);
+        Assert.Equal("db:dispatcher",
+            restored.Plans.Single(plan => plan.PlanType == QueryPlanType.Variant).DispatcherPlanId);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RetentionKeepsIdleDispatcherUntilItsVariantExpires(bool archived)
+    {
+        var repository = new ProtectedQueryStoreRepository(new MemoryProtectedStore());
+        using (var initial = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker()))
+            await PublishCycleAsync(initial, 40);
+        var snapshot = (await repository.ReadPublishedSnapshotAsync())!;
+        var original = Assert.Single(snapshot.Families);
+        var family = original with
+        {
+            Family = original.Family with
+            {
+                FamilyId = archived ? original.Family.FamilyId + ":epoch:prior" : original.Family.FamilyId,
+            },
+            Plans = original.Plans.Select(plan => plan.PlanType == QueryPlanType.Dispatcher
+                ? plan with { LastExecutionAt = Now - QueryStoreRetentionOptions.Default.EffectiveHistory - TimeSpan.FromHours(1) }
+                : plan).ToArray(),
+        };
+        await repository.PublishSnapshotAsync(snapshot with { Families = [family] });
+
+        using var sink = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker());
+        await RepublishAsync(Now.AddMinutes(1));
+        var retained = Assert.Single((await repository.ReadPublishedSnapshotAsync())!.Families);
+        Assert.Contains(retained.Plans, plan => plan.PlanId == "db:dispatcher");
+        Assert.Equal("40", retained.Family.ExecutionCount);
+        Assert.Single(retained.Runtime);
+        Assert.DoesNotContain(retained.Runtime, bucket => bucket.PlanId == "db:dispatcher");
+
+        await RepublishAsync(Now + QueryStoreRetentionOptions.Default.EffectiveHistory + TimeSpan.FromHours(1));
+        Assert.Empty((await repository.ReadPublishedSnapshotAsync())!.Families);
+
+        async Task RepublishAsync(DateTimeOffset observed)
+        {
+            var state = new QueryStoreDatabaseState(
+                "db", QueryStoreCollectionState.ReadWrite, "epoch", Now.AddDays(-1), observed,
+                "available", 16, 160, true, true, false, false);
+            await sink.BeginDatabaseCycleAsync(state, "epoch", false, default);
+            await sink.CommitDatabaseCycleAsync(state,
+                new("db", "epoch", "epoch", observed, new Dictionary<QueryStoreFactKind, string?>()), default);
+            await sink.PublishAsync(new(false, observed, observed, [DatabaseResult("db")]), default);
+        }
     }
 
     [Fact]
@@ -671,6 +819,33 @@ public sealed class ProtectedQueryStoreHistoryTests
         Assert.Equal(
             collectedFrom,
             snapshot!.Families.SelectMany(family => family.Runtime).Min(bucket => bucket.IntervalStart));
+    }
+
+    private static QueryFamilyDetailV1 VariantOnly(QueryFamilyDetailV1 original) =>
+        original with
+        {
+            Family = original.Family with
+            {
+                FamilyId = QueryFamilyIdentity.Create("db", "hash-b", null, "variant").FamilyId,
+                QueryHash = "hash-b",
+                PhysicalQueries = [original.Family.PhysicalQueries.Single(query => query.QueryId == "variant")],
+                TotalWaitMilliseconds = "10",
+            },
+            Plans = [original.Plans.Single(plan => plan.PlanType == QueryPlanType.Variant)],
+            Runtime = [original.Runtime[0] with
+            {
+                WaitMilliseconds = new Dictionary<string, string> { ["CPU"] = "7", ["Lock"] = "3" },
+            }],
+        };
+
+    private sealed class HistoryLogger : ILogger<ProtectedQueryStoreHistorySink>
+    {
+        public List<(LogLevel Level, EventId EventId, string Message, Exception? Exception)> Entries { get; } = [];
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, eventId, formatter(state, exception), exception));
     }
 
     private static async Task PublishCycleAsync(
