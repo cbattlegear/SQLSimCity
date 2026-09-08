@@ -31,6 +31,12 @@ public sealed class ProtectedQueryStoreHistorySink(
             "{WriteLockHoldMs:0.#} ms of {ElapsedMs:0.#} ms. Every publish rewrites the whole slot, " +
             "so this is the write churn per collection cycle, not the change since the last one.");
 
+    private static readonly Action<ILogger, int, Exception?> LogIncompleteVariantRestore =
+        LoggerMessage.Define<int>(
+            LogLevel.Warning, new EventId(23, "QueryStoreIncompleteVariantRestore"),
+            "Query Store history restored {VariantCount} variant references without complete dispatcher metadata. " +
+            "Retained runtime is preserved; parent grouping remains unresolved until source metadata is collected.");
+
     private readonly ILogger _logger = logger ?? NullLogger<ProtectedQueryStoreHistorySink>.Instance;
     private readonly QueryStoreRetentionOptions _retention = retention ?? QueryStoreRetentionOptions.Default;
     private readonly ConcurrentDictionary<string, DatabaseFacts> _committed = new(StringComparer.Ordinal);
@@ -125,7 +131,8 @@ public sealed class ProtectedQueryStoreHistorySink(
                         new EpochWaitFact(state.CurrentEpoch, wait);
                     break;
                 case QueryVariantFact variant:
-                    state.Variants[variant.VariantQueryId] = variant;
+                    state.Variants[variant.VariantQueryId] = new(
+                        variant.VariantQueryId, variant.ParentQueryId, variant.DispatcherPlanId, variant.Optimization);
                     break;
                 case QueryReplicaFact replica:
                     state.Replicas[replica.ReplicaGroupId] = replica;
@@ -330,6 +337,10 @@ public sealed class ProtectedQueryStoreHistorySink(
             }
         foreach (var pair in restored) _committed.TryAdd(pair.Key, pair.Value);
         Interlocked.Exchange(ref _sequence, snapshot.Sequence);
+        var incompleteVariants = restored.Values.Sum(state =>
+            state.Variants.Values.Count(variant => !state.HasDispatcherMetadata(variant)));
+        if (incompleteVariants > 0)
+            LogIncompleteVariantRestore(_logger, incompleteVariants, null);
     }
 
     private DatabaseFacts GetStage(string databaseId) =>
@@ -373,24 +384,43 @@ public sealed class ProtectedQueryStoreHistorySink(
             state.Waits.Remove(key);
         var retainedPlans = state.Runtime.Values.Select(value => value.Bucket.Key.PlanId)
             .ToHashSet(StringComparer.Ordinal);
-        foreach (var key in state.Plans.Where(pair =>
-                     pair.Value.LastExecutionAt < cutoff && !retainedPlans.Contains(pair.Key))
+        retainedPlans.UnionWith(state.Plans.Values.Where(plan => plan.LastExecutionAt >= cutoff)
+            .Select(plan => plan.PlanId));
+        // A dispatcher may be idle while its variants execute. Retain its metadata, not its runtime.
+        RetainDispatcherPlans(retainedPlans, planId =>
+            state.Plans.TryGetValue(planId, out var plan) &&
+            state.Variants.TryGetValue(plan.QueryId, out var variant) ? variant.DispatcherPlanId : null);
+        foreach (var key in state.Plans.Where(pair => !retainedPlans.Contains(pair.Key))
                      .Select(pair => pair.Key).ToArray())
             state.Plans.Remove(key);
         var retainedQueries = state.Plans.Values.Select(plan => plan.QueryId).ToHashSet(StringComparer.Ordinal);
+        var pendingQueries = new Queue<string>(retainedQueries);
+        while (pendingQueries.TryDequeue(out var queryId))
+            if (state.Variants.TryGetValue(queryId, out var variant) &&
+                variant.ParentQueryId is { } parent && retainedQueries.Add(parent))
+                pendingQueries.Enqueue(parent);
         foreach (var key in state.Identities.Where(pair =>
                      pair.Value.LastExecutionAt < cutoff && !retainedQueries.Contains(pair.Key))
                      .Select(pair => pair.Key).ToArray())
             state.Identities.Remove(key);
         foreach (var key in state.Variants.Where(pair =>
-                     !state.Identities.ContainsKey(pair.Value.VariantQueryId) ||
-                     !state.Identities.ContainsKey(pair.Value.ParentQueryId))
+                     !state.Identities.ContainsKey(pair.Value.VariantQueryId))
                      .Select(pair => pair.Key).ToArray())
             state.Variants.Remove(key);
         var textIds = state.Identities.Values.Select(identity => identity.QueryTextId)
             .ToHashSet(StringComparer.Ordinal);
         foreach (var key in state.Text.Keys.Where(key => !textIds.Contains(key)).ToArray())
             state.Text.Remove(key);
+    }
+
+    private static void RetainDispatcherPlans(
+        HashSet<string> retainedPlans,
+        Func<string, string?> dispatcherFor)
+    {
+        var pending = new Queue<string>(retainedPlans);
+        while (pending.TryDequeue(out var planId))
+            if (dispatcherFor(planId) is { } dispatcherId && retainedPlans.Add(dispatcherId))
+                pending.Enqueue(dispatcherId);
     }
 
     private static RuntimeBucketV1[] RetainArchivedRuntime(
@@ -449,6 +479,12 @@ public sealed class ProtectedQueryStoreHistorySink(
             BigInteger.Zero,
             (sum, bucket) => sum + BigInteger.Parse(bucket.ExecutionCount, CultureInfo.InvariantCulture));
         var plansWithRuntime = runtime.Select(bucket => bucket.PlanId).ToHashSet(StringComparer.Ordinal);
+        var plansById = detail.Plans.ToDictionary(plan => plan.PlanId, StringComparer.Ordinal);
+        var retainedPlans = detail.Plans
+            .Where(plan => plan.LastExecutionAt >= cutoff || plansWithRuntime.Contains(plan.PlanId))
+            .Select(plan => plan.PlanId).ToHashSet(StringComparer.Ordinal);
+        RetainDispatcherPlans(retainedPlans, planId =>
+            plansById.TryGetValue(planId, out var plan) ? plan.DispatcherPlanId : null);
         return detail with
         {
             Family = detail.Family with
@@ -465,9 +501,7 @@ public sealed class ProtectedQueryStoreHistorySink(
                 LastObservedAt = runtime.Length > 0
                     ? runtime[^1].IntervalEnd : detail.Family.LastObservedAt,
             },
-            Plans = detail.Plans.Where(plan =>
-                plan.LastExecutionAt >= cutoff ||
-                plansWithRuntime.Contains(plan.PlanId)).ToArray(),
+            Plans = detail.Plans.Where(plan => retainedPlans.Contains(plan.PlanId)).ToArray(),
             Runtime = runtime,
         };
     }
@@ -478,11 +512,14 @@ public sealed class ProtectedQueryStoreHistorySink(
         QueryStoreRetentionOptions retention,
         out QueryStoreBuildInspection inspection)
     {
-        var queryToParent = state.Variants.Values.ToDictionary(
-            variant => variant.VariantQueryId, variant => variant.ParentQueryId, StringComparer.Ordinal);
+        state.ResolveDispatcherReferences();
+        var queryToParent = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var variant in state.Variants.Values)
+            if (variant.ParentQueryId is { } parent)
+                queryToParent.Add(variant.VariantQueryId, parent);
         var identitiesById = state.Identities;
-        var variantsByParent = state.Variants.Values.ToLookup(
-            variant => variant.ParentQueryId, StringComparer.Ordinal);
+        var variantsByParent = queryToParent.ToLookup(
+            pair => pair.Value, pair => pair.Key, StringComparer.Ordinal);
         var plansByQuery = state.Plans.Values.ToLookup(plan => plan.QueryId, StringComparer.Ordinal);
         var retainedRuntime = RetainedRuntime(state, observedAt, retention)
             .Where(bucket => bucket.Epoch == state.CurrentEpoch).ToArray();
@@ -510,7 +547,7 @@ public sealed class ProtectedQueryStoreHistorySink(
             var queryIds = identities.Select(item => item.QueryId).ToHashSet(StringComparer.Ordinal);
             foreach (var parentId in queryIds.ToArray())
                 foreach (var variant in variantsByParent[parentId])
-                    queryIds.Add(variant.VariantQueryId);
+                    queryIds.Add(variant);
             var physicalIdentities = queryIds
                 .Select(queryId => identitiesById.GetValueOrDefault(queryId))
                 .Where(identity => identity is not null)
@@ -526,7 +563,7 @@ public sealed class ProtectedQueryStoreHistorySink(
                 .ToArray();
             var planIds = rawPlans.Where(plan => plan.PlanType is not QueryPlanType.Dispatcher)
                 .Select(plan => plan.PlanId).ToHashSet(StringComparer.Ordinal);
-            var plans = rawPlans.Select(plan => PlanSummary(state.DatabaseId, plan, state.Variants)).ToArray();
+            var plans = rawPlans.Select(plan => PlanSummary(state, plan)).ToArray();
             var runtime = planIds.SelectMany(planId =>
                 {
                     runtimeLookups++;
@@ -607,14 +644,17 @@ public sealed class ProtectedQueryStoreHistorySink(
     }
 
     private static QueryPlanSummaryV1 PlanSummary(
-        string databaseId,
-        QueryPlanFact plan,
-        Dictionary<string, QueryVariantFact> variants)
+        DatabaseFacts state,
+        QueryPlanFact plan)
     {
-        var variant = variants.TryGetValue(plan.QueryId, out var value) ? value : null;
+        var databaseId = state.DatabaseId;
+        var variant = state.Variants.TryGetValue(plan.QueryId, out var value) ? value : null;
         var optimization = variant?.Optimization ??
             (plan.PlanType is QueryPlanType.Dispatcher ? QueryOptimizationKind.ParameterSensitivePlan
                 : QueryOptimizationKind.None);
+        var caveat = "Plan metadata excludes Showplan XML.";
+        if (variant is not null && !state.HasDispatcherMetadata(variant))
+            caveat += " Dispatcher metadata is incomplete; parent-query grouping remains unresolved.";
         return new QueryPlanSummaryV1(
             $"{databaseId}:{plan.PlanId}", plan.QueryId, plan.QueryPlanHash, plan.PlanType, optimization,
             variant is null ? null : $"{databaseId}:{variant.DispatcherPlanId}",
@@ -624,7 +664,7 @@ public sealed class ProtectedQueryStoreHistorySink(
             plan.LastForceFailureReason, plan.EngineVersion, plan.CompatibilityLevel,
             plan.LastExecutionAt, new QueryStoreEvidenceV1(
                 QueryStoreSource.QueryStore, DataStatus.Available, plan.LastExecutionAt, null,
-                "Connected Query Store plan metadata.", "Plan metadata excludes Showplan XML."));
+                "Connected Query Store plan metadata.", caveat));
     }
 
     private static RuntimeBucketV1 RuntimeContract(
@@ -791,10 +831,22 @@ public sealed class ProtectedQueryStoreHistorySink(
         public Dictionary<string, QueryPlanFact> Plans { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, EpochRuntimeBucket> Runtime { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, EpochWaitFact> Waits { get; } = new(StringComparer.Ordinal);
-        public Dictionary<string, QueryVariantFact> Variants { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, VariantReference> Variants { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, QueryReplicaFact> Replicas { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, QueryTextDescriptorV1> Text { get; } = new(StringComparer.Ordinal);
         public List<QueryFamilyDetailV1> ArchivedFamilies { get; } = [];
+
+        public bool HasDispatcherMetadata(VariantReference variant) =>
+            variant.ParentQueryId is { } parent && Identities.ContainsKey(parent) &&
+            Plans.TryGetValue(variant.DispatcherPlanId, out var dispatcher) && dispatcher.QueryId == parent;
+
+        public void ResolveDispatcherReferences()
+        {
+            foreach (var (queryId, variant) in Variants.ToArray())
+                if (variant.ParentQueryId is null &&
+                    Plans.TryGetValue(variant.DispatcherPlanId, out var dispatcher))
+                    Variants[queryId] = variant with { ParentQueryId = dispatcher.QueryId };
+        }
 
         public DatabaseFacts Clone()
         {
@@ -835,6 +887,7 @@ public sealed class ProtectedQueryStoreHistorySink(
                     state.Text[physical.QueryTextId] = physical.Text;
                 }
                 foreach (var plan in detail.Plans)
+                {
                     state.Plans[RawId(databaseId, plan.PlanId)] = new QueryPlanFact(
                         RawId(databaseId, plan.PlanId), plan.QueryId, plan.QueryPlanHash, plan.PlanType,
                         plan.DispatcherPlanId is null ? null : RawId(databaseId, plan.DispatcherPlanId),
@@ -842,14 +895,10 @@ public sealed class ProtectedQueryStoreHistorySink(
                         BigInteger.Parse(plan.ForceFailureCount, CultureInfo.InvariantCulture),
                         plan.LastForceFailureReason, plan.EngineVersion, plan.CompatibilityLevel,
                         plan.LastExecutionAt);
-                foreach (var plan in detail.Plans)
-                {
                     if (plan.DispatcherPlanId is not { } dispatcherPlanId) continue;
                     var dispatcherId = RawId(databaseId, dispatcherPlanId);
-                    if (!state.Plans.TryGetValue(dispatcherId, out var dispatcher))
-                        throw new InvalidDataException("A restored Query Store variant has no dispatcher plan.");
-                    state.Variants[plan.QueryId] = new QueryVariantFact(
-                        plan.QueryId, dispatcher.QueryId, dispatcherId, plan.Optimization);
+                    state.Variants[plan.QueryId] = new(
+                        plan.QueryId, null, dispatcherId, plan.Optimization);
                 }
                 foreach (var runtime in detail.Runtime)
                 {
@@ -881,6 +930,8 @@ public sealed class ProtectedQueryStoreHistorySink(
                     }
                 }
             }
+            // Index order is unrelated to plan dependencies. Resolve only after all families load.
+            state.ResolveDispatcherReferences();
             return state;
         }
 
@@ -903,6 +954,12 @@ public sealed class ProtectedQueryStoreHistorySink(
             return $"legacy-restored:{Convert.ToHexString(digest).ToLowerInvariant()[..16]}";
         }
     }
+
+    private sealed record VariantReference(
+        string VariantQueryId,
+        string? ParentQueryId,
+        string DispatcherPlanId,
+        QueryOptimizationKind Optimization);
 
     private sealed record EpochRuntimeBucket(
         string Epoch,

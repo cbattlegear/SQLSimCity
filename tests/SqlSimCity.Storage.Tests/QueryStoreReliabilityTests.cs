@@ -330,6 +330,59 @@ public sealed class QueryStoreReliabilityTests : IDisposable
         Assert.Equal(WaitSignature(snapshot), WaitSignature((await repository.ReadPublishedSnapshotAsync())!));
     }
 
+    [Theory]
+    [InlineData(QueryOptimizationKind.ParameterSensitivePlan)]
+    [InlineData(QueryOptimizationKind.OptionalParameterPlanOptimization)]
+    public async Task MissingDispatcherReferencesSurviveSqliteReopenWithoutRecollection(
+        QueryOptimizationKind optimization)
+    {
+        QueryStorePublishedSnapshot before;
+        using (var store = await OpenStoreAsync())
+        {
+            var repository = new ProtectedQueryStoreRepository(store);
+            using var sink = new ProtectedQueryStoreHistorySink(repository, new QueryStoreCollectionStatusTracker());
+            await StageWaitHistoryAsync(sink, "epoch", false, true);
+            var snapshot = (await repository.ReadPublishedSnapshotAsync())!;
+            before = snapshot with
+            {
+                Families = snapshot.Families.Select(family => family with
+                {
+                    Plans = family.Plans.Select(plan => plan with
+                    {
+                        PlanType = QueryPlanType.Variant,
+                        DispatcherPlanId = "db:missing-dispatcher",
+                        Optimization = optimization,
+                    }).ToArray(),
+                }).ToArray(),
+            };
+            await repository.PublishSnapshotAsync(before);
+        }
+
+        var source = new ReliabilitySource(_clock);
+        source.States["db"] = QueryStoreCollectionState.Off;
+        source.States["sibling"] = QueryStoreCollectionState.Off;
+        for (var restart = 0; restart < 2; restart++)
+        {
+            _clock.Advance(TimeSpan.FromMinutes(5));
+            using var store = await OpenStoreAsync();
+            var repository = new ProtectedQueryStoreRepository(store);
+            await CollectAsync(repository, source);
+            var after = (await repository.ReadPublishedSnapshotAsync())!;
+            Assert.Equal(_clock.GetUtcNow(), after.PublishedAt);
+            Assert.Equal(WaitSignature(before), WaitSignature(after));
+            var family = Assert.Single(after.Families);
+            AssertEvidence(family.Family.Evidence, Now, DataStatus.Disabled);
+            Assert.All(family.Runtime, bucket => AssertEvidence(bucket.Evidence, Now, DataStatus.Disabled));
+            Assert.All(family.Plans, plan =>
+            {
+                Assert.Equal("db:missing-dispatcher", plan.DispatcherPlanId);
+                Assert.Equal(optimization, plan.Optimization);
+                Assert.Contains("unresolved", plan.Evidence.Caveat, StringComparison.OrdinalIgnoreCase);
+            });
+        }
+        Assert.Equal(0, source.TextReads);
+    }
+
     private static string[] WaitSignature(QueryStorePublishedSnapshot snapshot) =>
         snapshot.Families.SelectMany(family => family.Runtime.Select(bucket =>
             $"{family.Family.FamilyId}|{bucket.EpochId}|{bucket.PlanId}|{bucket.IntervalId}|" +

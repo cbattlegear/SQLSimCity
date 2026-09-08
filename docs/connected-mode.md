@@ -242,6 +242,18 @@ storage, which a connection string enables automatically (see the quick start ab
 collector uses keyset pages, overlap watermarks, reset epochs, active-interval replacement, bounded
 generations, and a final publication pointer.
 
+Optimizer variants can outlive their dispatcher metadata. On restart, retained current-epoch
+families are loaded before dispatcher links are resolved. Missing dispatcher metadata leaves the relationship
+explicitly unresolved, with a `QueryStoreIncompleteVariantRestore` warning; it does not discard
+the variant's runtime, waits, or captured dispatcher reference or stop collection. Later source
+metadata can resolve the relationship. Idle dispatcher metadata is retained while a retained
+variant needs it, without extending retention of the dispatcher's runtime.
+
+Older builds could get stuck in `BackingOff` with `InvalidDataException` when restoring these
+incomplete relationships. The recovery reads existing snapshots in place: preserve the protected
+data directory when upgrading rather than deleting history. Recovery does not extend the configured
+history retention. Genuinely missing snapshot records and storage-integrity failures still fail explicitly.
+
 Raw SQL and Showplan XML are fetched only on demand and stored as detail records. Normalized facts,
 per-interval detail and hourly history all follow the same retention horizon, 24 hours by default
 and configurable — see below.
