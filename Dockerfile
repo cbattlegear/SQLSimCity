@@ -40,7 +40,7 @@ RUN dotnet publish src/SqlSimCity.Api/SqlSimCity.Api.csproj \
     -p:Deterministic=true \
     -p:UseAppHost=false
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0@sha256:a4556ed033fa96f984bb7a8d348851cb2d36b1281dd2420070045f664fbb5f94 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:11.0@sha256:bc0d6653979efba491ab3d6f589d691f96c309c3c3ef81325efa6978e7b7f242 AS runtime
 ARG BUILD_DATE
 ARG VERSION=0.0.0-local
 ARG REVISION=unknown
